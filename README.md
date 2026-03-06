@@ -1,4 +1,4 @@
-# Trading Scanner
+# Equity Momentum Scanner
 
 A standalone desktop application for scanning the entire US equity universe against configurable technical indicators. Built with PyQt6 and packaged as a single-file Windows executable.
 
