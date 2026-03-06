@@ -2,8 +2,6 @@
 
 A standalone desktop application for scanning the entire US equity universe against configurable technical indicators. Built with PyQt6 and packaged as a single-file Windows executable.
 
-<img width="3832" height="2050" alt="scanner_screenshot" src="https://github.com/user-attachments/assets/64e94c33-59d9-41db-b7b7-98244b5bc330" />
-
 ## Features
 
 - **Full US Equity Universe** — Automatically downloads and maintains 15,000+ tickers from NASDAQ FTP, GitHub, and SEC EDGAR sources
