@@ -29,7 +29,8 @@ This README is written to be self-sufficient for any developer (human or LLM) wh
 18. [Build & deploy](#build--deploy)
 19. [Critical invariants](#critical-invariants)
 20. [Disclaimer](#disclaimer)
-
+    
+**Not financial advice.** This software is for informational and educational use only — see the full [Disclaimer](#disclaimer) at the bottom of this README before relying on any output.
 ---
 
 ## Architecture at a glance
@@ -1483,4 +1484,3 @@ The developer(s) of this software:
 **Use at your own risk.** All investment decisions should be made based on your own research and judgment, ideally in consultation with a qualified financial professional. Past performance of any security identified by this scanner is not indicative of future results.
 
 The Zacks scraper is built on a derivation of [TinyEarn](https://github.com/hussien-hussien/TinyEarn) (© 2018–2020 Hussien Hussien, MIT licensed) and uses TLS impersonation to bypass Imperva's bot-detection layer. Users are responsible for ensuring their use of this scraper complies with Zacks' terms of service.
-<img width="1915" height="1026" alt="Screenshot 2026-05-19" src="https://github.com/user-attachments/assets/a84bab69-3586-4056-8188-5a235d52fc25" />
