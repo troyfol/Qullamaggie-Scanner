@@ -128,6 +128,52 @@ def test_obj_data_handles_html_inside_string_values():
 
 
 # ----------------------------------------------------------------------
+# _extract_obj_data_fallback — drift-tolerant fallback (B2 resilience)
+# ----------------------------------------------------------------------
+
+_OBJ_PAYLOAD = (
+    '{"earnings_announcements_earnings_table": '
+    '[["1/29/26", "12/2025", "$2.65", "$2.84", "+0.19", "+7.17%", "After Close"]], '
+    '"earnings_announcements_sales_table": []}'
+)
+
+
+@pytest.mark.parametrize("assignment", [
+    "window.obj_data = ",        # different host object
+    "var obj_data=",             # bare var, no spaces
+    "let obj_data = ",
+    'document["obj_data"] = ',   # bracket assignment
+    '"obj_data": ',              # key inside a bigger literal
+])
+def test_obj_data_fallback_handles_assignment_drift(assignment):
+    html = f"<script>{assignment}{_OBJ_PAYLOAD};</script>"
+    # The strict extractor only knows `document.obj_data = {` ...
+    assert zs._extract_obj_data(html) is None
+    # ... but the fallback recovers the payload.
+    data = zs._extract_obj_data_fallback(html)
+    assert data is not None
+    assert "earnings_announcements_earnings_table" in data
+
+
+def test_obj_data_fallback_skips_unparseable_candidates():
+    """A broken obj_data-ish match earlier in the page must not stop the
+    fallback from trying (and parsing) a later one."""
+    html = (
+        "<script>obj_data = {broken: [};</script>"
+        f"<script>window.obj_data = {_OBJ_PAYLOAD};</script>"
+    )
+    data = zs._extract_obj_data_fallback(html)
+    assert data is not None
+    assert "earnings_announcements_earnings_table" in data
+
+
+def test_obj_data_fallback_returns_none_when_hopeless():
+    assert zs._extract_obj_data_fallback("<html>no data</html>") is None
+    assert zs._extract_obj_data_fallback(
+        "<script>document.obj_data = {broken: [};</script>") is None
+
+
+# ----------------------------------------------------------------------
 # _row_to_dict — translates one obj_data row into the §2.2 fragment
 # ----------------------------------------------------------------------
 
@@ -337,6 +383,80 @@ def test_fetch_returns_none_when_obj_data_missing():
         with zs.ZacksSession() as scraper:
             rows = scraper.fetch("AAPL")
     assert rows is None
+
+
+def _fetch_with_page(html: str, symbol: str = "AAPL", years: int = 5):
+    """Run one ZacksSession.fetch against a canned page; returns
+    (rows, last_failure_kind)."""
+    with patch("trade_scanner_fh.zacks_scraper.requests.Session") as mock_cls:
+        sess = mock_cls.return_value
+        sess.headers = {}
+        sess.get.return_value = _FakeResp(html)
+        sess.close.return_value = None
+
+        with zs.ZacksSession() as scraper:
+            rows = scraper.fetch(symbol, years=years)
+            kind = scraper.last_failure_kind
+    return rows, kind
+
+
+def test_fetch_recovers_via_fallback_when_assignment_drifts():
+    """End-to-end (B2): the real AAPL fixture with its obj_data assignment
+    mutated to a form the strict regex doesn't know still yields the full
+    history via the fallback parser — no failure recorded."""
+    html = _load_fixture().replace("document.obj_data", "window.obj_data")
+    rows, kind = _fetch_with_page(html, years=20)
+    assert rows is not None
+    assert len(rows) >= 20
+    assert kind is None
+
+
+def test_fetch_classifies_format_break_as_parse_error():
+    """obj_data present but unreadable by BOTH parsers on a non-block page
+    → FAIL_PARSE_ERROR. A parser break must never look like a not_found
+    coverage gap (the GUI auto-blacklists not_found tickers)."""
+    html = "<html><script>document.obj_data = {broken: [};</script></html>"
+    rows, kind = _fetch_with_page(html)
+    assert rows is None
+    assert kind == zs.FAIL_PARSE_ERROR
+
+
+def test_fetch_empty_obj_data_literal_classified_not_found():
+    """A page carrying a literal `document.obj_data = {}` IS parseable —
+    it's a coverage gap (FAIL_NOT_FOUND, auto-blacklistable), NOT a
+    parser break. Misclassifying it FAIL_PARSE_ERROR would re-queue the
+    ticker every run and count it toward the parse-spike alarm."""
+    html = "<html><script>document.obj_data = {};</script></html>"
+    rows, kind = _fetch_with_page(html)
+    assert rows is None
+    assert kind == zs.FAIL_NOT_FOUND
+
+
+def test_fetch_empty_obj_data_via_fallback_classified_not_found():
+    """Same empty literal under a drifted assignment form: the fallback
+    parser reads `{}` fine — still a coverage gap, never a parse error."""
+    html = "<html><script>window.obj_data = {};</script></html>"
+    rows, kind = _fetch_with_page(html)
+    assert rows is None
+    assert kind == zs.FAIL_NOT_FOUND
+
+
+def test_fetch_no_obj_data_token_still_not_found():
+    """A non-block page with no obj_data anywhere stays a coverage gap
+    (FAIL_NOT_FOUND) — the fallback must not reclassify it."""
+    html = "<html><body>plain page, no earnings tables</body></html>"
+    rows, kind = _fetch_with_page(html)
+    assert rows is None
+    assert kind == zs.FAIL_NOT_FOUND
+
+
+def test_fetch_interstitial_classified_blocked_before_fallback():
+    """The Imperva block page is classified FAIL_BLOCKED — the fallback
+    parser only runs on non-block pages."""
+    html = "<html><head><title>Pardon Our Interruption</title></head></html>"
+    rows, kind = _fetch_with_page(html)
+    assert rows is None
+    assert kind == zs.FAIL_BLOCKED
 
 
 def test_fetch_outside_session_raises():

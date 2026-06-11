@@ -220,13 +220,30 @@ def fetch_earnings(symbol: str, *, timeout: float = 25.0) -> Optional[list[dict]
         return None
 
     if data is None:
-        # No earningsData key. Distinguish "covered but no earnings"
-        # (ETF/fund → empty) from a bot-challenge page (blocked). A real
-        # finviz quote page carries the ticker's snapshot table; a
-        # challenge page does not and is typically tiny.
-        looks_like_quote = ("snapshot-td" in body) or (f"t={sym}" in body)
-        if looks_like_quote and len(body) > 50_000:
+        # No earningsData key. Three-way classification (B2 resilience):
+        # FAIL_EMPTY ("covered but no earnings" — ETF/fund, safe to
+        # blacklist) requires BOTH independent quote-page markers to
+        # agree: the snapshot table CSS class AND the ticker echo in the
+        # page's self-referential quote links. A page that half-looks
+        # like a quote (exactly one marker on a realistic body) is a
+        # finviz REDESIGN suspect — degrade to a LOUD parse_error so the
+        # fill loop's spike alarm halts the run instead of silently
+        # blacklisting ticker after ticker. Anything else (tiny /
+        # markerless) is a bot-challenge page (blocked).
+        has_snapshot = "snapshot-td" in body
+        has_ticker_echo = f"t={sym}" in body
+        big = len(body) > 50_000
+        if has_snapshot and has_ticker_echo and big:
             _set_failure(FAIL_EMPTY)
+        elif (has_snapshot or has_ticker_echo) and big:
+            log.warning(
+                "finviz: page for %s looks like a quote page but the %s "
+                "marker is missing (len=%d) — possible redesign; treating "
+                "as parse_error, NOT empty",
+                sym, "snapshot-td" if not has_snapshot else "ticker-echo",
+                len(body),
+            )
+            _set_failure(FAIL_PARSE)
         else:
             log.warning("finviz: no earningsData + non-quote page for %s "
                         "(len=%d) — treating as blocked", sym, len(body))

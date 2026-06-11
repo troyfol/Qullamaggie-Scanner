@@ -42,10 +42,9 @@ dedup (finviz > zacks > finnhub) sees identical date ranges.
 """
 from __future__ import annotations
 
-import json
 import logging
 import math
-import time
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -54,6 +53,7 @@ import pandas as pd
 
 from . import config
 from . import earnings_raw
+from . import fill_framework
 from . import finviz_client
 
 log = logging.getLogger("scanner.finviz_fill")
@@ -273,52 +273,24 @@ def _fetch_one_ticker(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Checkpoint persistence (resumable bulk runs)
+# Checkpoint persistence (resumable bulk runs) — shared impl in
+# fill_framework; thin wrappers keep the module-level names that tests
+# (and run_fill_loop's call-time hook resolution) rely on.
 # ──────────────────────────────────────────────────────────────────────
 
-@dataclass
-class _Checkpoint:
-    run_id: str
-    started_at: str
-    completed: list[str]
+_Checkpoint = fill_framework.Checkpoint
 
 
 def _save_checkpoint(cp: _Checkpoint) -> None:
-    try:
-        config.FINVIZ_BULK_CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
-        config.atomic_write_text(
-            config.FINVIZ_BULK_CHECKPOINT,
-            json.dumps({
-                "run_id": cp.run_id,
-                "started_at": cp.started_at,
-                "completed": cp.completed,
-            }),
-        )
-    except OSError as exc:
-        log.warning("Checkpoint write failed: %s", exc)
+    fill_framework.save_checkpoint(config.FINVIZ_BULK_CHECKPOINT, cp, log)
 
 
 def _load_checkpoint() -> Optional[_Checkpoint]:
-    path = config.FINVIZ_BULK_CHECKPOINT
-    if not path.exists():
-        return None
-    try:
-        d = json.loads(path.read_text(encoding="utf-8"))
-        return _Checkpoint(
-            run_id=str(d.get("run_id", "")),
-            started_at=str(d.get("started_at", "")),
-            completed=[str(t) for t in (d.get("completed") or []) if t],
-        )
-    except (OSError, ValueError) as exc:
-        log.warning("Checkpoint read failed: %s", exc)
-        return None
+    return fill_framework.load_checkpoint(config.FINVIZ_BULK_CHECKPOINT, log)
 
 
 def _clear_checkpoint() -> None:
-    try:
-        config.FINVIZ_BULK_CHECKPOINT.unlink(missing_ok=True)
-    except OSError as exc:
-        log.debug("Checkpoint clear failed: %s", exc)
+    fill_framework.clear_checkpoint(config.FINVIZ_BULK_CHECKPOINT, log)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -333,41 +305,9 @@ def _flush_pending_to_disk(
     """Merge ``pending`` (ticker → finviz rows) into
     earnings_history.parquet, replacing only the (ticker, source=finviz)
     rows for those tickers. Zacks / Finnhub rows are preserved."""
-    from . import earnings_history as eh
-
-    if not pending:
-        return
-
-    with eh.HISTORY_WRITE_LOCK:
-        existing = eh.load_earnings_history()
-        new_rows: list[dict] = []
-        for rows in pending.values():
-            new_rows.extend(rows)
-        new_df = pd.DataFrame(new_rows, columns=eh.COLUMNS)
-        # Ingest-time price-relative EPS artifact guard (reverse-split
-        # nano-caps): finviz eps_actual can carry pre-split values for
-        # sub-$5 tickers; null them before they hit disk.
-        new_df = eh.sanitize_eps_artifacts(new_df)
-
-        if not new_df.empty and new_df.duplicated(
-            subset=["ticker", "period_ending"], keep=False,
-        ).any():
-            new_df = new_df.drop_duplicates(
-                subset=["ticker", "period_ending"], keep="last",
-            ).reset_index(drop=True)
-
-        if existing is not None and not existing.empty:
-            new_tickers = set(new_df["ticker"].dropna().astype(str).unique())
-            mask_replace = (
-                existing["ticker"].astype(str).isin(new_tickers)
-                & (existing["source"] == "finviz")
-            )
-            keep = existing.loc[~mask_replace]
-            combined = pd.concat([keep, new_df], ignore_index=True)
-        else:
-            combined = new_df
-
-        eh.save_earnings_history(combined, sort=is_final)
+    fill_framework.flush_pending_to_disk(
+        pending, source="finviz", is_final=is_final,
+    )
 
 
 def _flush_next_dates_to_cache(
@@ -408,22 +348,7 @@ def _flush_next_dates_to_cache(
 
 def _finalize_fill(affected_tickers: list[str]) -> None:
     """End-of-fill: refresh YoY across the parquet + one reconcile."""
-    if not affected_tickers:
-        return
-    from . import earnings_history as eh
-    # Serialize the read→recompute→write against concurrent fills (the
-    # launch-time smart refresh runs finviz + zacks workers at once). The
-    # per-flush writes already take this lock; the finalize must too, or it
-    # reads a stale snapshot and writes back over another worker's rows.
-    with eh.HISTORY_WRITE_LOCK:
-        existing = eh.load_earnings_history()
-        if existing is not None and not existing.empty:
-            existing = eh.compute_yoy_columns(existing)
-            eh.save_earnings_history(existing, sort=True)
-    from . import earnings_reconcile  # lazy: cycle-safe
-    earnings_reconcile.reconcile_earnings_dates(
-        affected_tickers=list(set(affected_tickers))
-    )
+    fill_framework.finalize_fill(affected_tickers)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -443,7 +368,9 @@ def _fill_via_finviz(
     failed_cb=None,
     resume_from_checkpoint: bool = False,
 ) -> tuple[int, int]:
-    """Common loop body for bulk / gap / spot finviz fills.
+    """Common loop body for bulk / gap / spot finviz fills — delegates to
+    ``fill_framework.run_fill_loop``, with finviz's next-date pipeline
+    riding the after_fetch / persist_extra / after_finalize hooks.
 
     Args:
         tickers: ordered symbols to process. The caller MUST pre-union
@@ -457,53 +384,22 @@ def _fill_via_finviz(
 
     Returns ``(filled_count, error_count)``.
     """
-    work = [t for t in tickers if t and t not in blacklist]
-    if not work:
-        log.info("%s: no tickers to process", label)
-        return 0, 0
-
-    run_id = earnings_raw.new_run_id()
-    completed: set[str] = set()
-    if resume_from_checkpoint:
-        cp = _load_checkpoint()
-        if cp is not None and cp.completed:
-            completed = set(cp.completed)
-            run_id = cp.run_id or run_id
-            log.info("%s: resuming run %s with %d tickers already complete",
-                     label, run_id, len(completed))
-
-    log.info("%s: %d tickers to process (run_id=%s)", label, len(work), run_id)
-
-    pending: dict[str, list[dict]] = {}
-    raw_pending: list[dict] = []
-    # Seed with prior-session completed tickers so a kill+resume bulk still
-    # reconciles their dates at end-of-run (idempotent). See finnhub_fill.
-    affected_total: list[str] = list(completed)
-    next_pending: dict[str, pd.Timestamp] = {}  # finviz next dates buffered for the next durable flush
-    next_tickers: set[str] = set()              # cumulative — every ticker that got a next date (for the end reconcile)
-    filled = 0
-    errors = 0
-    consec_errors = 0
-    blocks_so_far = 0
-    total = len(work)
-
     today_ts = pd.Timestamp.today().normalize()
     cutoff = today_ts - pd.DateOffset(years=config.EARNINGS_HISTORY_YEARS)
 
-    first_fail_idx: Optional[int] = None
+    next_pending: dict[str, pd.Timestamp] = {}  # finviz next dates buffered for the next durable flush
+    next_tickers: set[str] = set()              # cumulative — every ticker that got a next date (for the end reconcile)
 
-    def _flush_raw():
-        if not raw_pending:
-            return
-        try:
-            earnings_raw.append_finviz_rows(raw_pending, run_id)
-        except Exception as exc:
-            log.warning("Finviz raw-layer write failed: %s", exc)
-        raw_pending.clear()
+    def _capture_next_date(sym, result):
+        # Capture finviz's next scheduled date (rides on a dropped forward
+        # row) for any successful fetch — buffered for the next durable
+        # flush (persist_extra) and tracked cumulatively for the
+        # end-of-run reconcile.
+        if result.failure is None and result.next_date is not None:
+            next_pending[sym] = result.next_date
+            next_tickers.add(sym)
 
-    def _persist_progress():
-        _flush_pending_to_disk(pending)
-        _flush_raw()
+    def _persist_next_dates():
         # Durably write finviz next dates BEFORE the checkpoint advances, so
         # a ticker is never recorded as `completed` while its next date
         # lives only in memory (a hard crash + resume would skip it →
@@ -511,156 +407,42 @@ def _fill_via_finviz(
         # successful write so a failed flush retries on the next persist.
         if _flush_next_dates_to_cache(next_pending, datetime.now()):
             next_pending.clear()
-        _save_checkpoint(_Checkpoint(
-            run_id=run_id,
-            started_at=datetime.now().isoformat(timespec="seconds"),
-            completed=sorted(completed),
-        ))
 
-    i = 0
-    while i < total:
-        if stop_flag and stop_flag[0]:
-            log.info("%s: stopped at %d/%d", label, i, total)
-            break
+    def _reconcile_next_only(affected_total):
+        # finviz next dates for tickers that yielded no NEW history row still
+        # need a reconcile to fold their next_earnings into the dates row
+        # (_finalize_fill only reconciles history-affected tickers). Use the
+        # cumulative next_tickers set — next_pending was drained by the flushes.
+        next_only = sorted(next_tickers - set(affected_total))
+        if next_only:
+            try:
+                from . import earnings_reconcile  # lazy: cycle-safe
+                earnings_reconcile.reconcile_earnings_dates(affected_tickers=next_only)
+            except Exception as exc:
+                log.warning("Reconcile of finviz next-only tickers failed: %s", exc)
 
-        sym = work[i]
-        if sym in completed:
-            i += 1
-            continue
-
-        fetch_now = datetime.now()
-        result = _fetch_one_ticker(sym, cutoff=cutoff, now=fetch_now)
-
-        # Capture finviz's next scheduled date (rides on a dropped forward
-        # row) for any successful fetch — buffered for the next durable
-        # flush (in _persist_progress) and tracked cumulatively for the
-        # end-of-run reconcile.
-        if result.failure is None and result.next_date is not None:
-            next_pending[sym] = result.next_date
-            next_tickers.add(sym)
-
-        if result.failure is None and result.rows:
-            pending[sym] = result.rows
-            for raw in result.raw_records:
-                raw_pending.append(raw)
-            affected_total.append(sym)
-            completed.add(sym)
-            filled += 1
-            consec_errors = 0
-            first_fail_idx = None
-        elif result.failure is None and not result.rows:
-            # 200 OK but every entry filtered (all forward / all >5y).
-            completed.add(sym)
-            consec_errors = 0
-            first_fail_idx = None
-        elif result.is_empty:
-            # finviz doesn't cover the ticker — blacklist; NOT a block.
-            errors += 1
-            completed.add(sym)
-            consec_errors = 0
-            first_fail_idx = None
-            if on_empty_identified is not None:
-                try:
-                    on_empty_identified(sym)
-                except Exception:
-                    pass
-            if failed_cb is not None:
-                try:
-                    failed_cb(sym, finviz_client.FAIL_EMPTY)
-                except Exception:
-                    pass
-        else:
-            # Real failure (rate_limited / blocked / server / network /
-            # parse / forbidden) — counts toward the block streak.
-            errors += 1
-            consec_errors += 1
-            if first_fail_idx is None:
-                first_fail_idx = i
-            log.warning("%s: %s → fetch failure (kind=%s, consec=%d)",
-                        label, sym, result.failure or "unknown", consec_errors)
-            if failed_cb is not None:
-                try:
-                    failed_cb(sym, result.failure or "unknown")
-                except Exception:
-                    pass
-
-        if progress_cb:
-            progress_cb(i + 1, total)
-
-        if len(pending) >= flush_every:
-            _persist_progress()
-            log.info(
-                "%s: flushed %d ticker(s) (%d/%d processed, "
-                "%d filled, %d errors so far)",
-                label, len(pending), i + 1, total, filled, errors,
-            )
-            pending = {}
-
-        if (i + 1) % 200 == 0:
-            log.info("%s: %d/%d processed (%d filled, %d errors, %d blocks)",
-                     label, i + 1, total, filled, errors, blocks_so_far)
-
-        # Block trigger
-        if consec_errors >= config.FINVIZ_CONSEC_BLOCK_LIMIT:
-            blocks_so_far += 1
-            pause_sec = min(
-                config.FINVIZ_INITIAL_BLOCK_PAUSE_SEC * (2 ** (blocks_so_far - 1)),
-                config.FINVIZ_MAX_BLOCK_PAUSE_SEC,
-            )
-            log.warning(
-                "%s: %d consecutive failures (block #%d) — pausing %ds",
-                label, consec_errors, blocks_so_far, pause_sec,
-            )
-            time.sleep(pause_sec)
-
-            if blocks_so_far >= config.FINVIZ_MAX_BLOCKS_PER_RUN:
-                if on_block_callback is not None:
-                    decision = on_block_callback(consec_errors, blocks_so_far)
-                    if decision == "stop":
-                        log.info("%s: on_block_callback returned 'stop'", label)
-                        break
-                else:
-                    log.warning(
-                        "%s: hit %d blocks with no callback configured — halting",
-                        label, blocks_so_far,
-                    )
-                    break
-
-            # Rewind to the first ticker in the failure window and retry.
-            rewind_to = first_fail_idx if first_fail_idx is not None else i
-            rewind_count = i + 1 - rewind_to
-            errors = max(0, errors - rewind_count)
-            consec_errors = 0
-            first_fail_idx = None
-            i = rewind_to
-            log.info("%s: rewinding %d ticker(s) to retry block window (i=%d)",
-                     label, rewind_count, i)
-            if progress_cb:
-                progress_cb(i, total)
-            continue
-
-        i += 1
-
-    _persist_progress()   # flushes remaining history + next dates + checkpoint
-    _finalize_fill(affected_total)
-    # finviz next dates for tickers that yielded no NEW history row still
-    # need a reconcile to fold their next_earnings into the dates row
-    # (_finalize_fill only reconciles history-affected tickers). Use the
-    # cumulative next_tickers set — next_pending was drained by the flushes.
-    next_only = sorted(next_tickers - set(affected_total))
-    if next_only:
-        try:
-            from . import earnings_reconcile  # lazy: cycle-safe
-            earnings_reconcile.reconcile_earnings_dates(affected_tickers=next_only)
-        except Exception as exc:
-            log.warning("Reconcile of finviz next-only tickers failed: %s", exc)
-
-    if not (stop_flag and stop_flag[0]):
-        _clear_checkpoint()
-
-    log.info("%s done: %d filled, %d errors, %d blocks",
-             label, filled, errors, blocks_so_far)
-    return filled, errors
+    spec = fill_framework.FillSpec(
+        module=sys.modules[__name__],   # hooks resolved through here at call time
+        log=log,
+        config_prefix="FINVIZ",
+        fail_empty=finviz_client.FAIL_EMPTY,
+        append_raw_rows=lambda rows, rid: earnings_raw.append_finviz_rows(rows, rid),
+        raw_label="Finviz",
+        warn_on_fetch_failure=True,
+    )
+    return fill_framework.run_fill_loop(
+        spec, tickers, blacklist,
+        fetch_kwargs={"cutoff": cutoff},
+        progress_cb=progress_cb, stop_flag=stop_flag,
+        flush_every=flush_every, label=label,
+        on_block_callback=on_block_callback,
+        on_empty_identified=on_empty_identified,
+        failed_cb=failed_cb,
+        resume_from_checkpoint=resume_from_checkpoint,
+        after_fetch=_capture_next_date,
+        persist_extra=_persist_next_dates,
+        after_finalize=_reconcile_next_only,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -791,13 +573,6 @@ def find_finviz_gap_tickers(
 ) -> list[str]:
     """Return tickers in ``universe ∩ (not blacklist)`` whose
     ``source=finviz`` row count in earnings_history.parquet is 0."""
-    from . import earnings_history as eh
-    have_finviz: set[str] = set()
-    df = eh.load_earnings_history()
-    if df is not None and not df.empty and "source" in df.columns:
-        fv = df.loc[df["source"] == "finviz"]
-        have_finviz = set(fv["ticker"].astype(str).unique())
-    return [
-        t for t in universe_symbols
-        if t not in blacklist and t not in have_finviz
-    ]
+    return fill_framework.find_gap_tickers(
+        universe_symbols, blacklist, source="finviz",
+    )

@@ -7,14 +7,6 @@ import pandas as pd
 import pytest
 
 
-@pytest.fixture(scope="module")
-def _qapp():
-    from PyQt6.QtWidgets import QApplication
-    import sys
-    app = QApplication.instance() or QApplication(sys.argv[:1])
-    yield app
-
-
 @pytest.fixture(autouse=True)
 def _no_launch_data_pipeline(monkeypatch):
     """The full-``MainWindow()`` tests below construct a real window to

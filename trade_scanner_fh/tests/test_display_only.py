@@ -193,13 +193,6 @@ def test_consec_rev_beats_display_only_lets_individual_rev_filter_apply():
 # IndicatorRow / IndicatorPanel UI behavior
 # ----------------------------------------------------------------------
 
-@pytest.fixture(scope="module")
-def _qapp():
-    from PyQt6.QtWidgets import QApplication
-    import sys
-    return QApplication.instance() or QApplication(sys.argv[:1])
-
-
 @pytest.fixture
 def panel(_qapp):
     from trade_scanner_fh.gui.widgets import IndicatorPanel

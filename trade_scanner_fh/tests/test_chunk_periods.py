@@ -7,14 +7,6 @@ import pytest
 from trade_scanner_fh.scanner import chunk_periods
 
 
-@pytest.fixture(scope="module")
-def _qapp():
-    from PyQt6.QtWidgets import QApplication
-    import sys
-    app = QApplication.instance() or QApplication(sys.argv[:1])
-    yield app
-
-
 def test_sequenced_run_dialog_today_button_sets_end_date(_qapp):
     """The "Today" quick-select next to End snaps the end-date input
     to today's date in one click."""

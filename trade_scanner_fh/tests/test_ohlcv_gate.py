@@ -11,14 +11,6 @@ import pytest
 from trade_scanner_fh import config
 
 
-@pytest.fixture(scope="module")
-def _qapp():
-    from PyQt6.QtWidgets import QApplication
-    import sys
-    app = QApplication.instance() or QApplication(sys.argv[:1])
-    yield app
-
-
 class _FakeSettings:
     def __init__(self, value):
         self._value = value

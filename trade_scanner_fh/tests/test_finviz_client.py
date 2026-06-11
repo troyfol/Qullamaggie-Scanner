@@ -71,13 +71,35 @@ def test_fetch_earnings_empty_array_is_returned(monkeypatch):
 
 
 def test_fetch_earnings_no_key_on_quote_page_is_empty(monkeypatch):
-    # A real finviz quote page (snapshot-td marker, big) but no
-    # earningsData → uncovered ticker (ETF / fund) → FAIL_EMPTY.
-    body = '<div class="snapshot-td-label">x</div>' + ("y" * 60_000)
+    # A real finviz quote page (snapshot-td marker + ticker echo, big)
+    # but no earningsData → uncovered ticker (ETF / fund) → FAIL_EMPTY.
+    body = ('<div class="snapshot-td-label">x</div>'
+            '<a href="quote.ashx?t=SPY&p=d">SPY</a>' + ("y" * 60_000))
     monkeypatch.setattr(finviz_client.creq, "get",
                         lambda *a, **k: _Resp(200, body))
     assert finviz_client.fetch_earnings("SPY") is None
     assert finviz_client.last_failure_kind() == finviz_client.FAIL_EMPTY
+
+
+def test_fetch_earnings_stripped_snapshot_marker_is_parse_not_empty(monkeypatch):
+    # B2: ticker echo present but the snapshot-td marker stripped (finviz
+    # redesign) — must degrade to a LOUD parse_error, never a silent
+    # FAIL_EMPTY that would blacklist the ticker.
+    body = '<a href="quote.ashx?t=AAOI&p=d">AAOI</a>' + ("y" * 60_000)
+    monkeypatch.setattr(finviz_client.creq, "get",
+                        lambda *a, **k: _Resp(200, body))
+    assert finviz_client.fetch_earnings("AAOI") is None
+    assert finviz_client.last_failure_kind() == finviz_client.FAIL_PARSE
+
+
+def test_fetch_earnings_stripped_ticker_echo_is_parse_not_empty(monkeypatch):
+    # B2: the inverse disagreement — snapshot-td present but no ticker
+    # echo anywhere on a big page → also a redesign suspect → parse_error.
+    body = '<div class="snapshot-td-label">x</div>' + ("y" * 60_000)
+    monkeypatch.setattr(finviz_client.creq, "get",
+                        lambda *a, **k: _Resp(200, body))
+    assert finviz_client.fetch_earnings("SPY") is None
+    assert finviz_client.last_failure_kind() == finviz_client.FAIL_PARSE
 
 
 def test_fetch_earnings_tiny_nonquote_page_is_blocked(monkeypatch):

@@ -9,38 +9,9 @@ from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
-import pytest
 
 from trade_scanner_fh import config, scanner
 from trade_scanner_fh.scanner import ScanParams
-
-
-@pytest.fixture(scope="module")
-def _qapp():
-    from PyQt6.QtWidgets import QApplication
-    import sys
-    app = QApplication.instance() or QApplication(sys.argv[:1])
-    yield app
-
-
-@pytest.fixture
-def fake_scan_cache(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(config, "PARQUET_DIR", tmp_path / "ohlcv")
-    monkeypatch.setattr(
-        config, "EARNINGS_HISTORY_PARQUET",
-        tmp_path / "earnings_history.parquet",
-    )
-    monkeypatch.setattr(
-        config, "EARNINGS_PARQUET",
-        tmp_path / "earnings_dates.parquet",
-    )
-    monkeypatch.setattr(
-        config, "SECTOR_MAP_PARQUET",
-        tmp_path / "sector_map.parquet",
-    )
-    (tmp_path / "ohlcv").mkdir(parents=True, exist_ok=True)
-    return tmp_path
 
 
 def _hist_row(ticker, period_str, report_str, eps_pct=5.0, rev_pct=5.0):

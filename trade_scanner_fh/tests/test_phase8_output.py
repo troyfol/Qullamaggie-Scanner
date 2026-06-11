@@ -5,19 +5,10 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from trade_scanner_fh.gui.widgets import (
     RESULT_COLUMNS, DATE_COLUMN_KEYS, _build_dynamic_columns,
 )
-
-
-@pytest.fixture(scope="module")
-def _qapp():
-    from PyQt6.QtWidgets import QApplication
-    import sys
-    app = QApplication.instance() or QApplication(sys.argv[:1])
-    yield app
 
 
 def _build_row(symbol: str, **extras) -> dict:

@@ -215,6 +215,25 @@ misbehaves.
 
 ---
 
+## 9. Running tests + coverage (developers)
+
+From the repo root, run the suite with the project's Python environment:
+
+```sh
+python -m pytest trade_scanner_fh/tests -q
+```
+
+The suite is fully headless — all network calls are mocked, and Qt widget
+tests share a single offscreen `QApplication` (see `tests/conftest.py`).
+With `pytest-cov` installed (`pip install pytest-cov`), add a line-coverage
+report:
+
+```sh
+python -m pytest trade_scanner_fh/tests -q --cov=trade_scanner_fh --cov-report=term
+```
+
+---
+
 > **Disclaimer.** This software is for informational and educational
 > purposes only and is not financial advice. Data from third-party
 > providers may be inaccurate or incomplete. Use at your own risk. See the

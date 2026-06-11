@@ -29,14 +29,6 @@ import pytest
 from trade_scanner_fh import zacks_scraper as zs
 
 
-@pytest.fixture(scope="module")
-def _qapp():
-    from PyQt6.QtWidgets import QApplication
-    import sys
-    app = QApplication.instance() or QApplication(sys.argv[:1])
-    yield app
-
-
 @pytest.fixture
 def tmp_data_dir(tmp_path, monkeypatch):
     """Redirect config.DATA_DIR to a tmp path. The persistent profile

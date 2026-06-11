@@ -72,7 +72,7 @@ import pandas as pd
 
 from . import config
 from . import earnings_raw
-from .zacks_scraper import FAIL_BLOCKED, ZacksSession
+from .zacks_scraper import FAIL_BLOCKED, FAIL_PARSE_ERROR, ZacksSession
 
 log = logging.getLogger("scanner.earnings_history")
 
@@ -1413,6 +1413,10 @@ def _fill_via_zacks(
     errors = 0
     consec_errors = 0
     total = len(work)
+    # Parse-failure spike alarm (B2): fetch attempts vs. parse_error
+    # classifications across the run — see the halt check in the loop.
+    spike_attempts = 0
+    spike_parse_fails = 0
 
     def _flush_raw():
         if not raw_pending:
@@ -1436,9 +1440,12 @@ def _fill_via_zacks(
             except Exception as exc:
                 log.debug("[%s] unexpected exception: %s", sym, exc)
                 rows = None
+            spike_attempts += 1
 
             if rows is None or len(rows) == 0:
                 errors += 1
+                if rows is None and session.last_failure_kind == FAIL_PARSE_ERROR:
+                    spike_parse_fails += 1
                 # Audit M1: only confirmed Imperva blocks advance the
                 # auto-pause counter. "ticker not on Zacks" / parse
                 # errors / network glitches reset it so a long alphabetical
@@ -1490,6 +1497,27 @@ def _fill_via_zacks(
 
             if progress_cb:
                 progress_cb(i + 1, total)
+
+            # Parse-failure spike alarm (B2): a high fraction of
+            # parse_error classifications means Zacks changed the page
+            # format (a parser break on OUR side), not that N tickers
+            # went bad. Halt loudly instead of churning the rest of the
+            # run. parse_error tickers land in their own failed_cb
+            # bucket — NOT the not_found bucket the GUI auto-blacklists
+            # — so a parser break can never poison the skip list.
+            # Thresholds read at call time so overrides apply mid-run.
+            if (spike_attempts >= config.PARSE_SPIKE_MIN_SAMPLE
+                    and spike_parse_fails * 100.0
+                    >= config.PARSE_SPIKE_FAIL_PCT * spike_attempts):
+                log.error(
+                    "%s: PARSE-FAILURE SPIKE — %d of %d fetches (%.0f%%) "
+                    "were parse errors; HALTING the run (Zacks page format "
+                    "has likely changed; affected tickers were NOT "
+                    "blacklisted)",
+                    label, spike_parse_fails, spike_attempts,
+                    spike_parse_fails * 100.0 / spike_attempts,
+                )
+                break
 
             if len(pending) >= flush_every:
                 # Audit L8: skip the per-flush sort; one final sorted

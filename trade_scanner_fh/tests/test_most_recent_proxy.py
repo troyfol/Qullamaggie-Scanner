@@ -8,24 +8,9 @@ from __future__ import annotations
 from datetime import date, datetime
 
 import pandas as pd
-import pytest
 
 from trade_scanner_fh import config, scanner
 from trade_scanner_fh.scanner import ScanParams
-
-
-@pytest.fixture
-def fake_scan_cache(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(config, "PARQUET_DIR", tmp_path / "ohlcv")
-    monkeypatch.setattr(config, "EARNINGS_HISTORY_PARQUET",
-                        tmp_path / "earnings_history.parquet")
-    monkeypatch.setattr(config, "EARNINGS_PARQUET",
-                        tmp_path / "earnings_dates.parquet")
-    monkeypatch.setattr(config, "SECTOR_MAP_PARQUET",
-                        tmp_path / "sector_map.parquet")
-    (tmp_path / "ohlcv").mkdir(parents=True, exist_ok=True)
-    return tmp_path
 
 
 def _write_ohlcv(symbol, end, days=200, close=100.0):

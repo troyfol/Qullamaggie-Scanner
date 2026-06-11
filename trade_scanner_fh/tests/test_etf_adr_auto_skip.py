@@ -18,14 +18,6 @@ import pandas as pd
 import pytest
 
 
-@pytest.fixture(scope="module")
-def _qapp():
-    from PyQt6.QtWidgets import QApplication
-    import sys
-    app = QApplication.instance() or QApplication(sys.argv[:1])
-    yield app
-
-
 @pytest.fixture
 def mw(_qapp, tmp_path, monkeypatch):
     """Build a MainWindow instance via ``__new__`` so __init__ doesn't

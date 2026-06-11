@@ -7,19 +7,8 @@ from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
-import pytest
 
 from trade_scanner_fh import earnings_history as eh
-
-
-@pytest.fixture
-def tmp_parquets(tmp_path, monkeypatch):
-    monkeypatch.setattr(eh.config, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(eh.config, "EARNINGS_HISTORY_PARQUET",
-                        tmp_path / "earnings_history.parquet")
-    monkeypatch.setattr(eh.config, "EARNINGS_PARQUET",
-                        tmp_path / "earnings_dates.parquet")
-    return tmp_path
 
 
 def _good_row():

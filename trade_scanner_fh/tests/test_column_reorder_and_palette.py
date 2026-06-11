@@ -17,14 +17,6 @@ import pandas as pd
 import pytest
 
 
-@pytest.fixture(scope="module")
-def _qapp():
-    from PyQt6.QtWidgets import QApplication
-    import sys
-    app = QApplication.instance() or QApplication(sys.argv[:1])
-    yield app
-
-
 def _row(symbol="A", **extras):
     base = {"symbol": symbol, "close": 100.0,
             "price": 100.0, "pct_gain": 10.0}

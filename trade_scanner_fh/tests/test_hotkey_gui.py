@@ -15,14 +15,6 @@ from trade_scanner_fh.hotkey import (
 )
 
 
-@pytest.fixture(scope="module")
-def _qapp():
-    from PyQt6.QtWidgets import QApplication
-    import sys
-    app = QApplication.instance() or QApplication(sys.argv[:1])
-    yield app
-
-
 @pytest.fixture(autouse=True)
 def _no_launch_data_pipeline(monkeypatch):
     """MainWindow.__init__ would otherwise kick off launch-time data/

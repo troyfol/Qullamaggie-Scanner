@@ -288,6 +288,42 @@ def _extract_obj_data(html: str) -> Optional[dict]:
         return None
 
 
+# B2 resilience: drift-tolerant fallback matcher. The strict extractor
+# above keys on the exact `document.obj_data = {` form; a Zacks JS
+# refactor (window.obj_data, var obj_data, document["obj_data"] = ...,
+# "obj_data": {...} inside a bigger literal) would silently break it even
+# though the payload itself is unchanged. This regex accepts any
+# `obj_data`-ish token followed by an assignment-or-key separator and an
+# opening brace.
+_OBJ_DATA_FALLBACK_RE = re.compile(r"""obj_data['"\]\s]*[=:]\s*\{""")
+
+# Bare token used by fetch() to tell a page-format break ("obj_data is
+# there but neither parser can read it" → FAIL_PARSE_ERROR) from a real
+# coverage gap (no obj_data anywhere → FAIL_NOT_FOUND).
+_OBJ_DATA_TOKEN = "obj_data"
+
+
+def _extract_obj_data_fallback(html: str) -> Optional[dict]:
+    """Fallback for `_extract_obj_data` tolerant of assignment-form drift
+    (B2 resilience). Tries every obj_data-ish assignment in the page and
+    hands the opening brace to `json.JSONDecoder.raw_decode`, which scans
+    a single JSON value and tolerates arbitrary trailing script text — so
+    no end-detection (brace walk) is needed at all. Returns the first
+    candidate that parses to a dict, else None."""
+    decoder = json.JSONDecoder()
+    for m in _OBJ_DATA_FALLBACK_RE.finditer(html):
+        start = m.end() - 1  # position of opening '{'
+        try:
+            parsed, _end = decoder.raw_decode(html, start)
+        except json.JSONDecodeError as exc:
+            log.debug("fallback obj_data candidate at %d unparseable: %s",
+                      m.start(), exc)
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Row → spec-schema dict
 # ──────────────────────────────────────────────────────────────────────
@@ -1036,9 +1072,40 @@ class ZacksSession:
                 log.debug("[%s] Imperva interstitial detected", symbol)
                 self.last_failure_kind = FAIL_BLOCKED
                 return None
-            log.debug("[%s] obj_data not found in page (Zacks may not cover this ticker)", symbol)
-            self.last_failure_kind = FAIL_NOT_FOUND
-            return None
+            # B2 resilience: not a block page — before classifying, try
+            # the drift-tolerant fallback extractor in case Zacks changed
+            # the obj_data assignment syntax out from under the strict
+            # regex / brace walk.
+            obj_data = _extract_obj_data_fallback(text)
+            if obj_data:
+                log.warning(
+                    "[%s] obj_data recovered via fallback parser — Zacks "
+                    "page syntax has drifted (update _OBJ_DATA_START_RE)",
+                    symbol,
+                )
+            elif obj_data is not None:
+                # Parsed but EMPTY: the page carries a literal
+                # `obj_data = {}` — perfectly readable, Zacks just has no
+                # tables for this ticker. Fall through to the
+                # FAIL_NOT_FOUND check below so the ticker stays
+                # auto-blacklistable and never counts toward the
+                # parse-spike alarm (only a genuinely-unparseable page is
+                # a parser break).
+                pass
+            elif _OBJ_DATA_TOKEN in text:
+                # obj_data exists on the page but neither parser could
+                # read it → a page-format break, NOT a coverage gap.
+                # Keeping these out of FAIL_NOT_FOUND matters: the GUI
+                # auto-blacklists not_found tickers after each run, and
+                # a parser break must never poison the skip list.
+                log.warning("[%s] obj_data present but unparseable — "
+                            "page-format break suspected", symbol)
+                self.last_failure_kind = FAIL_PARSE_ERROR
+                return None
+            else:
+                log.debug("[%s] obj_data not found in page (Zacks may not cover this ticker)", symbol)
+                self.last_failure_kind = FAIL_NOT_FOUND
+                return None
 
         eps_raw = obj_data.get(_EPS_KEY) or []
         rev_raw = obj_data.get(_REV_KEY) or []

@@ -3,15 +3,6 @@ beats triplet (EPS and Rev), and its blue/green highlighting."""
 from __future__ import annotations
 
 import pandas as pd
-import pytest
-
-
-@pytest.fixture(scope="module")
-def _qapp():
-    from PyQt6.QtWidgets import QApplication
-    import sys
-    app = QApplication.instance() or QApplication(sys.argv[:1])
-    yield app
 
 
 def _row(symbol: str, **extras) -> dict:

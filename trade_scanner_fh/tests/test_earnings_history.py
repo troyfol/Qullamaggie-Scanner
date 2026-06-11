@@ -37,21 +37,6 @@ def _row(
     }
 
 
-@pytest.fixture
-def tmp_parquets(tmp_path, monkeypatch):
-    """Redirect both parquet paths to a tmp directory."""
-    monkeypatch.setattr(eh.config, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(
-        eh.config, "EARNINGS_HISTORY_PARQUET",
-        tmp_path / "earnings_history.parquet",
-    )
-    monkeypatch.setattr(
-        eh.config, "EARNINGS_PARQUET",
-        tmp_path / "earnings_dates.parquet",
-    )
-    return tmp_path
-
-
 # ----------------------------------------------------------------------
 # YoY columns — compute_yoy_columns
 # ----------------------------------------------------------------------

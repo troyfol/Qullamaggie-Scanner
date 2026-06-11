@@ -6,7 +6,6 @@ from datetime import datetime
 from unittest.mock import patch
 
 import pandas as pd
-import pytest
 
 from trade_scanner_fh import (
     earnings_cache as ec,
@@ -18,18 +17,6 @@ from trade_scanner_fh import (
 # ──────────────────────────────────────────────────────────────────────
 # Fixtures + helpers
 # ──────────────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def tmp_parquets(tmp_path, monkeypatch):
-    """Redirect both parquet paths into a tmp directory so reconciler
-    tests don't touch the user's real cache."""
-    monkeypatch.setattr(eh.config, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(eh.config, "EARNINGS_HISTORY_PARQUET",
-                        tmp_path / "earnings_history.parquet")
-    monkeypatch.setattr(eh.config, "EARNINGS_PARQUET",
-                        tmp_path / "earnings_dates.parquet")
-    return tmp_path
-
 
 def _hist_row(
     ticker: str, period_str: str, report_str: str, *,

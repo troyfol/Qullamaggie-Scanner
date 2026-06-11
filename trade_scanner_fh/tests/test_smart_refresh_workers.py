@@ -12,14 +12,6 @@ from __future__ import annotations
 import pytest
 
 
-@pytest.fixture(scope="module")
-def _qapp():
-    from PyQt6.QtWidgets import QApplication
-    import sys
-    app = QApplication.instance() or QApplication(sys.argv[:1])
-    yield app
-
-
 def test_finviz_worker_targeted_calls_gap_fill(_qapp, monkeypatch):
     """mode='targeted' must NOT raise — it routes to gap_fill_finviz with
     exactly the supplied symbols."""

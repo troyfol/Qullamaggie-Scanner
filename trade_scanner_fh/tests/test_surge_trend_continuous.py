@@ -12,14 +12,6 @@ from trade_scanner_fh import indicators, scanner
 from trade_scanner_fh.scanner import ScanParams
 
 
-@pytest.fixture(scope="module")
-def _qapp():
-    from PyQt6.QtWidgets import QApplication
-    import sys
-    app = QApplication.instance() or QApplication(sys.argv[:1])
-    yield app
-
-
 def _ohlcv_from_closes(closes: list[float]) -> pd.DataFrame:
     """Build a synthetic OHLCV frame from a list of closes — opens =
     closes (no overnight gaps), highs/lows ±1%."""

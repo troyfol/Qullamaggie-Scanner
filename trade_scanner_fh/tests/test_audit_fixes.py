@@ -19,41 +19,6 @@ from trade_scanner_fh.zacks_scraper import (
 )
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Fixtures
-# ──────────────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def tmp_parquets(tmp_path, monkeypatch):
-    monkeypatch.setattr(eh.config, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(eh.config, "EARNINGS_HISTORY_PARQUET",
-                        tmp_path / "earnings_history.parquet")
-    monkeypatch.setattr(eh.config, "EARNINGS_PARQUET",
-                        tmp_path / "earnings_dates.parquet")
-    return tmp_path
-
-
-@pytest.fixture
-def fake_scan_cache(tmp_path, monkeypatch):
-    """Wire every cache directory + parquet path into tmp_path."""
-    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(config, "PARQUET_DIR", tmp_path / "ohlcv")
-    monkeypatch.setattr(
-        config, "EARNINGS_HISTORY_PARQUET",
-        tmp_path / "earnings_history.parquet",
-    )
-    monkeypatch.setattr(
-        config, "EARNINGS_PARQUET",
-        tmp_path / "earnings_dates.parquet",
-    )
-    monkeypatch.setattr(
-        config, "SECTOR_MAP_PARQUET",
-        tmp_path / "sector_map.parquet",
-    )
-    (tmp_path / "ohlcv").mkdir(parents=True, exist_ok=True)
-    return tmp_path
-
-
 def _hist_row(ticker, period_str, report_str, *, eps_pct=5.0, rev_pct=5.0):
     return {
         "ticker": ticker,

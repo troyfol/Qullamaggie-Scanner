@@ -268,19 +268,6 @@ def test_consec_beats_missing_column_fails_all():
 # IndicatorPanel round-trip (§11 §7 verification step)
 # ──────────────────────────────────────────────────────────────────────
 
-@pytest.fixture(scope="module")
-def _qapp():
-    """Module-level QApplication so widget tests can instantiate without
-    pytest-qt. The codebase doesn't depend on pytest-qt so we keep tests
-    self-contained."""
-    from PyQt6.QtWidgets import QApplication
-    import sys
-    app = QApplication.instance() or QApplication(sys.argv[:1])
-    yield app
-    # No teardown — let the process exit normally; QApplication.quit()
-    # mid-suite makes subsequent fixture instantiations flaky.
-
-
 @pytest.fixture
 def panel(_qapp):
     """Fresh IndicatorPanel for each test."""

@@ -13,7 +13,6 @@ EARNINGS_REFRESH_RECHECK_GUARD_DAYS (5) days is not re-queued.
 from __future__ import annotations
 
 import pandas as pd
-import pytest
 
 from trade_scanner_fh import (
     earnings_cache as ec,
@@ -29,18 +28,6 @@ TODAY = pd.Timestamp("2026-04-30")
 # An "old" fetch time well outside the re-poll guard window — the default
 # so staleness tests aren't accidentally suppressed by the guard.
 OLD_FETCH = pd.Timestamp("2026-01-01")
-
-
-@pytest.fixture
-def tmp_parquets(tmp_path, monkeypatch):
-    """Redirect parquet paths to tmp_path so the selector reads only the
-    rows each test seeds."""
-    monkeypatch.setattr(eh.config, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(eh.config, "EARNINGS_HISTORY_PARQUET",
-                        tmp_path / "earnings_history.parquet")
-    monkeypatch.setattr(eh.config, "EARNINGS_PARQUET",
-                        tmp_path / "earnings_dates.parquet")
-    return tmp_path
 
 
 def _hist(ticker: str, report_date: str, *, updated: pd.Timestamp = OLD_FETCH) -> dict:

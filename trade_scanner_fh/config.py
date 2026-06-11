@@ -448,6 +448,19 @@ FINVIZ_MAX_RESPONSE_BYTES = 20 * 1024 * 1024
 ZACKS_MAX_RESPONSE_BYTES = 25 * 1024 * 1024
 FINNHUB_MAX_RESPONSE_BYTES = 25 * 1024 * 1024
 
+# -- Parse-failure spike alarm (scraper resilience, step B2) ---------------
+# A sudden cluster of parse_error classifications across many tickers means
+# the SOURCE changed its page / JSON layout (a parser break on OUR side),
+# not that dozens of tickers individually went bad. The fill loops (shared
+# fill_framework loop + the Zacks loop in earnings_history) track the
+# parse-failure fraction of the run and HALT loudly once it spikes, instead
+# of churning the rest of the universe — and the affected tickers are never
+# blacklisted (a parser break must not poison the per-source blacklists).
+# The alarm only arms once at least MIN_SAMPLE tickers have been attempted,
+# so a couple of flaky pages at the start of a run can't false-trip it.
+PARSE_SPIKE_MIN_SAMPLE = 25   # fetch attempts before the alarm may trip
+PARSE_SPIKE_FAIL_PCT = 40.0   # halt when parse failures reach this % of attempts
+
 # -- EDGAR earnings source ------------------------------------------------
 # REMOVED 2026-05-31. The SEC submissions + XBRL companyfacts per-quarter
 # earnings source (GAAP EPS/revenue) was dropped — GAAP figures aren't
@@ -661,9 +674,10 @@ USER_CONFIG_INT_RANGES: dict = {
 }
 
 # Plausible exchange ticker: leading letter, then letters/digits/dot/hyphen,
-# 10 chars max (covers BRK.B / BF-B style class shares). Public — the
-# Advanced dialog uses it to name the offending entry in its warning.
-PLAUSIBLE_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
+# 10 chars max (covers BRK.B / BF-B style class shares). \Z (not $) so a
+# trailing newline can't sneak past .match(). Public — the Advanced dialog
+# uses it to name the offending entry in its warning.
+PLAUSIBLE_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}\Z")
 
 
 def user_config_path() -> Path:

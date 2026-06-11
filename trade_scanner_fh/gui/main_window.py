@@ -40,10 +40,14 @@ from ..hotkey import HotkeyConfig
 from ..scanner import ScanResult, chunk_periods
 from ..ticker_universe import load_universe
 from ..tradestation import BridgeConfig
+from .blacklists import BlacklistManager, normalize_ticker
+from .columns import ColumnManager
 from .dialogs import (
     ColumnsManagerDialog, ExcelExportDialog, SequencedRunDialog,
     WatchlistDialog,
 )
+from .earnings_coordinator import EarningsRefreshCoordinator
+from .exports import ExportsController
 from .hotkey_dialog import HotkeySettingsDialog
 from .theme import DARK_STYLESHEET
 from .widgets import (
@@ -1313,210 +1317,78 @@ class MainWindow(QMainWindow):
         self.status.addPermanentWidget(self._update_label)
 
     # ── Earnings smart-refresh progress panel ───────────────────────────
-    # Three concurrent fill sources (finviz / zacks / finnhub) each clobber
-    # the single shared status bar, so the smart refresh had no usable
-    # progress surface. This panel gives each source its own bar (hover for
-    # per-source detail) plus a single Stop button that halts all three.
+    # The 3-bar progress panel and the wider multi-source earnings refresh
+    # orchestration live in EarningsRefreshCoordinator
+    # (earnings_coordinator.py). MainWindow keeps every historical method
+    # name below as a thin delegate so signal wiring, menu actions, and
+    # tests are untouched.
 
-    _EARN_SOURCES = ("finviz", "zacks", "finnhub")
-    _EARN_SRC_COLORS = {
-        "finviz":  "#4a90d9",   # blue
-        "zacks":   "#9b6cd6",   # purple
-        "finnhub": "#3aa676",   # green
-    }
+    _EARN_SOURCES = EarningsRefreshCoordinator._EARN_SOURCES
+    _EARN_SRC_COLORS = EarningsRefreshCoordinator._EARN_SRC_COLORS
+
+    @property
+    def _earn_coord(self) -> EarningsRefreshCoordinator:
+        """Lazily-created earnings-refresh coordinator. Looked up via
+        ``__dict__`` (not getattr) because bare ``MainWindow.__new__``
+        test shells raise RuntimeError when attribute lookup falls
+        through to the uninitialized Qt C++ side."""
+        coord = self.__dict__.get("_earn_coord_obj")
+        if coord is None:
+            coord = EarningsRefreshCoordinator(self)
+            self.__dict__["_earn_coord_obj"] = coord
+        return coord
+
+    # Coordinator-owned state, re-exposed under the historical attribute
+    # names (tests and intra-window code read these on the window).
+
+    @property
+    def _earn_prog_state(self) -> dict[str, dict]:
+        return self._earn_coord._earn_prog_state
+
+    @property
+    def _earn_prog_bars(self) -> dict[str, QProgressBar]:
+        return self._earn_coord._earn_prog_bars
+
+    @property
+    def _earn_prog_panel(self) -> QFrame:
+        return self._earn_coord._earn_prog_panel
+
+    @property
+    def _earn_stop_btn(self) -> QPushButton:
+        return self._earn_coord._earn_stop_btn
 
     def _build_earnings_progress_panel(self, main_layout) -> None:
-        """Construct the (initially hidden) earnings-fill progress panel and
-        append it to ``main_layout``. One labelled QProgressBar per source
-        with a live tooltip, and a Stop-all button below."""
-        self._earn_prog_bars: dict[str, QProgressBar] = {}
-        # Per-source live state, used to build the hover tooltip.
-        self._earn_prog_state: dict[str, dict] = {
-            src: {"done": 0, "total": 0, "filled": None, "errors": None,
-                  "status": "idle", "label": src.capitalize()}
-            for src in self._EARN_SOURCES
-        }
-
-        self._earn_prog_panel = QFrame()
-        self._earn_prog_panel.setStyleSheet(
-            "QFrame { background: #2b2b2b; border-top: 1px solid #444; }"
-        )
-        outer = QVBoxLayout(self._earn_prog_panel)
-        outer.setContentsMargins(8, 4, 8, 4)
-        outer.setSpacing(3)
-
-        title = QLabel("Earnings fills")
-        title.setStyleSheet("color: #ccc; font-size: 10px; font-weight: bold;")
-        outer.addWidget(title)
-
-        bars_row = QHBoxLayout()
-        bars_row.setSpacing(10)
-        for src in self._EARN_SOURCES:
-            col = QVBoxLayout()
-            col.setSpacing(1)
-            lbl = QLabel(src.capitalize())
-            lbl.setStyleSheet("color: #bbb; font-size: 10px;")
-            col.addWidget(lbl)
-
-            bar = QProgressBar()
-            bar.setRange(0, 100)
-            bar.setValue(0)
-            bar.setTextVisible(True)
-            bar.setFormat("idle")
-            bar.setFixedHeight(16)
-            color = self._EARN_SRC_COLORS[src]
-            bar.setStyleSheet(
-                "QProgressBar { background: #1e1e1e; border: 1px solid #444; "
-                "border-radius: 3px; color: #eee; font-size: 9px; "
-                "text-align: center; }"
-                f"QProgressBar::chunk {{ background: {color}; border-radius: 2px; }}"
-            )
-            bar.setToolTip(f"{src.capitalize()}: idle")
-            col.addWidget(bar)
-            self._earn_prog_bars[src] = bar
-            bars_row.addLayout(col, 1)
-        outer.addLayout(bars_row)
-
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        self._earn_stop_btn = QPushButton("Stop Earnings Refresh")
-        self._earn_stop_btn.setStyleSheet(
-            "QPushButton { background: #803030; color: white; font-size: 10px; "
-            "padding: 3px 12px; border-radius: 3px; }"
-            "QPushButton:hover { background: #a04040; }"
-            "QPushButton:disabled { background: #444; color: #888; }"
-        )
-        self._earn_stop_btn.clicked.connect(self._stop_all_earnings_fills)
-        btn_row.addWidget(self._earn_stop_btn)
-        outer.addLayout(btn_row)
-
-        self._earn_prog_panel.setVisible(False)
-        main_layout.addWidget(self._earn_prog_panel)
+        self._earn_coord._build_earnings_progress_panel(main_layout)
 
     def _earn_prog_tooltip_text(self, src: str) -> str:
-        st = self._earn_prog_state[src]
-        lines = [f"{st['label']} — {st['status']}"]
-        if st["total"]:
-            lines.append(f"Progress: {st['done']}/{st['total']}")
-        if st["filled"] is not None:
-            lines.append(f"Filled: {st['filled']}   Errors: {st['errors']}")
-        return "\n".join(lines)
+        return self._earn_coord._earn_prog_tooltip_text(src)
 
     def _earn_prog_set_idle(self, src: str) -> None:
-        st = self._earn_prog_state[src]
-        st.update(done=0, total=0, filled=None, errors=None,
-                  status="idle", label=src.capitalize())
-        bar = self._earn_prog_bars[src]
-        bar.setRange(0, 100)
-        bar.setValue(0)
-        bar.setFormat("idle")
-        bar.setToolTip(f"{src.capitalize()}: idle")
+        self._earn_coord._earn_prog_set_idle(src)
 
     def _earn_prog_begin(self, src: str, label: str) -> None:
-        """Reveal the panel and mark ``src`` as queued/running. When no
-        source is currently in flight (a fresh batch), every source is
-        first reset to idle so stale 'done' results from a prior run don't
-        linger on the other bars."""
-        if src not in self._earn_prog_bars:
-            return
-        if not self._earn_state_active():
-            for other in self._EARN_SOURCES:
-                self._earn_prog_set_idle(other)
-        st = self._earn_prog_state[src]
-        st.update(done=0, total=0, filled=None, errors=None,
-                  status="running", label=label)
-        bar = self._earn_prog_bars[src]
-        bar.setRange(0, 0)            # busy/indeterminate until first tick
-        bar.setFormat("starting…")
-        bar.setToolTip(self._earn_prog_tooltip_text(src))
-        self._earn_prog_panel.setVisible(True)
-        self._earn_stop_btn.setEnabled(True)
-        self._earn_stop_btn.setText("Stop Earnings Refresh")
+        self._earn_coord._earn_prog_begin(src, label)
 
     def _earn_prog_tick(self, src: str, done: int, total: int) -> None:
-        if src not in self._earn_prog_bars:
-            return
-        st = self._earn_prog_state[src]
-        st.update(done=done, total=total, status="running")
-        bar = self._earn_prog_bars[src]
-        if total > 0:
-            bar.setRange(0, total)
-            bar.setValue(done)
-            bar.setFormat(f"%p%  ({done}/{total})")
-        else:
-            bar.setRange(0, 0)
-            bar.setFormat("working…")
-        bar.setToolTip(self._earn_prog_tooltip_text(src))
+        self._earn_coord._earn_prog_tick(src, done, total)
 
     def _earn_prog_finish(self, src: str, filled: int, errors: int) -> None:
-        if src not in self._earn_prog_bars:
-            return
-        st = self._earn_prog_state[src]
-        st.update(filled=filled, errors=errors, status="done")
-        bar = self._earn_prog_bars[src]
-        total = st["total"] or 1
-        bar.setRange(0, total)
-        bar.setValue(total)
-        bar.setFormat(f"done — {filled} filled, {errors} err")
-        bar.setToolTip(self._earn_prog_tooltip_text(src))
-        self._earn_prog_maybe_collapse()
+        self._earn_coord._earn_prog_finish(src, filled, errors)
 
     def _earn_state_active(self) -> bool:
-        """True while any source's *tracked state* is still in flight.
-        State-based (not QThread.isRunning) because the custom `finished`
-        signal fires from inside the worker's run(), so the just-finished
-        thread still reports isRunning()==True when collapse is evaluated."""
-        return any(
-            self._earn_prog_state[s]["status"] in ("running", "stopping")
-            for s in self._EARN_SOURCES
-        )
+        return self._earn_coord._earn_state_active()
 
     def _earn_threads_active(self) -> bool:
-        """True if any earnings worker thread is genuinely alive."""
-        for w in (getattr(self, "_finviz_worker", None),
-                  getattr(self, "_zacks_worker", None),
-                  getattr(self, "_finnhub_worker", None)):
-            if w is not None and w.isRunning():
-                return True
-        return False
+        return self._earn_coord._earn_threads_active()
 
     def _earn_prog_maybe_collapse(self) -> None:
-        """When no source's state is still in flight, flip the Stop button
-        to a Hide action and auto-collapse the panel after a grace period."""
-        if self._earn_state_active():
-            return
-        self._earn_stop_btn.setEnabled(True)
-        self._earn_stop_btn.setText("Hide")
-        from PyQt6.QtCore import QTimer
-        QTimer.singleShot(12000, self._earn_prog_autohide)
+        self._earn_coord._earn_prog_maybe_collapse()
 
     def _earn_prog_autohide(self) -> None:
-        if not self._earn_state_active():
-            self._earn_prog_panel.setVisible(False)
+        self._earn_coord._earn_prog_autohide()
 
     def _stop_all_earnings_fills(self) -> None:
-        """Stop button: halt every running earnings fill, or hide the panel
-        if all have already finished."""
-        if not self._earn_threads_active():
-            self._earn_prog_panel.setVisible(False)
-            return
-        stopped = []
-        for name, w in (("finviz", getattr(self, "_finviz_worker", None)),
-                        ("zacks", getattr(self, "_zacks_worker", None)),
-                        ("finnhub", getattr(self, "_finnhub_worker", None))):
-            if w is not None and w.isRunning():
-                w.request_stop()
-                stopped.append(name)
-                self._earn_prog_state[name]["status"] = "stopping"
-                bar = self._earn_prog_bars.get(name)
-                if bar is not None:
-                    bar.setFormat("stopping…")
-                    bar.setToolTip(self._earn_prog_tooltip_text(name))
-        if stopped:
-            self.log_panel.write_line(
-                f"Earnings refresh stop requested: {', '.join(stopped)}."
-            )
-            self._earn_stop_btn.setEnabled(False)
+        self._earn_coord._stop_all_earnings_fills()
 
     # ── Log handler ────────────────────────────────────────────────────
 
@@ -1527,6 +1399,18 @@ class MainWindow(QMainWindow):
         )
         handler = QtLogHandler(self.log_panel.append_signal)
         handler.setFormatter(formatter)
+        # `_log_error` writes its user-facing message to the panel
+        # directly AND logs the full record (incl. traceback) at ERROR.
+        # That record propagates up to this handler on the `scanner`
+        # logger, so without a guard every `_log_error` site showed in
+        # the panel TWICE — once verbatim, once as the formatted record
+        # plus traceback. Records tagged `extra={"panel_skip": True}`
+        # are dropped by this GUI handler only; propagation to every
+        # other handler (subsystem files, console) is unaffected, so
+        # the full record still lands everywhere else.
+        handler.addFilter(
+            lambda record: not getattr(record, "panel_skip", False)
+        )
         logging.getLogger("scanner").addHandler(handler)
         logging.getLogger("scanner").setLevel(logging.INFO)
         # Track the GUI handler so closeEvent can detach it cleanly.
@@ -1574,10 +1458,14 @@ class MainWindow(QMainWindow):
         ``category`` prefixes the logger record (greppable subsystem
         tag); the panel shows ``msg`` verbatim so existing user-facing
         wording is preserved at refactored call sites. When ``exc`` is
-        given the logger record carries the full traceback. The panel
-        write is guarded so reporting never raises from teardown /
-        crash-handler paths."""
-        log.error("%s: %s", category, msg, exc_info=exc)
+        given the logger record carries the full traceback. The record
+        is tagged ``panel_skip`` so the QtLogHandler on the parent
+        ``scanner`` logger doesn't echo it back into the panel — the
+        panel shows exactly ONE clean line per call. The panel write is
+        guarded so reporting never raises from teardown / crash-handler
+        paths."""
+        log.error("%s: %s", category, msg, exc_info=exc,
+                  extra={"panel_skip": True})
         try:
             self.log_panel.write_line(msg)
         except Exception as panel_exc:
@@ -1807,269 +1695,39 @@ class MainWindow(QMainWindow):
             want_smart=bool(self._earnings_auto_refresh_ref[0] and not stopped),
         )
 
-    def _arm_or_run_smart_refresh(self, *, want_smart: bool) -> None:
-        """Drive the earnings smart refresh with SAME-LAUNCH CAPTURE: arm
-        ``_pending_smart_refresh`` and start the daily Nasdaq sweep; when the
-        sweep actually starts, the smart refresh is deferred until the sweep
-        + reconcile finish (chained from ``_on_nasdaq_auto_refresh_done``) so
-        the candidate selector reads a freshly-updated ``last_earnings`` and
-        catches a just-reported quarter THIS launch. When no sweep is due,
-        run the smart refresh immediately.
+    # Same-launch capture flag — owned by the coordinator, re-exposed
+    # under the historical name (tests and __init__ assign it directly).
 
-        Shared by both launch paths — the OHLCV-update path
-        (``_on_update_done``) and the OHLCV-current path — so a report the
-        calendar discovers gets its actual captured regardless of OHLCV
-        freshness. ``want_smart`` lets the caller suppress earnings (auto-
-        refresh disabled, or a stopped/partial OHLCV update) while still
-        letting the Nasdaq sweep run on its own cadence.
-        """
-        self._pending_smart_refresh = want_smart
-        swept = self._maybe_run_nasdaq_refresh()
-        if not swept:
-            # No sweep started (not due / already running / no universe):
-            # nothing to chain off, so run the smart refresh now.
-            self._pending_smart_refresh = False
-            if want_smart:
-                self._kick_off_smart_refresh()
+    @property
+    def _pending_smart_refresh(self) -> bool:
+        return self._earn_coord._pending_smart_refresh
+
+    @_pending_smart_refresh.setter
+    def _pending_smart_refresh(self, value: bool) -> None:
+        self._earn_coord._pending_smart_refresh = value
+
+    def _arm_or_run_smart_refresh(self, *, want_smart: bool) -> None:
+        self._earn_coord._arm_or_run_smart_refresh(want_smart=want_smart)
 
     def _maybe_run_nasdaq_refresh(self) -> bool:
-        """Kick off the daily Nasdaq calendar sweep if enabled and due.
-        Shared by the post-update path and the OHLCV-skip path so the
-        calendar cadence isn't coupled to OHLCV freshness. Returns True
-        iff a sweep was actually started (the caller chains the earnings
-        smart refresh off a started sweep for same-launch capture)."""
-        if self._nasdaq_auto_refresh_ref[0] and self._is_nasdaq_refresh_due():
-            return self._kick_off_nasdaq_auto_refresh()
-        return False
+        return self._earn_coord._maybe_run_nasdaq_refresh()
 
     def _trim_all_blocked_candidates(self, candidates: list[str]) -> list[str]:
-        """Drop candidates that EVERY earnings source has permanently
-        blacklisted (finnhub ∩ finviz ∩ zacks) — no source can refresh them,
-        so they are pure dead weight. Without this, no-history names no source
-        covers (warrants, preferreds, foreign OTC, SPACs) re-trip Rule A every
-        launch: they inflate the flagged count ~20×, false-fire the bulk-run
-        warning, and make a prompt promise far more work than the per-source
-        workers (which skip every one of them) actually queue. `candidates`
-        already excludes the OHLCV blacklist + ETF/ADR, so the raw per-source
-        blacklist intersection is exactly "blocked everywhere". Returns the
-        filtered list and logs how many were trimmed. Shared by the auto
-        (launch) and manual ("Run Earnings Smart Refresh Now") paths."""
-        all_blocked = (
-            getattr(self, "_finnhub_blacklist", set())
-            & getattr(self, "_finviz_blacklist", set())
-            & getattr(self, "_zacks_blacklist", set())
-        )
-        if not all_blocked:
-            return list(candidates)
-        before_n = len(candidates)
-        filtered = [t for t in candidates if t not in all_blocked]
-        trimmed = before_n - len(filtered)
-        if trimmed:
-            self.log_panel.write_line(
-                f"Earnings smart refresh: skipped {trimmed:,} no-history "
-                f"ticker(s) all three sources have blacklisted "
-                f"(uncoverable — warrants / preferreds / foreign OTC / SPACs)."
-            )
-        return filtered
+        return self._earn_coord._trim_all_blocked_candidates(candidates)
 
     def _kick_off_smart_refresh(self) -> None:
-        """Launch-time earnings smart refresh. Runs finviz + zacks
-        CONCURRENTLY against one shared per-ticker candidate list
-        (`find_smart_refresh_candidates`). Finnhub is EXCLUDED from this
-        automatic cycle (config.FINNHUB_IN_AUTO_REFRESH=False; least-
-        effective source, manual-only). Each source applies its own skip
-        set; whichever lands a quarter wins the priority dedup.
-
-        Only invoked from `_on_update_done`, so it inherits the OHLCV
-        freshness gate (a skipped update never reaches here). A
-        bulk-sized candidate set (> ZACKS_SMART_REFRESH_BULK_THRESHOLD)
-        prompts Run / Skip / Disable before kicking anything off.
-        """
-        if self._universe_df is None and not self._symbols:
-            return
-        universe_syms = self._get_universe_symbols()
-        if not universe_syms:
-            return
-
-        # Exclude the OHLCV blacklist + ETF/ADR auto-skip from candidate
-        # selection so Rule A (no-history) doesn't flood with funds the
-        # earnings sources never cover. Per-source skip sets are applied
-        # again at the worker level below.
-        cand_skip = set(self._blacklist) | self._etf_adr_auto_skip_set()
-        from ..earnings_history import find_smart_refresh_candidates
-        candidates = find_smart_refresh_candidates(universe_syms, cand_skip)
-        # Drop names every source has permanently blacklisted (see helper).
-        candidates = self._trim_all_blocked_candidates(candidates)
-        if not candidates:
-            return
-
-        threshold = config.ZACKS_SMART_REFRESH_BULK_THRESHOLD
-        if len(candidates) > threshold:
-            pct = len(candidates) * 100 // max(1, len(universe_syms))
-            choice = QMessageBox.question(
-                self,
-                "Earnings Smart Refresh — Bulk-Sized Run Detected",
-                (
-                    f"The earnings smart refresh would queue "
-                    f"<b>{len(candidates):,}</b> tickers ({pct}% of your "
-                    f"universe) across finviz + zacks (finnhub is manual-only).\n\n"
-                    f"A set this large usually means a first-time / recovery "
-                    f"fill — functionally a multi-hour bulk scrape, not a "
-                    f"daily top-up.\n\n"
-                    f"<b>Yes</b> — run it now\n"
-                    f"<b>No</b> — skip this launch (ask again next launch)\n"
-                    f"<b>Cancel</b> — disable earnings auto-refresh for this "
-                    f"session\n\nContinue?"
-                ),
-                QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.No
-                | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.No,
-            )
-            if choice == QMessageBox.StandardButton.Cancel:
-                self._earnings_auto_refresh_ref[0] = False
-                self.log_panel.write_line(
-                    "Earnings auto-refresh disabled for this session."
-                )
-                return
-            if choice != QMessageBox.StandardButton.Yes:
-                self.log_panel.write_line(
-                    f"Earnings smart refresh skipped "
-                    f"({len(candidates):,} candidates would have queued)."
-                )
-                return
-
-        # Auto cycle: finviz + zacks only. Finnhub (least-effective source)
-        # is manual-only — run it via the Finnhub bulk/gap/spot menu actions
-        # or the manual "Run Earnings Smart Refresh Now".
-        self._launch_smart_refresh_workers(
-            candidates, due=True,
-            include_finnhub=config.FINNHUB_IN_AUTO_REFRESH,
-        )
+        self._earn_coord._kick_off_smart_refresh()
 
     def _launch_smart_refresh_workers(
         self, candidates: list[str], *, due: bool = True,
         include_finnhub: bool = True,
     ) -> None:
-        """Start the earnings sources concurrently against ``candidates`` in
-        the smart-refresh ``targeted`` mode. Each guard avoids clobbering a
-        manual fill of the same source already running. Shared by the
-        launch-time auto path (`_kick_off_smart_refresh`) and the manual
-        `Run Earnings Smart Refresh Now` menu action.
-
-        ``include_finnhub``: the auto path passes False so Finnhub (the
-        least-effective source) never runs on an automatic cycle — it's
-        manual-only via the dedicated Finnhub bulk/gap/spot menu actions and
-        this manual smart-refresh. finviz + zacks always run."""
-        srcs = "finviz + zacks" + (" + finnhub" if include_finnhub else "")
-        word = "due" if due else "ticker(s)"
-        self.log_panel.write_line(
-            f"Earnings smart refresh: {len(candidates)} {word} — "
-            f"refreshing {srcs} concurrently."
+        self._earn_coord._launch_smart_refresh_workers(
+            candidates, due=due, include_finnhub=include_finnhub,
         )
-        if not (self._finviz_worker and self._finviz_worker.isRunning()):
-            self._start_finviz_worker(
-                candidates, self._combined_finviz_skip_set(),
-                mode="targeted", label="Smart refresh (finviz)",
-            )
-        if not (self._zacks_worker and self._zacks_worker.isRunning()):
-            self._start_zacks_worker(
-                candidates, mode="targeted", label="Smart refresh (zacks)",
-            )
-        if include_finnhub and not (
-            self._finnhub_worker and self._finnhub_worker.isRunning()
-        ):
-            self._start_finnhub_worker(
-                candidates, self._combined_finnhub_skip_set(),
-                mode="targeted", label="Smart refresh (finnhub)",
-            )
 
     def _run_earnings_smart_refresh_now(self) -> None:
-        """Manual Data-menu trigger for the concurrent earnings smart
-        refresh — the same process that normally follows an OHLCV update,
-        invokable on demand. Useful when the OHLCV freshness gate skipped
-        the update (cache already current) so the auto path never fired.
-
-        If the staleness rules report nothing due, offers a small sample
-        test run so the concurrent fill + progress panel are still visible.
-        """
-        if self._universe_df is None and not self._symbols:
-            QMessageBox.information(
-                self, "Earnings Smart Refresh",
-                "No universe is loaded yet — load tickers first.",
-            )
-            return
-        universe_syms = self._get_universe_symbols()
-        if not universe_syms:
-            QMessageBox.information(
-                self, "Earnings Smart Refresh",
-                "The universe is empty — nothing to refresh.",
-            )
-            return
-
-        # Don't double-launch if a refresh is already mid-flight.
-        if self._earn_threads_active():
-            QMessageBox.information(
-                self, "Earnings Smart Refresh",
-                "An earnings fill is already running — watch the progress "
-                "panel above the status bar, or stop it first.",
-            )
-            return
-
-        cand_skip = set(self._blacklist) | self._etf_adr_auto_skip_set()
-        from ..earnings_history import find_smart_refresh_candidates
-        candidates = find_smart_refresh_candidates(universe_syms, cand_skip)
-        # Apply the same all-three-sources-blocked trim the auto path uses, so
-        # the manual prompt's count reflects what will actually be fetched
-        # (not thousands of permanently-uncoverable names every source skips).
-        candidates = self._trim_all_blocked_candidates(candidates)
-
-        if candidates:
-            threshold = config.ZACKS_SMART_REFRESH_BULK_THRESHOLD
-            if len(candidates) > threshold:
-                pct = len(candidates) * 100 // max(1, len(universe_syms))
-                choice = QMessageBox.question(
-                    self, "Earnings Smart Refresh — Bulk-Sized Run",
-                    (
-                        f"<b>{len(candidates):,}</b> tickers ({pct}% of your "
-                        f"universe) are due across finviz + zacks + finnhub — "
-                        f"functionally a multi-hour bulk scrape.\n\n"
-                        f"Run it now?"
-                    ),
-                    QMessageBox.StandardButton.Yes
-                    | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
-                )
-                if choice != QMessageBox.StandardButton.Yes:
-                    self.log_panel.write_line(
-                        f"Manual earnings smart refresh skipped "
-                        f"({len(candidates):,} candidates)."
-                    )
-                    return
-            self.log_panel.write_line("Manual earnings smart refresh triggered.")
-            self._launch_smart_refresh_workers(candidates, due=True)
-            return
-
-        # Nothing due — offer a sample test pass so the panel is visible.
-        sample = [s for s in universe_syms if s not in cand_skip][:25]
-        choice = QMessageBox.question(
-            self, "Earnings Smart Refresh — Nothing Due",
-            (
-                "No tickers are currently due for an earnings refresh "
-                "(everything is fresh per the staleness rules).\n\n"
-                f"Run a TEST pass against the first <b>{len(sample)}</b> "
-                "universe ticker(s) anyway, so you can watch the concurrent "
-                "finviz + zacks + finnhub fill and the progress panel?"
-            ),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        if choice == QMessageBox.StandardButton.Yes and sample:
-            self.log_panel.write_line(
-                f"Manual earnings smart refresh (sample test): "
-                f"{len(sample)} ticker(s)."
-            )
-            self._launch_smart_refresh_workers(sample, due=False)
+        self._earn_coord._run_earnings_smart_refresh_now()
 
     # ── Zacks smart refresh ────────────────────────────────────────────
 
@@ -2183,105 +1841,15 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(int, int)
     def _on_zacks_progress(self, done: int, total: int):
-        if total <= 0:
-            return
-        self.status.showMessage(
-            f"Zacks refresh: {done}/{total} ticker(s)..."
-        )
+        self._earn_coord._on_zacks_progress(done, total)
 
     @pyqtSlot(int, int, list)
     def _on_zacks_done(self, filled: int, errors: int, candidates: list):
-        n = len(candidates)
-        if n == 0:
-            self._earn_prog_finish("zacks", filled, errors)
-            return  # candidate empty path already logged inside the worker
-        self.log_panel.write_line(
-            f"Zacks fill done: {n} tickers attempted, {filled} ok, "
-            f"{errors} errors."
-        )
-        # Per-kind breakdown summary (failure_breakdown signal already
-        # fired before this slot; the auto-add to skip list happened
-        # there too, so _auto_added_zacks_skips reflects this run).
-        breakdown = self._last_zacks_failures
-        if breakdown:
-            from ..zacks_scraper import (
-                FAIL_BLOCKED, FAIL_NOT_FOUND,
-                FAIL_HTTP_ERROR, FAIL_PARSE_ERROR,
-            )
-            n_block = len(breakdown.get(FAIL_BLOCKED, []))
-            n_nf = len(breakdown.get(FAIL_NOT_FOUND, []))
-            n_http = len(breakdown.get(FAIL_HTTP_ERROR, []))
-            n_parse = len(breakdown.get(FAIL_PARSE_ERROR, []))
-            n_unk = len(breakdown.get("unknown", []))
-
-            added = int(getattr(self, "_auto_added_zacks_skips", 0))
-            if n_nf:
-                already = max(0, n_nf - added)
-                self.log_panel.write_line(
-                    f"  ↳ {n_nf} not on Zacks "
-                    f"(auto-added {added} new to Zacks skip list, "
-                    f"{already} were already on it)"
-                )
-            if n_block:
-                self.log_panel.write_line(
-                    f"  ↳ {n_block} Imperva block(s) "
-                    "(auto-recovered with cookie refresh)"
-                )
-            if n_http:
-                self.log_panel.write_line(
-                    f"  ↳ {n_http} HTTP / network error(s) (transient)"
-                )
-            if n_parse:
-                self.log_panel.write_line(
-                    f"  ↳ {n_parse} parse error(s) (Zacks page format may have shifted)"
-                )
-            if n_unk:
-                self.log_panel.write_line(
-                    f"  ↳ {n_unk} unclassified failure(s)"
-                )
-            self.log_panel.write_line(
-                "Tip: Data → Show Last Zacks Failures... for the per-ticker "
-                "breakdown; Data → Edit Zacks Skip List... to review/edit."
-            )
-        self.status.showMessage(
-            f"Ready: {len(self._symbols)} tickers with OHLCV data"
-        )
-        self._earn_prog_finish("zacks", filled, errors)
+        self._earn_coord._on_zacks_done(filled, errors, candidates)
 
     @pyqtSlot(dict)
     def _on_zacks_failures(self, breakdown: dict):
-        """Stash the worker's per-kind failure breakdown for the
-        Show Last Zacks Failures menu action AND auto-add every
-        FAIL_NOT_FOUND ticker to the Zacks-only skip list — they're
-        definitively not on Zacks (Imperva blocks land in a different
-        bucket), no point re-checking next run.
-
-        Sets `self._auto_added_zacks_skips` so `_on_zacks_done` can
-        report the count cleanly."""
-        self._last_zacks_failures = dict(breakdown or {})
-        self._auto_added_zacks_skips = 0
-        if not breakdown:
-            return
-
-        from ..zacks_scraper import FAIL_NOT_FOUND
-        not_found = breakdown.get(FAIL_NOT_FOUND, []) or []
-        new_skips = [
-            self._normalize_ticker(t) for t in not_found
-            if self._normalize_ticker(t) not in self._zacks_blacklist
-        ]
-        new_skips = [t for t in new_skips if t]  # drop blanks
-        if not new_skips:
-            return
-        for t in new_skips:
-            self._zacks_blacklist.add(t)
-        try:
-            self._save_zacks_blacklist()
-            self._auto_added_zacks_skips = len(new_skips)
-        except Exception as exc:
-            self._log_error(
-                "zacks-skip-list",
-                f"Warning: Zacks skip list save failed: {exc}", exc,
-            )
+        self._earn_coord._on_zacks_failures(breakdown)
 
     def _show_last_zacks_failures(self):
         """Menu action: per-kind ticker-failure breakdown for the most
@@ -2796,6 +2364,13 @@ class MainWindow(QMainWindow):
             )
 
     # ── Ticker blacklist ────────────────────────────────────────────────
+    #
+    # Persistence lives in blacklists.BlacklistManager (Step A2 split).
+    # The load/save methods below are thin delegates that keep their
+    # original names — GUI menu wiring and tests reference them. Managers
+    # are built per call (not cached in __init__) so the `_*_BLACKLIST_FILE`
+    # path attrs are read at call time: tests shadow them on bare `__new__`
+    # instances, exactly like the pre-extraction direct reads.
 
     _BLACKLIST_FILE = config.DATA_DIR / "blacklist.txt"
     # Zacks-only skip list: tickers known not to be on Zacks. Honored
@@ -2809,28 +2384,20 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _normalize_ticker(t: str) -> str:
-        """Normalize Unicode minus/dash variants to ASCII hyphen."""
-        return (t.strip().upper()
-                .replace("\u2212", "-")   # minus sign
-                .replace("\u2013", "-")   # en dash
-                .replace("\u2014", "-"))  # em dash
+        """Normalize Unicode minus/dash variants to ASCII hyphen.
+        Canonical implementation lives in blacklists.normalize_ticker
+        (shared with BlacklistManager); kept as a staticmethod here
+        because dozens of call sites + tests reference it."""
+        return normalize_ticker(t)
 
     def _load_blacklist(self):
         """Load blacklisted tickers from file. Degrades to an empty set on a
         locked/corrupt/unreadable file (mirrors the Zacks/Finnhub/Finviz skip-
         list loaders) — this runs in __init__ before the window is shown, so
         an unguarded read error would abort launch with no GUI to report it."""
-        if self._BLACKLIST_FILE.exists():
-            try:
-                text = self._BLACKLIST_FILE.read_text(encoding="utf-8").strip()
-                self._blacklist = {
-                    self._normalize_ticker(t)
-                    for t in text.split(",") if t.strip()
-                }
-                return
-            except Exception as exc:
-                log.warning("Failed to load blacklist: %s", exc)
-        self._blacklist = set()
+        self._blacklist = BlacklistManager(
+            self._BLACKLIST_FILE, fmt="csv", label="blacklist",
+        ).load()
 
     def _send_ohlcv_errors_to_blacklist(self):
         """Append OHLCV error tickers to the blacklist."""
@@ -2853,10 +2420,9 @@ class MainWindow(QMainWindow):
 
     def _save_blacklist(self):
         """Persist blacklist to file (atomic write via temp + rename)."""
-        config.atomic_write_text(
-            self._BLACKLIST_FILE,
-            ", ".join(sorted(self._blacklist)),
-        )
+        BlacklistManager(
+            self._BLACKLIST_FILE, fmt="csv", label="blacklist",
+        ).save(self._blacklist)
 
     # ── Universe-derived auto-skip (ETFs + ADRs) ───────────────────────
     #
@@ -2927,19 +2493,9 @@ class MainWindow(QMainWindow):
     def _load_zacks_blacklist(self):
         """Load Zacks-only skip-list tickers from disk. Empty set if
         file missing — auto-populated as the user runs fills."""
-        if self._ZACKS_BLACKLIST_FILE.exists():
-            try:
-                text = self._ZACKS_BLACKLIST_FILE.read_text(encoding="utf-8")
-                self._zacks_blacklist = {
-                    self._normalize_ticker(t)
-                    for line in text.splitlines()
-                    for t in line.split(",")
-                    if t.strip() and not t.lstrip().startswith("#")
-                }
-                return
-            except Exception as exc:
-                log.warning("Failed to load Zacks skip list: %s", exc)
-        self._zacks_blacklist = set()
+        self._zacks_blacklist = BlacklistManager(
+            self._ZACKS_BLACKLIST_FILE, label="Zacks skip list",
+        ).load()
 
     def _save_zacks_blacklist(self):
         """Atomic write of zacks_blacklist.txt — one ticker per line for
@@ -2950,12 +2506,9 @@ class MainWindow(QMainWindow):
         (or a clipboard-paste mishap in the manual editor dialog)
         can't inject phantom entries on the next line.
         """
-        cleaned = sorted(
-            t.replace("\n", "").replace("\r", "").strip()
-            for t in self._zacks_blacklist if t and t.strip()
-        )
-        body = "\n".join(cleaned) + "\n"
-        config.atomic_write_text(self._ZACKS_BLACKLIST_FILE, body)
+        BlacklistManager(
+            self._ZACKS_BLACKLIST_FILE, label="Zacks skip list",
+        ).save(self._zacks_blacklist)
 
     # ── Finnhub-only skip list (Phase 2 mirror of the Zacks pattern) ───
     #
@@ -2968,19 +2521,9 @@ class MainWindow(QMainWindow):
 
     def _load_finnhub_blacklist(self):
         """Load Finnhub-only skip-list tickers from disk."""
-        if self._FINNHUB_BLACKLIST_FILE.exists():
-            try:
-                text = self._FINNHUB_BLACKLIST_FILE.read_text(encoding="utf-8")
-                self._finnhub_blacklist = {
-                    self._normalize_ticker(t)
-                    for line in text.splitlines()
-                    for t in line.split(",")
-                    if t.strip() and not t.lstrip().startswith("#")
-                }
-                return
-            except Exception as exc:
-                log.warning("Failed to load Finnhub skip list: %s", exc)
-        self._finnhub_blacklist = set()
+        self._finnhub_blacklist = BlacklistManager(
+            self._FINNHUB_BLACKLIST_FILE, label="Finnhub skip list",
+        ).load()
 
     def _save_finnhub_blacklist(self):
         """Atomic write of finnhub_blacklist.txt — one ticker per line.
@@ -2988,12 +2531,9 @@ class MainWindow(QMainWindow):
         Defensive newline/whitespace strip per the same rationale as
         _save_zacks_blacklist.
         """
-        cleaned = sorted(
-            t.replace("\n", "").replace("\r", "").strip()
-            for t in self._finnhub_blacklist if t and t.strip()
-        )
-        body = "\n".join(cleaned) + "\n"
-        config.atomic_write_text(self._FINNHUB_BLACKLIST_FILE, body)
+        BlacklistManager(
+            self._FINNHUB_BLACKLIST_FILE, label="Finnhub skip list",
+        ).save(self._finnhub_blacklist)
 
     def _combined_finnhub_skip_set(self) -> set[str]:
         """Combined skip set for Finnhub bulk / gap fills:
@@ -3365,44 +2905,13 @@ class MainWindow(QMainWindow):
 
     def _start_finnhub_worker(self, symbols: list[str], skip: set[str],
                               *, mode: str, label: str):
-        from .workers import FinnhubFillWorker
-        self._finnhub_worker = FinnhubFillWorker(symbols, skip, mode=mode)
-        self._finnhub_worker.log_msg.connect(self.log_panel.write_line)
-        self._finnhub_worker.progress.connect(
-            lambda d, t, _l=label: self.status.showMessage(f"{_l}: {d}/{t}")
+        self._earn_coord._start_finnhub_worker(
+            symbols, skip, mode=mode, label=label,
         )
-        self._finnhub_worker.progress.connect(
-            lambda d, t: self._earn_prog_tick("finnhub", d, t)
-        )
-        self._finnhub_worker.etf_identified.connect(
-            self._on_finnhub_etf_identified
-        )
-        self._finnhub_worker.finished.connect(self._on_finnhub_done)
-        self._earn_prog_begin("finnhub", label)
-        self._finnhub_worker.start()
 
     @pyqtSlot(int, int)
     def _on_finnhub_done(self, filled: int, errors: int):
-        # Persist any auto-added Finnhub skip-list entries collected via
-        # the etf_identified signal.
-        if self._auto_added_finnhub_skips > 0:
-            try:
-                self._save_finnhub_blacklist()
-            except Exception as exc:
-                log.warning("Could not save Finnhub skip list: %s", exc)
-            self.log_panel.write_line(
-                f"Finnhub fill: added {self._auto_added_finnhub_skips} "
-                f"ETF / uncovered ticker(s) to Finnhub skip list "
-                f"(now {len(self._finnhub_blacklist)} total)."
-            )
-            self._auto_added_finnhub_skips = 0
-        self.log_panel.write_line(
-            f"Finnhub fill done: {filled} filled, {errors} errors."
-        )
-        self.status.showMessage(
-            f"Finnhub fill done: {filled} filled, {errors} errors"
-        )
-        self._earn_prog_finish("finnhub", filled, errors)
+        self._earn_coord._on_finnhub_done(filled, errors)
 
     # (EDGAR-only skip list + EDGAR fill handlers removed 2026-05-31
     #  — earnings EDGAR/GAAP source dropped.)
@@ -3413,28 +2922,15 @@ class MainWindow(QMainWindow):
 
     def _load_finviz_blacklist(self):
         """Load finviz-only skip-list tickers from disk."""
-        if self._FINVIZ_BLACKLIST_FILE.exists():
-            try:
-                text = self._FINVIZ_BLACKLIST_FILE.read_text(encoding="utf-8")
-                self._finviz_blacklist = {
-                    self._normalize_ticker(t)
-                    for line in text.splitlines()
-                    for t in line.split(",")
-                    if t.strip() and not t.lstrip().startswith("#")
-                }
-                return
-            except Exception as exc:
-                log.warning("Failed to load finviz skip list: %s", exc)
-        self._finviz_blacklist = set()
+        self._finviz_blacklist = BlacklistManager(
+            self._FINVIZ_BLACKLIST_FILE, label="finviz skip list",
+        ).load()
 
     def _save_finviz_blacklist(self):
         """Atomic write of finviz_blacklist.txt — one ticker per line."""
-        cleaned = sorted(
-            t.replace("\n", "").replace("\r", "").strip()
-            for t in self._finviz_blacklist if t and t.strip()
-        )
-        body = "\n".join(cleaned) + "\n"
-        config.atomic_write_text(self._FINVIZ_BLACKLIST_FILE, body)
+        BlacklistManager(
+            self._FINVIZ_BLACKLIST_FILE, label="finviz skip list",
+        ).save(self._finviz_blacklist)
 
     def _combined_finviz_skip_set(self) -> set[str]:
         """Combined skip set for finviz bulk / gap fills:
@@ -3632,42 +3128,13 @@ class MainWindow(QMainWindow):
 
     def _start_finviz_worker(self, symbols: list[str], skip: set[str],
                              *, mode: str, label: str):
-        from .workers import FinvizFillWorker
-        self._finviz_worker = FinvizFillWorker(symbols, skip, mode=mode)
-        self._finviz_worker.log_msg.connect(self.log_panel.write_line)
-        self._finviz_worker.progress.connect(
-            lambda d, t, _l=label: self.status.showMessage(f"{_l}: {d}/{t}")
+        self._earn_coord._start_finviz_worker(
+            symbols, skip, mode=mode, label=label,
         )
-        self._finviz_worker.progress.connect(
-            lambda d, t: self._earn_prog_tick("finviz", d, t)
-        )
-        self._finviz_worker.empty_identified.connect(
-            self._on_finviz_empty_identified
-        )
-        self._finviz_worker.finished.connect(self._on_finviz_done)
-        self._earn_prog_begin("finviz", label)
-        self._finviz_worker.start()
 
     @pyqtSlot(int, int)
     def _on_finviz_done(self, filled: int, errors: int):
-        if self._auto_added_finviz_skips > 0:
-            try:
-                self._save_finviz_blacklist()
-            except Exception as exc:
-                log.warning("Could not save finviz skip list: %s", exc)
-            self.log_panel.write_line(
-                f"Finviz fill: added {self._auto_added_finviz_skips} "
-                f"uncovered ticker(s) to finviz skip list "
-                f"(now {len(self._finviz_blacklist)} total)."
-            )
-            self._auto_added_finviz_skips = 0
-        self.log_panel.write_line(
-            f"Finviz fill done: {filled} filled, {errors} errors."
-        )
-        self.status.showMessage(
-            f"Finviz fill done: {filled} filled, {errors} errors"
-        )
-        self._earn_prog_finish("finviz", filled, errors)
+        self._earn_coord._on_finviz_done(filled, errors)
 
     # ── Ticker greylist ─────────────────────────────────────────────────
     # Greylist is a SCAN-ONLY filter — tickers in this list are skipped by
@@ -4015,26 +3482,7 @@ class MainWindow(QMainWindow):
             self.log_panel.write_line("No Zacks fill running.")
 
     def _start_zacks_worker(self, symbols: list[str], *, mode: str, label: str):
-        """Shared worker bringup for the bulk/targeted Zacks menu actions.
-        Wires the progress/log/Imperva-block signals onto a fresh
-        ZacksFillWorker."""
-        self._zacks_worker = ZacksFillWorker(
-            symbols, self._zacks_skip_set(), mode=mode,
-        )
-        self._zacks_worker.log_msg.connect(self.log_panel.write_line)
-        self._zacks_worker.progress.connect(
-            lambda d, t, _l=label: self.status.showMessage(f"{_l}: {d}/{t}")
-        )
-        self._zacks_worker.progress.connect(
-            lambda d, t: self._earn_prog_tick("zacks", d, t)
-        )
-        self._zacks_worker.finished.connect(self._on_zacks_done)
-        self._zacks_worker.failure_breakdown.connect(self._on_zacks_failures)
-        self._zacks_worker.imperva_block_detected.connect(
-            self._on_imperva_block_detected
-        )
-        self._earn_prog_begin("zacks", label)
-        self._zacks_worker.start()
+        self._earn_coord._start_zacks_worker(symbols, mode=mode, label=label)
 
     def _build_cookie_textedit(
         self, initial: str, *, hide_initially: bool,
@@ -5053,7 +4501,9 @@ class MainWindow(QMainWindow):
     # Nasdaq daily auto-refresh (Phase 5 of Finnhub augmentation)
     # ──────────────────────────────────────────────────────────────────
 
-    _NASDAQ_LAST_RUN_KEY = "menu/last_nasdaq_run_iso"
+    # Nasdaq-sweep cadence logic lives in EarningsRefreshCoordinator;
+    # the key is aliased here because tests read it off the window.
+    _NASDAQ_LAST_RUN_KEY = EarningsRefreshCoordinator._NASDAQ_LAST_RUN_KEY
     _OHLCV_LAST_RUN_KEY = "menu/last_ohlcv_run_iso"
 
     def _is_ohlcv_due(self) -> bool:
@@ -5127,88 +4577,17 @@ class MainWindow(QMainWindow):
         )
 
     def _is_nasdaq_refresh_due(self) -> bool:
-        """True iff the last recorded Nasdaq run is older than
-        ``config.NASDAQ_REFRESH_DAYS`` (or never ran). Daily as of
-        2026-06 so the calendar's `last_earnings` stays current for the
-        earnings smart-refresh candidate selector."""
-        try:
-            last_iso = self._qsettings().value(self._NASDAQ_LAST_RUN_KEY)
-        except Exception as exc:
-            log.debug("Could not read last_nasdaq_run_iso: %s", exc)
-            return True  # err on the side of refreshing
-        if not last_iso:
-            return True
-        try:
-            last = datetime.fromisoformat(str(last_iso))
-        except ValueError:
-            log.debug("Bad last_nasdaq_run_iso value: %r", last_iso)
-            return True
-        # Calendar-day cadence, NOT a rolling 24h gap: the first launch of
-        # a new calendar day re-sweeps regardless of clock time. A 24h gap
-        # on a completion-time stamp would skip a same-time-next-morning
-        # launch (gap.days == 0 at ~23h58m), silently reintroducing the
-        # stale-calendar miss this daily sweep exists to prevent.
-        return (datetime.now().date() - last.date()).days >= config.NASDAQ_REFRESH_DAYS
+        return self._earn_coord._is_nasdaq_refresh_due()
 
     def _stamp_nasdaq_run_now(self) -> None:
-        """Record the current time as the most recent Nasdaq run.
-        Called from BOTH the auto-trigger path and the manual menu
-        action so they share the daily counter."""
-        try:
-            self._qsettings().setValue(
-                self._NASDAQ_LAST_RUN_KEY,
-                datetime.now().isoformat(timespec="seconds"),
-            )
-        except Exception as exc:
-            log.debug("Could not write last_nasdaq_run_iso: %s", exc)
+        self._earn_coord._stamp_nasdaq_run_now()
 
     def _kick_off_nasdaq_auto_refresh(self) -> bool:
-        """Phase 5 launch-time auto-trigger. Spawns the same
-        EarningsFillWorker the manual menu does, then stamps the last-
-        run timestamp on completion so the daily counter resets. Returns
-        True iff the sweep worker was actually started (so the caller can
-        chain the earnings smart refresh off its completion)."""
-        if self._earnings_worker and self._earnings_worker.isRunning():
-            return False
-        if self._universe_df is None and not self._symbols:
-            return False
-        syms = self._get_universe_symbols()
-        if not syms:
-            return False
-        self.log_panel.write_line(
-            "Nasdaq daily auto-refresh: launching calendar sweep..."
-        )
-        self._earnings_worker = EarningsFillWorker(
-            syms, self._blacklist, mode="bulk",
-        )
-        self._earnings_worker.log_msg.connect(self.log_panel.write_line)
-        self._earnings_worker.progress.connect(
-            lambda d, t: self.status.showMessage(
-                f"Nasdaq calendar (auto-daily): {d}/{t}"
-            )
-        )
-        self._earnings_worker.finished.connect(
-            self._on_nasdaq_auto_refresh_done
-        )
-        self._earnings_worker.start()
-        return True
+        return self._earn_coord._kick_off_nasdaq_auto_refresh()
 
     @pyqtSlot(int, int)
     def _on_nasdaq_auto_refresh_done(self, filled: int, errors: int):
-        self._stamp_nasdaq_run_now()
-        self.status.showMessage(
-            f"Nasdaq daily auto-refresh done: {filled} filled, "
-            f"{errors} errors"
-        )
-        # Same-launch capture: the calendar's `last_earnings` is now
-        # current, so run the deferred earnings smart refresh against the
-        # fresh candidate list. Only fires when _on_update_done armed it
-        # (the real OHLCV-update path); the OHLCV-skip path leaves the
-        # flag False so a fresh cache still skips earnings.
-        if getattr(self, "_pending_smart_refresh", False):
-            self._pending_smart_refresh = False
-            if self._earnings_auto_refresh_ref[0]:
-                self._kick_off_smart_refresh()
+        self._earn_coord._on_nasdaq_auto_refresh_done(filled, errors)
 
     # ──────────────────────────────────────────────────────────────────
     # Match-color tolerance — settings menu + persistence
@@ -6264,206 +5643,63 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 log.debug("Timeframe follow-up dispatch failed: %s", exc)
 
+    # ── Column layout management ─────────────────────────────────────
+    # Column reorder / hide / persist logic (Columns ▾ dropdown wiring,
+    # header-drag order, hidden-column set, scan-time reconcile) lives
+    # in ColumnManager (columns.py). MainWindow keeps every historical
+    # method name below as a thin delegate so signal wiring and tests
+    # are untouched; the layout state itself (`_results_column_order`,
+    # `_deleted_column_keys`, `_columns_dialog`) stays on the window.
+
+    @property
+    def _columns_mgr(self) -> ColumnManager:
+        """Lazily-created column manager. Looked up via ``__dict__``
+        (not getattr) because bare ``MainWindow.__new__`` test shells
+        raise RuntimeError when attribute lookup falls through to the
+        uninitialized Qt C++ side."""
+        mgr = self.__dict__.get("_columns_mgr_obj")
+        if mgr is None:
+            mgr = ColumnManager(self)
+            self.__dict__["_columns_mgr_obj"] = mgr
+        return mgr
+
     @pyqtSlot(list)
     def _on_results_column_order_changed(self, keys: list):
-        """Persist the user's column order. Threaded into Excel
-        export and re-applied across timeframe switches. Also pushes
-        into the open Columns dropdown so it stays in sync with a
-        header drag."""
-        self._results_column_order = list(keys)
-        self._sync_columns_dialog()
+        self._columns_mgr._on_results_column_order_changed(keys)
 
     @pyqtSlot(bool)
     def _on_interleave_quarters_toggled(self, checked: bool):
-        """User toggled the Interleave Q EPS+Rev checkbox. Flip the
-        table's flag and re-render the active period so the new
-        column layout takes effect immediately.
-
-        The saved column order is cleared as part of the toggle: any
-        prior manual reorder captured the OLD per-quarter layout, and
-        re-applying it after populate would put the q-i blocks back
-        where they were and visibly undo the interleave flip. Treating
-        the toggle as an explicit "rearrange columns" action means the
-        new canonical order wins; the user can re-drag afterwards if
-        they want a custom layout on top of the new flag.
-        """
-        try:
-            self.results_table.set_interleave_quarters(bool(checked))
-            self._results_column_order = []
-            self.results_table.set_saved_column_order([])
-            self._reapply_view_filters_for_active_period()
-            self._sync_columns_dialog()
-        except Exception as exc:
-            log.debug("interleave toggle failed: %s", exc)
+        self._columns_mgr._on_interleave_quarters_toggled(checked)
 
     # ── Columns dropdown wiring ──────────────────────────────────────
 
     def _current_columns_for_dialog(self) -> list[tuple]:
-        """Build the (header, key, fmt) list the popup should show.
-
-        Sources, in order of preference:
-          1. The live `_active_columns` if a scan has populated the
-             table (this is post-`_build_dynamic_columns` AND already
-             reordered per `_results_column_order`).
-          2. A canonical `_build_dynamic_columns` build of the cached
-             active period — used when a preset just loaded and wiped
-             the results so the dialog still shows the preset's
-             column intent.
-          3. Empty list (pre-scan, no preset applied) — caller should
-             treat the dialog as a no-op.
-        """
-        try:
-            active = list(self.results_table.active_columns)
-        except (AttributeError, RuntimeError):
-            active = []
-        if active and self.results_table.model_src.rowCount() > 0:
-            # Live populated table — already in the user's visual order
-            # via `_apply_saved_order` after populate. Mirror that order
-            # in the dialog.
-            return self._reorder_for_visual(active)
-        # No scan in flight; consult the saved order if we have one
-        # (preset-loaded scenario). Use a synthetic canonical build
-        # from RESULT_COLUMNS so headers / formatters resolve.
-        if self._results_column_order:
-            by_key = {k: (h, f) for h, k, f in RESULT_COLUMNS}
-            out: list[tuple] = []
-            seen: set[str] = set()
-            for k in self._results_column_order:
-                entry = by_key.get(k)
-                if entry is not None:
-                    out.append((entry[0], k, entry[1]))
-                    seen.add(k)
-            return out
-        return []
+        return self._columns_mgr._current_columns_for_dialog()
 
     def _reorder_for_visual(self, active: list[tuple]) -> list[tuple]:
-        """Return `active` reordered to match the table header's
-        current visual position. Falls back to canonical order on any
-        Qt failure (uninitialized header during shell-mode tests)."""
-        try:
-            header = self.results_table.horizontalHeader()
-            n = header.count()
-            if n != len(active):
-                return list(active)
-            return [active[header.logicalIndex(v)] for v in range(n)]
-        except Exception:
-            return list(active)
+        return self._columns_mgr._reorder_for_visual(active)
 
     def _open_columns_dialog(self):
-        """Open / focus the modeless ColumnsManagerDialog. Singleton —
-        re-clicking the toolbar button raises the existing window
-        rather than spawning a second copy. Pre-scan + no-preset state
-        falls through to a status-bar nudge instead of a useless empty
-        popup."""
-        from .widgets import _ALWAYS_VISIBLE_KEYS as _CORE_KEYS
-        cols = self._current_columns_for_dialog()
-        if not cols:
-            self.status.showMessage(
-                "No columns to manage yet — run a scan or load a preset.",
-                4000,
-            )
-            return
-        hidden = set(getattr(self, "_deleted_column_keys", set()))
-        if self._columns_dialog is None:
-            self._columns_dialog = ColumnsManagerDialog(
-                cols, hidden, _CORE_KEYS, parent=self,
-            )
-            self._columns_dialog.columns_updated.connect(
-                self._on_columns_dialog_updated
-            )
-            self._columns_dialog.reset_requested.connect(
-                self._on_columns_dialog_reset
-            )
-        else:
-            self._columns_dialog.update_columns(cols, hidden)
-        self._columns_dialog.show()
-        self._columns_dialog.raise_()
-        self._columns_dialog.activateWindow()
+        self._columns_mgr._open_columns_dialog()
 
     @pyqtSlot(list, list)
     def _on_columns_dialog_updated(self, ordered_keys: list, hidden_keys: list):
-        """Drag/check change inside the dropdown popup. Mirror onto
-        MainWindow state and re-render. Always-visible keys can never
-        appear in `hidden_keys` (the dialog blocks that), so this is a
-        plain assignment."""
-        from .widgets import _ALWAYS_VISIBLE_KEYS as _CORE_KEYS
-        # Belt-and-suspenders: drop core keys from the hidden set in
-        # case a future bug lets them slip through the dialog filter.
-        sanitized_hidden = {k for k in hidden_keys if k not in _CORE_KEYS}
-        self._results_column_order = list(ordered_keys)
-        self._deleted_column_keys = sanitized_hidden
-        try:
-            self._reapply_view_filters_for_active_period()
-        except Exception as exc:
-            log.debug("re-render after columns dialog update failed: %s", exc)
+        self._columns_mgr._on_columns_dialog_updated(ordered_keys, hidden_keys)
 
     @pyqtSlot()
     def _on_columns_dialog_reset(self):
-        """User clicked Reset to Default inside the popup. Clears both
-        the manual order and the hidden set, re-renders, and refreshes
-        the popup so it shows the canonical layout."""
-        self._reset_columns_to_default()
+        self._columns_mgr._on_columns_dialog_reset()
 
     def _reset_columns_to_default(self) -> None:
-        """Shared helper for Reset to Default — invoked from the
-        popup, the header right-click, and the preset-load flow when
-        the saved preset has no column metadata."""
-        self._results_column_order = []
-        self._deleted_column_keys = set()
-        try:
-            self.results_table.set_saved_column_order([])
-        except Exception as exc:
-            # The table widget may now hold a stale saved order that no
-            # longer matches the (reset/canonical) MainWindow state —
-            # log the divergence so a wrong column layout after Reset
-            # to Default is diagnosable.
-            log.debug(
-                "column reset: results_table.set_saved_column_order([]) "
-                "failed — table may keep a stale saved order while "
-                "MainWindow order is reset to canonical: %s", exc,
-            )
-        try:
-            self._reapply_view_filters_for_active_period()
-        except Exception as exc:
-            log.debug("re-render after column reset failed: %s", exc)
-        self._sync_columns_dialog()
+        self._columns_mgr._reset_columns_to_default()
 
     def _sync_columns_dialog(self) -> None:
-        """Push the current MainWindow column state into the open
-        dropdown (no-op when the popup hasn't been spawned yet). Called
-        from every code path that mutates `_results_column_order` or
-        `_deleted_column_keys` outside the dialog itself."""
-        if self._columns_dialog is None:
-            return
-        cols = self._current_columns_for_dialog()
-        hidden = set(getattr(self, "_deleted_column_keys", set()))
-        self._columns_dialog.update_columns(cols, hidden)
+        self._columns_mgr._sync_columns_dialog()
 
     def _reconcile_column_order_for_scan(
         self, canonical_keys: list[str],
     ) -> None:
-        """Apply the prepend-additions / drop-removals rule to
-        `_results_column_order` based on a fresh canonical column
-        list (output of `_build_dynamic_columns` for the active
-        period). No-op when the saved order is empty (canonical
-        already wins).
-
-        Behavior:
-          • Saved order empty → leave it empty (canonical applies).
-          • Saved order non-empty → drop any saved keys NOT in the
-            new canonical set; prepend any new canonical keys NOT
-            already in the saved order, in their canonical order
-            (which mirrors the indicator panel's top-to-bottom
-            arrangement, i.e. "first added = leftmost in table").
-        """
-        if not self._results_column_order:
-            return
-        canonical_set = set(canonical_keys)
-        saved = list(self._results_column_order)
-        kept = [k for k in saved if k in canonical_set]
-        saved_set = set(kept)
-        additions = [k for k in canonical_keys if k not in saved_set]
-        self._results_column_order = additions + kept
+        self._columns_mgr._reconcile_column_order_for_scan(canonical_keys)
 
     @pyqtSlot(list)
     def _on_rows_deletion_requested(self, symbols: list):
@@ -6503,28 +5739,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(list)
     def _on_columns_deletion_requested(self, keys: list):
-        """User hid one or more columns via the header right-click
-        menu. Add the keys to the per-session hide-set and re-render.
-        Always-visible core columns are filtered upstream by the
-        ResultsTable translator slot, so this slot doesn't need to
-        re-check them."""
-        if not keys:
-            return
-        added = False
-        for k in keys:
-            if k and k not in self._deleted_column_keys:
-                self._deleted_column_keys.add(k)
-                added = True
-        if not added:
-            return
-        log.info(
-            "Hid %d column(s) from view: %s",
-            len(keys), ", ".join(keys),
-        )
-        try:
-            self._reapply_view_filters_for_active_period()
-        except Exception as exc:
-            log.debug("re-render after column delete failed: %s", exc)
+        self._columns_mgr._on_columns_deletion_requested(keys)
 
     @pyqtSlot(list, str)
     def _on_rows_paste_requested(self, cut_symbols: list, target_symbol: str):
@@ -6753,416 +5968,69 @@ class MainWindow(QMainWindow):
         # column-width cache + populate fast-path all apply.
         self._on_timeframe_changed(idx)
 
+    # ── Excel / CSV export delegates ─────────────────────────────────
+    # The export pipeline (ExcelExportDialog handoff, multi-sheet XLSX
+    # generation, color mapping, CSV concatenation, legacy CSV/TXT
+    # export) lives in ExportsController (exports.py). MainWindow keeps
+    # every historical method name below as a thin delegate so button
+    # wiring and tests are untouched.
+
+    @property
+    def _exports(self) -> ExportsController:
+        """Lazily-created exports controller. Looked up via ``__dict__``
+        (not getattr) because bare ``MainWindow.__new__`` test shells
+        raise RuntimeError when attribute lookup falls through to the
+        uninitialized Qt C++ side."""
+        ctl = self.__dict__.get("_exports_ctl")
+        if ctl is None:
+            ctl = ExportsController(self)
+            self.__dict__["_exports_ctl"] = ctl
+        return ctl
+
     def _ordered_active_columns_for_export(self) -> list[tuple]:
-        """Return the active columns reordered per the user's saved
-        layout. Columns whose key is in `_results_column_order` come
-        first in that order; any remaining columns keep their
-        canonical position at the end."""
-        active = list(self.results_table.active_columns)
-        if not self._results_column_order:
-            return active
-        by_key = {c[1]: c for c in active}
-        ordered: list = []
-        seen: set[str] = set()
-        for key in self._results_column_order:
-            entry = by_key.get(key)
-            if entry is not None:
-                ordered.append(entry)
-                seen.add(key)
-        for entry in active:
-            if entry[1] not in seen:
-                ordered.append(entry)
-        return ordered
+        return self._exports._ordered_active_columns_for_export()
 
     def _build_export_df(
         self, df: "pd.DataFrame", keys: list[str], wants_news: bool,
         prepend_period: Optional[str] = None,
     ) -> "pd.DataFrame":
-        """Apply column selection + News injection to a single period df.
-        When prepend_period is provided, prepend a `Period` column of that
-        constant value (used for multi-period CSV concatenation).
-
-        Iterates `keys` IN THE ORDER PROVIDED so the user's manual
-        column drag (and any preset-saved layout) flows through to the
-        export. The dialog hands back keys in the visual order they were
-        passed in (`_ordered_active_columns_for_export()` already encodes
-        the drag order); we just need to honor that ordering instead of
-        falling back to canonical iteration. The lookup table below
-        carries header text + format info so per-quarter dynamic
-        columns still round-trip correctly.
-        """
-        # Build a key → (header, fmt_func) lookup from the live active
-        # columns so dynamic q-i blocks resolve. Falls back to canonical
-        # RESULT_COLUMNS when no scan has populated the table yet (so
-        # CSV export from a fresh shell still works).
-        try:
-            active = list(self.results_table.active_columns)
-        except (AttributeError, RuntimeError):
-            active = []
-        layout = active if active else list(RESULT_COLUMNS)
-        by_key: dict[str, tuple[str, object]] = {
-            k: (h, f) for h, k, f in layout
-        }
-
-        out_cols: list[tuple[str, Optional[str]]] = []
-        if prepend_period is not None:
-            out_cols.append(("Period", "_period_synthetic"))
-        for key in keys:
-            entry = by_key.get(key)
-            if entry is None:
-                continue
-            header, fmt_func = entry
-            out_cols.append((header, key))
-            if wants_news and fmt_func is _fmt_date:
-                out_cols.append((f"News_{header}", None))
-
-        out: dict[str, object] = {}
-        n = len(df) if df is not None else 0
-        for display_header, source_key in out_cols:
-            if source_key == "_period_synthetic":
-                out[display_header] = [prepend_period] * n
-            elif source_key is None:
-                out[display_header] = [""] * n
-            elif df is not None and source_key in df.columns:
-                out[display_header] = df[source_key].values
-            else:
-                out[display_header] = [""] * n
-        return pd.DataFrame(out)
+        return self._exports._build_export_df(
+            df, keys, wants_news, prepend_period=prepend_period,
+        )
 
     @staticmethod
     def _sanitize_sheet_name(label: str, used: set[str]) -> str:
-        """Excel sheet names: max 31 chars, no \\ / ? * [ ]. Also enforce
-        uniqueness within `used` by appending _N when a collision occurs."""
-        safe = label
-        for ch in r'\/?*[]:':
-            safe = safe.replace(ch, "_")
-        safe = safe[:31] or "Sheet"
-        base = safe
-        i = 2
-        while safe in used:
-            tail = f"_{i}"
-            safe = (base[:31 - len(tail)] + tail)
-            i += 1
-        used.add(safe)
-        return safe
+        return ExportsController._sanitize_sheet_name(label, used)
 
     def _excel_export_dialog(self):
-        """Open column / period / format / News dialog, then write the
-        selected periods of the cached scan to disk. XLSX with multiple
-        periods → multi-sheet workbook (one sheet per period). CSV with
-        multiple periods → single concatenated file with a Period column
-        prepended at the front."""
-        if not self._period_results:
-            QMessageBox.information(
-                self, "Excel Export", "No results to export — run a scan first.",
-            )
-            return
-
-        # Phase 8 §8.4 + 2026-05 update: pass the table's CURRENTLY
-        # ORDERED column set (after any user drag / right-click
-        # reorder), not just the canonical RESULT_COLUMNS. The
-        # exporter will write columns in this order so saved sheets
-        # match the on-screen layout for all selected periods.
-        # Auto-data-presence preselection was dropped 2026-05 — the
-        # dialog opens with everything checked and the user uses
-        # Select-None / individual unchecks to refine.
-        export_columns = self._ordered_active_columns_for_export()
-        dlg = ExcelExportDialog(
-            export_columns,
-            periods=self._period_order, parent=self,
-        )
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        keys = dlg.selected_keys()
-        selected_periods = dlg.selected_periods()
-        fmt = dlg.format_choice()
-        wants_news = dlg.wants_news()
-        wants_colors = dlg.wants_colors()
-
-        if not keys:
-            QMessageBox.information(
-                self, "Excel Export", "No columns selected — nothing to export.",
-            )
-            return
-        if not selected_periods:
-            QMessageBox.information(
-                self, "Excel Export", "No time periods selected — nothing to export.",
-            )
-            return
-
-        suffix = ".xlsx" if fmt == "xlsx" else ".csv"
-        filt = ("Excel Workbook (*.xlsx)" if fmt == "xlsx"
-                else "CSV Files (*.csv)")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Results", f"trading_scanner_results{suffix}", filt,
-        )
-        if not path:
-            return
-
-        try:
-            if fmt == "xlsx":
-                self._write_xlsx_multi_sheet(
-                    path, selected_periods, keys, wants_news,
-                    apply_colors=wants_colors,
-                )
-            else:
-                self._write_csv_export(
-                    path, selected_periods, keys, wants_news,
-                )
-        except OSError as exc:
-            QMessageBox.warning(self, "Export Error", f"Could not write file:\n{exc}")
-            return
-        except ImportError as exc:
-            QMessageBox.warning(
-                self, "Export Error",
-                f"XLSX export requires the openpyxl package.\n{exc}",
-            )
-            return
-
-        news_note = " (with News columns)" if wants_news else ""
-        self.status.showMessage(
-            f"Exported {len(selected_periods)} period(s) to {path}{news_note}"
-        )
-        self.log_panel.write_line(
-            f"Excel export: {fmt.upper()} → {path} "
-            f"({len(selected_periods)} period(s), {len(keys)} columns{news_note})"
-        )
+        self._exports._excel_export_dialog()
 
     def _write_xlsx_multi_sheet(
         self, path: str, periods: list[str], keys: list[str], wants_news: bool,
         *, apply_colors: bool = False,
     ):
-        """Write each selected period as its own sheet. Applies the
-        active view filters (Earnings Only / Color Match Only) so the
-        export matches what the user sees in the table.
-
-        When `apply_colors=True`, mirrors the on-screen text colors
-        (match-color palette + streak green + display-only red) into
-        per-cell font colors via openpyxl. Colors are only applied to
-        the active period's sheet — non-active periods retain their
-        underlying values (the table model only holds one period at a
-        time so we can't read foregrounds for the others)."""
-        used_names: set[str] = set()
-        sheet_to_period: dict[str, str] = {}
-        with pd.ExcelWriter(path, engine="openpyxl") as writer:
-            for label in periods:
-                raw = self._period_results.get(label, pd.DataFrame())
-                df = self._apply_view_filters(raw)
-                export_df = self._build_export_df(df, keys, wants_news)
-                sheet = self._sanitize_sheet_name(label, used_names)
-                sheet_to_period[sheet] = label
-                export_df.to_excel(writer, sheet_name=sheet, index=False)
-
-            if apply_colors:
-                # Colors come from the live table model. The model only
-                # holds the active period's render, so we apply colors
-                # only to that sheet. Other sheets keep plain values —
-                # acceptable: typical sequenced-run workflow exports the
-                # current view, and if the user really wants every
-                # period colored they can switch tabs and re-export.
-                active_period = self._active_period or ""
-                active_sheet = next(
-                    (s for s, p in sheet_to_period.items()
-                     if p == active_period),
-                    None,
-                )
-                if active_sheet is not None:
-                    self._apply_xlsx_cell_colors(
-                        writer.book[active_sheet], keys, wants_news,
-                    )
+        self._exports._write_xlsx_multi_sheet(
+            path, periods, keys, wants_news, apply_colors=apply_colors,
+        )
 
     def _apply_xlsx_cell_colors(self, ws, keys: list[str], wants_news: bool):
-        """Walk the live ResultsTable model and stamp matching font
-        colors onto each cell of `ws`. The export sheet's column layout
-        is what `_build_export_df` produced — same `keys` order plus
-        any News_<header> insertions when `wants_news` is True. Row
-        order matches `_apply_view_filters(active_df)` since
-        `_build_export_df` doesn't re-sort.
-        """
-        from openpyxl.styles import Font
-        from copy import copy as _copy_style
-
-        # Map exported column index → live-table source column index.
-        # The export's column order is the user's drag-reordered visual
-        # order from `_ordered_active_columns_for_export`. We need the
-        # SOURCE-MODEL column for each exported header.
-        active = self.results_table.active_columns
-        key_to_src_col = {k: c for c, (_h, k, _f) in enumerate(active)}
-
-        export_cols = self._ordered_export_columns_with_news(keys, wants_news)
-        # export_cols is the list of (header, source_key_or_None,
-        # is_news_placeholder) for each column in the sheet.
-
-        n_rows = self.results_table.model_src.rowCount()
-        # Skip header row (xlsx row 1 is the header).
-        for r_excel in range(2, n_rows + 2):
-            r_src = r_excel - 2
-            for c_excel, (_header, src_key, is_news) in enumerate(
-                export_cols, start=1,
-            ):
-                if is_news or src_key is None:
-                    continue
-                src_col = key_to_src_col.get(src_key)
-                if src_col is None:
-                    continue
-                item = self.results_table.model_src.item(r_src, src_col)
-                if item is None:
-                    continue
-                qcolor = item.foreground().color()
-                # Default brush returns invalid color (alpha=0 / no
-                # explicit setForeground call). Skip those — leaves
-                # cell at openpyxl default.
-                if not qcolor.isValid() or qcolor.alpha() == 0:
-                    continue
-                # Treat near-white default as "no color set". Qt's
-                # invalid foreground brush sometimes returns black or
-                # near-black depending on context. Only apply colors
-                # that ARE in the curated palette / streak-green /
-                # fail-red set — others are likely the implicit
-                # default and shouldn't pollute the export.
-                rgb = (qcolor.red(), qcolor.green(), qcolor.blue())
-                if not self._is_export_color(rgb):
-                    continue
-                hex_rgb = f"FF{qcolor.red():02X}{qcolor.green():02X}{qcolor.blue():02X}"
-                cell = ws.cell(row=r_excel, column=c_excel)
-                old = cell.font
-                cell.font = Font(
-                    name=old.name, size=old.size, bold=old.bold,
-                    italic=old.italic, color=hex_rgb,
-                )
+        self._exports._apply_xlsx_cell_colors(ws, keys, wants_news)
 
     def _ordered_export_columns_with_news(
         self, keys: list[str], wants_news: bool,
     ) -> list[tuple[str, "str | None", bool]]:
-        """Return [(header, source_key|None, is_news), ...] matching
-        the layout produced by `_build_export_df`. News placeholders
-        carry source_key=None and is_news=True; real columns carry
-        their key plus is_news=False. Used by the color exporter to
-        align Excel cells with live-table source columns.
-
-        Iterates the LIVE active layout (same as `_build_export_df`)
-        so dynamic q-i columns are included when their keys are in
-        `keys` (i.e., the user checked the EPS / Rev bundle toggle)."""
-        from .widgets import RESULT_COLUMNS, _fmt_date
-        try:
-            active = list(self.results_table.active_columns)
-        except (AttributeError, RuntimeError):
-            active = []
-        layout = active if active else list(RESULT_COLUMNS)
-        out: list[tuple[str, "str | None", bool]] = []
-        for header, key, fmt_func in layout:
-            if key not in keys:
-                continue
-            out.append((header, key, False))
-            if wants_news and fmt_func is _fmt_date:
-                out.append((f"News_{header}", None, True))
-        return out
+        return self._exports._ordered_export_columns_with_news(keys, wants_news)
 
     def _is_export_color(self, rgb: tuple[int, int, int]) -> bool:
-        """True iff the (r, g, b) tuple is one of the colors we
-        deliberately apply in the table render (palette match-color,
-        streak green, or display-only fail red). All other colors
-        (including the implicit default foreground) are skipped."""
-        from .widgets import ResultsTable
-        # Curated palette
-        for c in ResultsTable._ALIGN_PALETTE:
-            if (c.red(), c.green(), c.blue()) == rgb:
-                return True
-        # Streak green
-        sg = ResultsTable._STREAK_GREEN
-        if (sg.red(), sg.green(), sg.blue()) == rgb:
-            return True
-        # Fail red
-        fr = ResultsTable._FAIL_RED
-        if (fr.red(), fr.green(), fr.blue()) == rgb:
-            return True
-        return False
+        return self._exports._is_export_color(rgb)
 
     def _write_csv_export(
         self, path: str, periods: list[str], keys: list[str], wants_news: bool,
     ):
-        """Single-period: just dump that period's selected columns. Multi-
-        period: concatenate, prepending a `Period` column to identify rows.
-        Both paths run the active view filters so the CSV matches the
-        on-screen table."""
-        if len(periods) == 1:
-            raw = self._period_results.get(periods[0], pd.DataFrame())
-            df = self._apply_view_filters(raw)
-            self._build_export_df(df, keys, wants_news).to_csv(path, index=False)
-            return
-        pieces = []
-        for label in periods:
-            raw = self._period_results.get(label, pd.DataFrame())
-            df = self._apply_view_filters(raw)
-            if df is None or df.empty:
-                continue
-            pieces.append(
-                self._build_export_df(df, keys, wants_news, prepend_period=label)
-            )
-        if not pieces:
-            # All selected periods empty (after view filters) — write a
-            # header-only CSV
-            self._build_export_df(
-                pd.DataFrame(), keys, wants_news, prepend_period="",
-            ).to_csv(path, index=False)
-            return
-        pd.concat(pieces, ignore_index=True).to_csv(path, index=False)
+        self._exports._write_csv_export(path, periods, keys, wants_news)
 
     def _export_results(self):
-        """Export results table to CSV (full data) or TXT (tickers only).
-
-        Phase 4 R13: CSV writing uses the stdlib csv.writer so embedded
-        commas, quotes, and newlines are correctly escaped (QUOTE_MINIMAL).
-        """
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Results", "",
-            "CSV Files (*.csv);;Text Files (*.txt)"
-        )
-        if not path:
-            return
-
-        proxy = self.results_table.proxy
-        rows = proxy.rowCount()
-        cols = proxy.columnCount()
-
-        try:
-            if path.lower().endswith(".txt"):
-                # TXT: comma-separated tickers only
-                tickers = []
-                for r in range(rows):
-                    val = proxy.index(r, 0).data(Qt.ItemDataRole.DisplayRole)
-                    if val:
-                        tickers.append(val)
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(",".join(tickers))
-            else:
-                # CSV: full table with headers — csv.writer handles quoting.
-                # Build headers from the LIVE model layout (active_columns),
-                # not the static RESULT_COLUMNS: the model drops unpopulated
-                # columns and appends dynamic q-i beats columns, so a static,
-                # positional header list mislabels the data beneath it (and
-                # loses headers entirely once beats columns push past
-                # len(RESULT_COLUMNS)). active_columns is the exact list the
-                # model was built from, so one header maps to each data column.
-                try:
-                    active = list(self.results_table.active_columns)
-                except (AttributeError, RuntimeError):
-                    active = list(RESULT_COLUMNS)
-                headers = [h for (h, _key, _fmt) in active][:cols]
-                with open(path, "w", encoding="utf-8", newline="") as f:
-                    w = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
-                    w.writerow(headers)
-                    for r in range(rows):
-                        row_data = [
-                            proxy.index(r, c).data(Qt.ItemDataRole.DisplayRole) or ""
-                            for c in range(cols)
-                        ]
-                        w.writerow(row_data)
-
-            self.status.showMessage(f"Exported {rows} tickers to {path}")
-        except OSError as exc:
-            QMessageBox.warning(self, "Export Error", f"Could not write file:\n{exc}")
+        self._exports._export_results()
 
     # ── Watchlist Bridge (Phase 4) ───────────────────────────────────
 
