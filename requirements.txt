@@ -1,0 +1,43 @@
+# Trading Scanner — Finnhub Fork (trade_scanner_fh)
+# Python 3.11 (developed/built on C:\python\envs\eda-pipeline).
+#
+# Versions pinned to the known-good build environment. Install with:
+#   python -m pip install -r requirements.txt
+#
+# Note: scipy / beautifulsoup4 / finnhub-python appeared in older install
+# notes but are NOT imported anywhere in the codebase — omitted here.
+
+# ── Runtime: GUI ────────────────────────────────────────────────────
+PyQt6==6.7.1
+
+# ── Runtime: data / numerics ────────────────────────────────────────
+numpy==2.0.2
+pandas==2.2.3
+pyarrow==21.0.0          # parquet engine for the OHLCV / earnings caches
+openpyxl==3.1.5          # XLSX engine for the Excel export
+# lxml has no explicit `import lxml` — yfinance.earnings_dates loads it
+# lazily. Required at runtime (and as a PyInstaller hidden import).
+lxml==6.0.2
+
+# ── Runtime: data sources / network ─────────────────────────────────
+yfinance==0.2.65
+requests==2.32.5
+curl_cffi==0.13.0        # Chrome-TLS impersonation for the Zacks scraper
+finance-calendars==0.0.7 # Nasdaq earnings-calendar fills
+financedatabase==2.3.1   # sector-map fallback source
+
+# ── Runtime: OS integration (Windows) ───────────────────────────────
+keyring==25.7.0          # Finnhub API key in Windows Credential Manager
+psutil==5.9.5            # Firefox process detection for cookie refresh
+pywin32==304             # win32gui/win32process — cookie-browser placement
+PyAutoGUI==0.9.54        # TradeStation bridge + per-row HOTKEY sender
+
+# ── Build / test tooling (not needed to run the exe) ────────────────
+pyinstaller==6.15.0      # builds Trade_Scanner_FH.exe from the .spec
+pytest==9.0.2            # test suite under trade_scanner_fh/tests/
+
+# ── Optional: diagnostics only ──────────────────────────────────────
+# patchright is imported solely by tests/_zacks_diag.py, a manual smoke
+# script. Not required to run the app or the pytest suite. Install it
+# only if you want to run that diagnostic:
+#   pip install patchright
