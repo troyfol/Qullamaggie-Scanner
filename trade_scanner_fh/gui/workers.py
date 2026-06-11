@@ -608,7 +608,11 @@ class ZacksFillWorker(QThread):
         *,
         delay_sec: float = 1.5,
         flush_every: int = 25,
-        years: int = 5,
+        # None → config.EARNINGS_HISTORY_YEARS, resolved inside the fill at
+        # call time so the Settings → Advanced… depth override applies live.
+        # (Was a stale literal 5 that silently pinned GUI Zacks fills to 5y
+        # after the config cap was raised to 10y.)
+        years: Optional[int] = None,
         consec_error_limit: int = 5,
     ):
         super().__init__()

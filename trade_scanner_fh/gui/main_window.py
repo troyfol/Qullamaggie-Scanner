@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QTextEdit, QToolBar, QVBoxLayout, QWidget,
 )
 
-from .. import config, finnhub_client
+from .. import __version__, config, finnhub_client
 from .. import hotkey as hotkey_mod
 from ..data_engine import check_schema_version, load_ohlcv, rebuild_ticker
 from ..hotkey import HotkeyConfig
@@ -93,7 +93,7 @@ PRESET_SCHEMA_VERSION = 6
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Trading Scanner")
+        self.setWindowTitle(f"Trading Scanner v{__version__}")
         self.setMinimumSize(1280, 800)
         self.resize(1500, 900)
 
@@ -960,6 +960,24 @@ class MainWindow(QMainWindow):
         self.act_sec_contact.triggered.connect(self._set_sec_contact_email_dialog)
         settings_menu.addAction(self.act_sec_contact)
 
+        settings_menu.addSeparator()
+
+        # Advanced tunables — OHLCV/earnings history depths + the
+        # reference/benchmark ticker list. Persisted per-user to
+        # scanner_data/user_config.json (loaded at config import) and
+        # applied to the live config module on OK — no restart needed.
+        self.act_advanced_settings = QAction("Advanced…", self)
+        self.act_advanced_settings.setToolTip(
+            "Edit advanced tunables: OHLCV cache depth (years), earnings "
+            "history depth (years), and the reference/benchmark ticker "
+            "list used for RS calculations. Stored locally in "
+            "scanner_data/user_config.json."
+        )
+        self.act_advanced_settings.triggered.connect(
+            self._show_advanced_settings
+        )
+        settings_menu.addAction(self.act_advanced_settings)
+
         # --- Central layout ---
         central = QWidget()
         self.setCentralWidget(central)
@@ -1544,6 +1562,45 @@ class MainWindow(QMainWindow):
             except OSError as exc:
                 log.warning("Could not create subsystem log %s: %s", filename, exc)
 
+    # ── Shared error-reporting + worker-bringup helpers ───────────────
+
+    def _log_error(self, category: str, msg: str,
+                   exc: Exception | None = None) -> None:
+        """Report an error to BOTH the rotating module log and the GUI
+        log panel — consolidates the repeated ``log.error(...)`` +
+        ``self.log_panel.write_line(...)`` pair so a failure can't show
+        up in one channel while silently missing from the other.
+
+        ``category`` prefixes the logger record (greppable subsystem
+        tag); the panel shows ``msg`` verbatim so existing user-facing
+        wording is preserved at refactored call sites. When ``exc`` is
+        given the logger record carries the full traceback. The panel
+        write is guarded so reporting never raises from teardown /
+        crash-handler paths."""
+        log.error("%s: %s", category, msg, exc_info=exc)
+        try:
+            self.log_panel.write_line(msg)
+        except Exception as panel_exc:
+            log.debug("log panel write failed (%s): %s", category, panel_exc)
+
+    def _start_worker(self, worker, **connections):
+        """Wire and start a QThread worker — consolidates the repeated
+        assign → connect(log_msg / progress / finished / …) → start()
+        block used by the worker launch sites.
+
+        Each ``signal_name=slot`` kwarg is connected onto the worker.
+        ``log_msg`` auto-connects to the log panel when the worker
+        exposes it and the caller didn't supply an override. Returns
+        the worker so call sites keep their one-line attribute
+        assignment. Launch sites that fan one signal out to multiple
+        slots keep their explicit wiring (kwargs can't repeat a key)."""
+        if "log_msg" not in connections and hasattr(worker, "log_msg"):
+            connections["log_msg"] = self.log_panel.write_line
+        for signal_name, slot in connections.items():
+            getattr(worker, signal_name).connect(slot)
+        worker.start()
+        return worker
+
     # ── Universe + Auto-update ────────────────────────────────────────
 
     def _startup(self):
@@ -1552,19 +1609,17 @@ class MainWindow(QMainWindow):
             # First run -- download universe first, then update OHLCV
             self.status.showMessage("First run -- downloading ticker universe...")
             self.log_panel.write_line("First run detected. Downloading ticker universe...")
-            self._universe_worker = UniverseWorker()
-            self._universe_worker.log_msg.connect(self.log_panel.write_line)
-            self._universe_worker.finished.connect(self._on_universe_downloaded)
-            self._universe_worker.start()
+            self._universe_worker = self._start_worker(
+                UniverseWorker(),
+                finished=self._on_universe_downloaded,
+            )
         else:
             # Refresh universe if stale (picks up new IPOs/delistings)
             # refresh_universe() has a built-in 7-day staleness guard
-            self._universe_worker = UniverseRefreshWorker()
-            self._universe_worker.log_msg.connect(self.log_panel.write_line)
-            self._universe_worker.finished.connect(
-                lambda _: self._load_universe_and_update()
+            self._universe_worker = self._start_worker(
+                UniverseRefreshWorker(),
+                finished=lambda _: self._load_universe_and_update(),
             )
-            self._universe_worker.start()
 
     def _on_universe_downloaded(self, df):
         """Called when first-run universe download completes."""
@@ -1657,18 +1712,18 @@ class MainWindow(QMainWindow):
             f"Reference tickers: {len(ref_set)} benchmarks ensured in OHLCV cache"
         )
 
-        self._update_worker = UpdateWorker(
-            update_syms,
-            backoff_enabled_ref=self._backoff_enabled_ref,
-            backoff_threshold=self._backoff_threshold,
-            backoff_wait=self._backoff_wait,
-            max_retries=self._max_retries,
+        self._update_worker = self._start_worker(
+            UpdateWorker(
+                update_syms,
+                backoff_enabled_ref=self._backoff_enabled_ref,
+                backoff_threshold=self._backoff_threshold,
+                backoff_wait=self._backoff_wait,
+                max_retries=self._max_retries,
+            ),
+            progress=self._on_update_progress,
+            error_tickers=self._on_ohlcv_error_tickers,
+            finished=self._on_update_done,
         )
-        self._update_worker.log_msg.connect(self.log_panel.write_line)
-        self._update_worker.progress.connect(self._on_update_progress)
-        self._update_worker.error_tickers.connect(self._on_ohlcv_error_tickers)
-        self._update_worker.finished.connect(self._on_update_done)
-        self._update_worker.start()
 
     @pyqtSlot(int, int)
     def _on_update_progress(self, done: int, total: int):
@@ -1715,8 +1770,11 @@ class MainWindow(QMainWindow):
                 s for s in all_syms
                 if (config.PARQUET_DIR / f"{s}.parquet").exists()
             ]
-        except FileNotFoundError:
-            pass
+        except FileNotFoundError as exc:
+            log.debug(
+                "universe reload after OHLCV update skipped "
+                "(keeping prior symbol list): %s", exc,
+            )
 
         if errors == 0:
             color = "#4caf50"
@@ -2220,8 +2278,9 @@ class MainWindow(QMainWindow):
             self._save_zacks_blacklist()
             self._auto_added_zacks_skips = len(new_skips)
         except Exception as exc:
-            self.log_panel.write_line(
-                f"Warning: Zacks skip list save failed: {exc}"
+            self._log_error(
+                "zacks-skip-list",
+                f"Warning: Zacks skip list save failed: {exc}", exc,
             )
 
     def _show_last_zacks_failures(self):
@@ -2423,10 +2482,10 @@ class MainWindow(QMainWindow):
             return
         self.status.showMessage("Force refreshing ticker universe...")
         self.log_panel.write_line("Force universe refresh requested by user.")
-        self._universe_worker = UniverseWorker()
-        self._universe_worker.log_msg.connect(self.log_panel.write_line)
-        self._universe_worker.finished.connect(self._on_universe_downloaded)
-        self._universe_worker.start()
+        self._universe_worker = self._start_worker(
+            UniverseWorker(),
+            finished=self._on_universe_downloaded,
+        )
 
     def _force_ohlcv_refresh(self):
         """Menu action: force re-run OHLCV staleness check and update."""
@@ -2576,8 +2635,11 @@ class MainWindow(QMainWindow):
                         try:
                             getattr(mod, attr).clear()
                             cleared += 1
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            log.debug(
+                                "yfinance %s.%s cache clear failed: %s",
+                                getattr(mod, "__name__", mod), attr, exc,
+                            )
             # Shared HTTP session singleton
             if hasattr(yf, 'shared') and hasattr(yf.shared, '_REQUESTS_SESSION'):
                 yf.shared._REQUESTS_SESSION = None
@@ -2589,8 +2651,11 @@ class MainWindow(QMainWindow):
                         try:
                             getattr(yf.Ticker, attr).clear()
                             cleared += 1
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            log.debug(
+                                "yfinance Ticker.%s cache clear failed: %s",
+                                attr, exc,
+                            )
 
             if cleared == 0:
                 msg = (f"yfinance session reset: no internal caches matched "
@@ -2605,7 +2670,9 @@ class MainWindow(QMainWindow):
                 )
                 self.status.showMessage("yfinance session reset")
         except Exception as exc:
-            self.log_panel.write_line(f"Session reset error: {exc}")
+            self._log_error(
+                "yfinance-session", f"Session reset error: {exc}", exc,
+            )
 
     def _refresh_missing_only(self):
         """Menu action: download OHLCV only for tickers with no cached data."""
@@ -2642,18 +2709,18 @@ class MainWindow(QMainWindow):
         self._update_label.setStyleSheet(
             "color: #4a90d9; font-size: 11px; padding: 0 8px;"
         )
-        self._update_worker = UpdateWorker(
-            missing,
-            backoff_enabled_ref=self._backoff_enabled_ref,
-            backoff_threshold=self._backoff_threshold,
-            backoff_wait=self._backoff_wait,
-            max_retries=self._max_retries,
+        self._update_worker = self._start_worker(
+            UpdateWorker(
+                missing,
+                backoff_enabled_ref=self._backoff_enabled_ref,
+                backoff_threshold=self._backoff_threshold,
+                backoff_wait=self._backoff_wait,
+                max_retries=self._max_retries,
+            ),
+            progress=self._on_update_progress,
+            error_tickers=self._on_ohlcv_error_tickers,
+            finished=self._on_update_done,
         )
-        self._update_worker.log_msg.connect(self.log_panel.write_line)
-        self._update_worker.progress.connect(self._on_update_progress)
-        self._update_worker.error_tickers.connect(self._on_ohlcv_error_tickers)
-        self._update_worker.finished.connect(self._on_update_done)
-        self._update_worker.start()
 
     def _show_backoff_settings(self):
         """Open a dialog to configure rate-limit backoff parameters."""
@@ -3268,7 +3335,9 @@ class MainWindow(QMainWindow):
                 norm, skip, on_etf_identified=self._on_finnhub_etf_identified,
             )
         except Exception as exc:
-            self.log_panel.write_line(f"Finnhub spot fill failed: {exc}")
+            self._log_error(
+                "finnhub-spot-fill", f"Finnhub spot fill failed: {exc}", exc,
+            )
             return
 
         if status == "ok":
@@ -3533,7 +3602,9 @@ class MainWindow(QMainWindow):
                 on_empty_identified=self._on_finviz_empty_identified,
             )
         except Exception as exc:
-            self.log_panel.write_line(f"Finviz spot fill failed: {exc}")
+            self._log_error(
+                "finviz-spot-fill", f"Finviz spot fill failed: {exc}", exc,
+            )
             return
 
         if status == "ok":
@@ -3790,7 +3861,9 @@ class MainWindow(QMainWindow):
         try:
             count, status = yahoo_fill.spot_fill_yahoo(norm, self._blacklist)
         except Exception as exc:
-            self.log_panel.write_line(f"Yahoo spot fill failed: {exc}")
+            self._log_error(
+                "yahoo-spot-fill", f"Yahoo spot fill failed: {exc}", exc,
+            )
             return
         if status == "ok":
             self.log_panel.write_line(
@@ -4515,8 +4588,8 @@ class MainWindow(QMainWindow):
             try:
                 self.log_panel.write_line(f"  {msg}")
                 QApplication.processEvents()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("cookie-refresh progress write failed: %s", exc)
 
         try:
             pid = launch_firefox_for_zacks_cookies(
@@ -4524,8 +4597,9 @@ class MainWindow(QMainWindow):
                 progress_log=_progress,
             )
         except Exception as exc:
-            self.log_panel.write_line(
-                f"── Refresh Zacks cookies CRASHED at launch: {exc} ──"
+            self._log_error(
+                "zacks-cookies",
+                f"── Refresh Zacks cookies CRASHED at launch: {exc} ──", exc,
             )
             self._fallback_to_paste_dialog_or_cancel()
             return
@@ -4545,13 +4619,13 @@ class MainWindow(QMainWindow):
             self.act_zacks_open_cookie_browser.setEnabled(False)
 
         from .workers import FirefoxCookieWaitWorker
-        self._cookie_wait_worker = FirefoxCookieWaitWorker(
-            get_zacks_profile_dir(),
-            pre_signature=pre_sig,
+        self._cookie_wait_worker = self._start_worker(
+            FirefoxCookieWaitWorker(
+                get_zacks_profile_dir(),
+                pre_signature=pre_sig,
+            ),
+            finished=self._on_cookie_wait_done,
         )
-        self._cookie_wait_worker.log_msg.connect(self.log_panel.write_line)
-        self._cookie_wait_worker.finished.connect(self._on_cookie_wait_done)
-        self._cookie_wait_worker.start()
 
     @pyqtSlot(bool, int, bool, str)
     def _on_cookie_wait_done(self, success: bool, n_cookies: int,
@@ -5281,6 +5355,135 @@ class MainWindow(QMainWindow):
                 "Could not write scanner_data/sec_contact.txt.",
             )
 
+    def _show_advanced_settings(self) -> None:
+        """Settings → Advanced… — edit the user-configurable tunables:
+        OHLCV cache depth, earnings-history depth, and the reference/
+        benchmark ticker list. OK validates, persists via
+        config.save_user_config() (scanner_data/user_config.json), and
+        applies the values to the live config module immediately — no
+        restart. Cancel changes nothing."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Advanced Settings")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(460)
+        layout = QVBoxLayout(dlg)
+
+        # OHLCV history depth
+        row1 = QHBoxLayout()
+        lbl1 = QLabel("OHLCV history depth (years):")
+        lbl1.setToolTip(
+            "How many years of daily bars a full OHLCV download pulls "
+            "per ticker."
+        )
+        row1.addWidget(lbl1)
+        spin_ohlcv = QSpinBox()
+        spin_ohlcv.setRange(
+            *config.USER_CONFIG_INT_RANGES["OHLCV_HISTORY_YEARS"]
+        )
+        spin_ohlcv.setValue(int(config.OHLCV_HISTORY_YEARS))
+        spin_ohlcv.setMinimumWidth(80)
+        row1.addWidget(spin_ohlcv)
+        layout.addLayout(row1)
+
+        # Depth changes never rewrite the existing per-ticker parquet
+        # cache — only future full downloads use the new window.
+        note = QLabel(
+            "Note: the OHLCV depth applies to NEW downloads only — "
+            "already-cached tickers keep their current depth until "
+            "re-downloaded or rebuilt."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #888888; font-size: 11px;")
+        layout.addWidget(note)
+
+        # Earnings history depth
+        row2 = QHBoxLayout()
+        lbl2 = QLabel("Earnings history depth (years):")
+        lbl2.setToolTip(
+            "Hard cap on per-quarter earnings history for all three "
+            "fill sources (Finviz / Zacks / Finnhub). Rows older than "
+            "this are pruned at save time."
+        )
+        row2.addWidget(lbl2)
+        spin_earn = QSpinBox()
+        spin_earn.setRange(
+            *config.USER_CONFIG_INT_RANGES["EARNINGS_HISTORY_YEARS"]
+        )
+        spin_earn.setValue(int(config.EARNINGS_HISTORY_YEARS))
+        spin_earn.setMinimumWidth(80)
+        row2.addWidget(spin_earn)
+        layout.addLayout(row2)
+
+        # Reference / benchmark tickers
+        lbl3 = QLabel(
+            "Reference / benchmark tickers (comma-separated). Always "
+            "kept in the OHLCV cache and used for the RS calculations; "
+            "never appear in scan results."
+        )
+        lbl3.setWordWrap(True)
+        layout.addWidget(lbl3)
+        txt = QTextEdit()
+        txt.setPlaceholderText("e.g. SPY, ONEQ, XLK")
+        txt.setPlainText(", ".join(config.REFERENCE_TICKERS))
+        txt.setMinimumHeight(80)
+        layout.addWidget(txt)
+
+        # OK / Cancel
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_ok = QPushButton("OK")
+        btn_ok.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_ok)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        # Pre-validate the ticker list here so a typo warns BY NAME —
+        # save_user_config() would drop the whole invalid list and
+        # silently revert to the baked-in defaults.
+        tickers = [
+            t.strip().upper()
+            for t in txt.toPlainText().replace("\n", ",").split(",")
+            if t.strip()
+        ]
+        bad = [
+            t for t in tickers if not config.PLAUSIBLE_TICKER_RE.match(t)
+        ]
+        if not tickers or bad:
+            QMessageBox.warning(
+                self, "Invalid Reference Tickers",
+                (
+                    "These entries don't look like tickers: "
+                    f"{', '.join(bad)}. "
+                    if bad
+                    else "The reference ticker list cannot be empty. "
+                )
+                + "Nothing was saved.",
+            )
+            return
+
+        if not config.save_user_config({
+            "OHLCV_HISTORY_YEARS": spin_ohlcv.value(),
+            "EARNINGS_HISTORY_YEARS": spin_earn.value(),
+            "REFERENCE_TICKERS": tickers,
+        }):
+            QMessageBox.warning(
+                self, "Write Error",
+                "Could not write scanner_data/user_config.json.",
+            )
+            return
+        self.log_panel.write_line(
+            "Advanced settings saved: OHLCV depth="
+            f"{config.OHLCV_HISTORY_YEARS}y, earnings depth="
+            f"{config.EARNINGS_HISTORY_YEARS}y, "
+            f"{len(config.REFERENCE_TICKERS)} reference ticker(s). "
+            "OHLCV depth applies to new downloads only."
+        )
+
     def _load_menu_toggles_pref(self) -> None:
         """Read persisted menu-toggle values from QSettings into the
         in-memory refs that drive the QAction.checked state. Called
@@ -5633,8 +5836,13 @@ class MainWindow(QMainWindow):
                         f"recently-reported quarters are excluded. Click a "
                         f"timeframe button (1D/1W/…) to jump to the latest."
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                # A failure here only skips the stale-End-date warning —
+                # the scan itself still proceeds with the chosen End.
+                log.warning(
+                    "stale End-date pre-scan check failed "
+                    "(warning skipped; scan proceeds): %s", exc,
+                )
 
             # Force smallest→longest ordering so the most proximal
             # timeframe always runs (and displays) first. Sorting
@@ -5691,15 +5899,15 @@ class MainWindow(QMainWindow):
         self.summary_label.setText("")
         self.status.showMessage("Scanning...")
 
-        self._worker = ScanWorker(
-            filtered, params_list,
-            sequenced=sequenced,
-            omit_intra_run=self.chk_omit_intra_run.isChecked(),
+        self._worker = self._start_worker(
+            ScanWorker(
+                filtered, params_list,
+                sequenced=sequenced,
+                omit_intra_run=self.chk_omit_intra_run.isChecked(),
+            ),
+            progress=self._on_scan_progress,
+            finished=self._on_scan_done,
         )
-        self._worker.progress.connect(self._on_scan_progress)
-        self._worker.finished.connect(self._on_scan_done)
-        self._worker.log_msg.connect(self.log_panel.write_line)
-        self._worker.start()
 
     def _stop_scan(self):
         if self._worker:
@@ -5743,16 +5951,20 @@ class MainWindow(QMainWindow):
                 )
                 import traceback as _tb
                 self.log_panel.write_line(_tb.format_exc())
-            except Exception:
-                pass
+            except Exception as panel_exc:
+                log.debug(
+                    "crash-summary write to log panel failed: %s", panel_exc,
+                )
             try:
                 self.summary_label.setText("  Scan crashed — see log  ")
                 self.summary_label.setStyleSheet(
                     "font-size: 13px; padding: 6px; background: #c0392b; "
                     "color: white; border-radius: 4px; font-weight: bold;"
                 )
-            except Exception:
-                pass
+            except Exception as label_exc:
+                log.debug(
+                    "crash-summary label update failed: %s", label_exc,
+                )
 
     def _on_scan_done_impl(self, result):
         """Original body of _on_scan_done — split out so the wrapping
@@ -5768,8 +5980,8 @@ class MainWindow(QMainWindow):
         # new results.
         try:
             self.results_table.clear_cut_clipboard()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("cut-clipboard clear after scan failed: %s", exc)
         # Reconcile the saved column order against the new canonical
         # set: NEW filter/display columns (variables added since last
         # scan) get prepended to the user's saved layout in indicator-
@@ -6200,8 +6412,16 @@ class MainWindow(QMainWindow):
         self._deleted_column_keys = set()
         try:
             self.results_table.set_saved_column_order([])
-        except Exception:
-            pass
+        except Exception as exc:
+            # The table widget may now hold a stale saved order that no
+            # longer matches the (reset/canonical) MainWindow state —
+            # log the divergence so a wrong column layout after Reset
+            # to Default is diagnosable.
+            log.debug(
+                "column reset: results_table.set_saved_column_order([]) "
+                "failed — table may keep a stale saved order while "
+                "MainWindow order is reset to canonical: %s", exc,
+            )
         try:
             self._reapply_view_filters_for_active_period()
         except Exception as exc:
@@ -6272,8 +6492,8 @@ class MainWindow(QMainWindow):
         # symbols.
         try:
             self.results_table.clear_cut_clipboard()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("cut-clipboard clear after row delete failed: %s", exc)
         # Re-render with view filters applied.
         try:
             shown = self._apply_view_filters(df)
@@ -7407,8 +7627,11 @@ class MainWindow(QMainWindow):
                 self.results_table.set_saved_column_order(
                     self._results_column_order
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug(
+                    "preset load: set_saved_column_order(%d keys) "
+                    "failed: %s", len(self._results_column_order), exc,
+                )
             self._sync_columns_dialog()
 
         # v6: session-bar omission toggles. No signal connections live
@@ -7556,8 +7779,10 @@ class MainWindow(QMainWindow):
                 for logger_name in ("scanner.data", "scanner.universe",
                                     "scanner.tradestation"):
                     logging.getLogger(logger_name).removeHandler(h)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug(
+                    "subsystem log handler close/detach failed: %s", exc,
+                )
         # Detach the QtLogHandler that pipes scanner logs into the
         # GUI's LogPanel. The handler holds a Qt signal reference; if
         # we leave it on the `scanner` logger after the window is
@@ -7570,8 +7795,8 @@ class MainWindow(QMainWindow):
         if gui_handler is not None:
             try:
                 logging.getLogger("scanner").removeHandler(gui_handler)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("GUI log handler detach failed: %s", exc)
             self._gui_log_handler = None
         super().closeEvent(event)
 

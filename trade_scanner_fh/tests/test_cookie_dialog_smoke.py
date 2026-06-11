@@ -121,6 +121,15 @@ def test_imperva_block_slot_runs_without_error(_qapp, tmp_path,
     parent._on_cookie_wait_done = types.MethodType(
         MainWindow._on_cookie_wait_done, parent,
     )
+    # Phase 1 quick wins: the launch path now wires the wait worker via
+    # the shared _start_worker helper (and reports launch crashes via
+    # _log_error) — bind both so attribute lookup resolves on the shell.
+    parent._start_worker = types.MethodType(
+        MainWindow._start_worker, parent,
+    )
+    parent._log_error = types.MethodType(
+        MainWindow._log_error, parent,
+    )
 
     captured = {}
 

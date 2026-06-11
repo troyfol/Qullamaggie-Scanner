@@ -1360,7 +1360,7 @@ def _fill_via_zacks(
     stop_flag: Optional[list[bool]] = None,
     delay_sec: float = 1.5,
     flush_every: int = 25,
-    years: int = config.EARNINGS_HISTORY_YEARS,
+    years: Optional[int] = None,
     label: str = "Zacks fill",
     consec_error_limit: int = 5,
     on_block_callback=None,
@@ -1381,6 +1381,11 @@ def _fill_via_zacks(
     during the block almost certainly failed for the block, not for
     its own sake. "stop" exits the loop cleanly.
     """
+    if years is None:
+        # Resolved at CALL time (None sentinel, not a def-time default) so a
+        # live Settings → Advanced… change to the earnings-history depth
+        # applies without a restart.
+        years = config.EARNINGS_HISTORY_YEARS
     work = [t for t in tickers if t not in blacklist]
     if not work:
         log.info("%s: no tickers to process", label)
@@ -1559,7 +1564,7 @@ def bulk_fill_zacks(
     stop_flag: Optional[list[bool]] = None,
     delay_sec: float = 1.5,
     flush_every: int = 25,
-    years: int = config.EARNINGS_HISTORY_YEARS,
+    years: Optional[int] = None,  # None → config.EARNINGS_HISTORY_YEARS at call time
     on_block_callback=None,
     consec_error_limit: int = 5,
     failed_cb=None,
@@ -1594,7 +1599,7 @@ def targeted_fill_zacks(
     stop_flag: Optional[list[bool]] = None,
     delay_sec: float = 1.5,
     flush_every: int = 25,
-    years: int = config.EARNINGS_HISTORY_YEARS,
+    years: Optional[int] = None,  # None → config.EARNINGS_HISTORY_YEARS at call time
     on_block_callback=None,
     consec_error_limit: int = 5,
     failed_cb=None,

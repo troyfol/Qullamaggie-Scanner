@@ -146,8 +146,11 @@ a = Analysis(
     # PySide6 / shiboken6 live in the shared build env (sibling projects
     # use them) but this app is PyQt6-only. PyInstaller aborts the build
     # if it sees two Qt bindings packages, so exclude PySide6 explicitly.
+    # scipy is safe to exclude: the app has zero scipy imports, and
+    # pandas/yfinance only lazy-import it on paths never hit here
+    # (yfinance repair=True is never passed).
     excludes=['matplotlib', 'tkinter', 'test', 'unittest',
-              'PySide6', 'shiboken6'],
+              'PySide6', 'shiboken6', 'scipy'],
     noarchive=False,
     optimize=0,
 )
@@ -173,4 +176,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='barchart_zacks.ico',
+    # Windows VERSIONINFO resource — versions mirror
+    # trade_scanner_fh.__version__ ("1.0.0-zacks.0").
+    version='version_info.txt',
 )

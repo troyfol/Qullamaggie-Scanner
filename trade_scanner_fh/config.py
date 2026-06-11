@@ -4,6 +4,7 @@ All paths, defaults, and tunable constants live here.
 """
 
 import os
+import re
 import sys
 import uuid
 from datetime import date, datetime, timedelta
@@ -298,6 +299,8 @@ YFINANCE_PAUSE_SEC = 0.5           # pause between OHLCV batches
 SAVE_FTP_RAW = False               # Phase 2 I12: persist raw NASDAQ FTP files for debugging
 
 # -- OHLCV Download --------------------------------------------------------
+# Baked-in default — user-overridable via Settings → Advanced…
+# (scanner_data/user_config.json; see the user-config section at the bottom).
 OHLCV_HISTORY_YEARS = 5          # max years of daily data to cache
 
 # -- Parquet schema versioning (Phase 4 R18) -------------------------------
@@ -315,7 +318,8 @@ MAX_MISSING_DAYS_FLAG = 5        # flag if > N trading days missing in a row
 UNIVERSE_STALE_DAYS = 7
 
 # -- Reference / Benchmark Tickers ----------------------------------------
-# Always kept in OHLCV cache; used for RS calculations, never in scan results
+# Always kept in OHLCV cache; used for RS calculations, never in scan results.
+# Baked-in default — user-overridable via Settings → Advanced….
 REFERENCE_TICKERS = [
     "SPY",   # S&P 500 — benchmark for RS vs. S&P
     "ONEQ",  # NASDAQ Composite — benchmark for RS vs. NASDAQ
@@ -347,6 +351,7 @@ EARNINGS_HISTORY_PARQUET = DATA_DIR / "earnings_history.parquet"
 # 2026-06: raised 5 → 10 (finviz freely provides ~10y+ in raw; 5y truncated
 # usable history). A one-time finviz-from-raw backfill recovers the extra
 # depth without re-fetching — see earnings_history.migrate_backfill_finviz_history_from_raw.
+# Baked-in default — user-overridable via Settings → Advanced….
 EARNINGS_HISTORY_YEARS = 10
 # Sanity bounds for reported EPS — filter reverse-split adjustment artifacts
 # on heavily-reverse-split nano-caps that store nonsensical per-share values
@@ -624,3 +629,177 @@ SECTOR_ETF_MAP = {
     "Media": "XLC",
     "Telecommunication": "XLC",
 }
+
+# ============================================================================
+# User-configurable overrides (Settings → Advanced…)
+# ============================================================================
+# A handful of the tunables above are exposed in the GUI and persisted to
+# scanner_data/user_config.json (gitignore-covered along with the rest of
+# scanner_data/). load_user_config() runs once at the BOTTOM of this module —
+# i.e. at import time, before any consumer module loads — and every consumer
+# reads `config.<NAME>` attributes at call time, so the user's values are in
+# effect from first use. Validation is strict and the fallback is always the
+# baked-in default: a corrupt or hand-mangled file can never crash import, it
+# just silently (debug log) reverts the bad field.
+_USER_CONFIG_FILENAME = "user_config.json"
+
+# Baked-in defaults, captured BEFORE any override is applied, so a bad or
+# deleted user_config.json always has something safe to fall back to. The
+# list default is stored as a tuple so nothing can mutate it in place.
+_USER_CONFIG_DEFAULTS: dict = {
+    "OHLCV_HISTORY_YEARS": OHLCV_HISTORY_YEARS,
+    "EARNINGS_HISTORY_YEARS": EARNINGS_HISTORY_YEARS,
+    "REFERENCE_TICKERS": tuple(REFERENCE_TICKERS),
+}
+
+# Clamp ranges for the integer overrides (years of history). Public — the
+# Advanced settings dialog reads these for its spinbox ranges so the GUI and
+# the validation here can never drift apart.
+USER_CONFIG_INT_RANGES: dict = {
+    "OHLCV_HISTORY_YEARS": (1, 25),
+    "EARNINGS_HISTORY_YEARS": (1, 25),
+}
+
+# Plausible exchange ticker: leading letter, then letters/digits/dot/hyphen,
+# 10 chars max (covers BRK.B / BF-B style class shares). Public — the
+# Advanced dialog uses it to name the offending entry in its warning.
+PLAUSIBLE_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
+
+
+def user_config_path() -> Path:
+    """Path to the per-user override file. Computed lazily so tests can
+    monkeypatch config.DATA_DIR (mirrors _sec_contact_path)."""
+    return DATA_DIR / _USER_CONFIG_FILENAME
+
+
+def _coerce_history_years(key: str, value) -> Optional[int]:
+    """Validate one years-of-history override. A genuine int is clamped to
+    the sane range for `key`; anything else returns None so the caller
+    falls back to the baked-in default. bool is rejected explicitly — it's
+    an int subclass, and `true` in the JSON would otherwise clamp to 1."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    lo, hi = USER_CONFIG_INT_RANGES[key]
+    return max(lo, min(hi, value))
+
+
+def _coerce_reference_tickers(value) -> Optional[list]:
+    """Validate a REFERENCE_TICKERS override: a non-empty list of plausible
+    ticker strings. Normalizes (strip/upper, order-preserving dedup) and
+    returns the clean list — or None when ANY entry is implausible, so a
+    half-broken list falls back whole rather than silently dropping
+    benchmarks the RS calculations expect."""
+    if not isinstance(value, list) or not value:
+        return None
+    out: list = []
+    for item in value:
+        if not isinstance(item, str):
+            return None
+        sym = item.strip().upper()
+        if not PLAUSIBLE_TICKER_RE.match(sym):
+            return None
+        if sym not in out:
+            out.append(sym)
+    return out
+
+
+def _validated_user_overrides(raw: dict) -> dict:
+    """Run every known override field in `raw` through its validator.
+    Invalid values and unknown keys are dropped (debug-logged) — never
+    raised — so one bad field can't take down the rest."""
+    import logging
+    log = logging.getLogger("scanner")
+    out: dict = {}
+    for key in ("OHLCV_HISTORY_YEARS", "EARNINGS_HISTORY_YEARS"):
+        if key in raw:
+            val = _coerce_history_years(key, raw[key])
+            if val is None:
+                log.debug(
+                    "user_config %s invalid (%r) — using default %r",
+                    key, raw[key], _USER_CONFIG_DEFAULTS[key],
+                )
+            else:
+                out[key] = val
+    if "REFERENCE_TICKERS" in raw:
+        val = _coerce_reference_tickers(raw["REFERENCE_TICKERS"])
+        if val is None:
+            log.debug(
+                "user_config REFERENCE_TICKERS invalid (%r) — using default",
+                raw["REFERENCE_TICKERS"],
+            )
+        else:
+            out["REFERENCE_TICKERS"] = val
+    return out
+
+
+def _apply_user_overrides(overrides: dict) -> None:
+    """Set the live module attributes: each known field gets its validated
+    override, or its baked-in default when absent — so re-loading after the
+    file is deleted/cleared restores the defaults too. The list default is
+    copied so callers can never mutate the baked-in tuple."""
+    g = globals()
+    for key, default in _USER_CONFIG_DEFAULTS.items():
+        val = overrides.get(key, default)
+        g[key] = list(val) if isinstance(val, (list, tuple)) else val
+
+
+def load_user_config() -> dict:
+    """Load scanner_data/user_config.json and apply the valid overrides to
+    the module attributes. Returns the dict of overrides actually applied.
+
+    Missing file, unreadable file, corrupt JSON, a non-object top level,
+    wrong types, out-of-range ints — every failure mode falls back to the
+    baked-in defaults with only a debug log; importing config can never
+    crash on a bad user_config.json."""
+    import json
+    import logging
+    log = logging.getLogger("scanner")
+    raw = None
+    try:
+        path = user_config_path()
+        if path.exists():
+            raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        # json.JSONDecodeError subclasses ValueError.
+        log.debug("user_config.json unreadable — using defaults: %s", exc)
+        raw = None
+    if not isinstance(raw, dict):
+        if raw is not None:
+            log.debug(
+                "user_config.json top level is %s, expected object — "
+                "using defaults", type(raw).__name__,
+            )
+        raw = {}
+    overrides = _validated_user_overrides(raw)
+    _apply_user_overrides(overrides)
+    return overrides
+
+
+def save_user_config(values: dict) -> bool:
+    """Validate `values`, persist the valid fields to user_config.json
+    (atomic write), and apply them to the live module attributes so the
+    change takes effect immediately — no restart needed.
+
+    Full-state semantics: the file is REPLACED with exactly the validated
+    fields, and any known field missing from `values` (or invalid) reverts
+    to its baked-in default both on disk and in memory — disk and module
+    state can never disagree. Returns True on success, False on a write
+    error (validation problems never raise; bad fields are just dropped)."""
+    import json
+    overrides = _validated_user_overrides(values)
+    try:
+        atomic_write_text(
+            user_config_path(),
+            json.dumps(overrides, indent=2) + "\n",
+        )
+    except OSError:
+        return False
+    _apply_user_overrides(overrides)
+    return True
+
+
+# Apply any persisted user overrides NOW, at the bottom of the import, so the
+# baked-in defaults above are already defined (and captured in
+# _USER_CONFIG_DEFAULTS) before being overridden. Read-only — a missing
+# scanner_data/ is fine (no directory side effects at import, per R7).
+load_user_config()
