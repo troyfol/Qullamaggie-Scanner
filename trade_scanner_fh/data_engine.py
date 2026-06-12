@@ -7,6 +7,7 @@ Public API
     download_many(symbols, ...)               -> list[ScrapeResult]  (parallel)
     download_one(symbol)                      -> ScrapeResult
     load_ohlcv(symbol)                        -> pd.DataFrame | None
+    prefetch_ohlcv(symbols, ...)              -> int   (cache warmer; F5)
     validate_ticker(symbol, df)               -> list[str]   (anomaly messages)
 
 ScrapeReport / ScrapeResult are dataclasses with structured metadata.
@@ -454,6 +455,66 @@ def clear_ohlcv_cache() -> None:
     may rewrite many parquets (not strictly necessary since mtime-keying
     self-invalidates, but useful for freeing memory)."""
     _load_ohlcv_cached.cache_clear()
+
+
+def prefetch_ohlcv(
+    symbols: list[str],
+    *,
+    max_workers: int = 4,
+    stop_flag: Optional[threading.Event] = None,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> int:
+    """Warm the load_ohlcv LRU cache for `symbols` on a thread pool (F5).
+
+    A cold first scan is ~85% parquet I/O (~8.7 ms/ticker); pre-loading the
+    cache in the background hides that cost. Pure cache warmer — no network,
+    no writes, and results are discarded (the lru_cache retains them keyed
+    by (symbol, mtime_ns), so a later load_ohlcv is a hit unless the parquet
+    was rewritten in between).
+
+    Args:
+        symbols: tickers to warm. An empty list is a no-op returning 0.
+        max_workers: thread-pool width (parquet reads release the GIL).
+        stop_flag: optional threading.Event — checked between submissions
+            and again at the start of each worker, so setting it aborts
+            promptly (already-loading symbols finish; the rest are skipped).
+        progress_cb: optional callable(done, total), invoked in completion
+            order as each symbol finishes (warmed, skipped, or failed).
+            Called from this (caller's) thread, not the workers.
+
+    Returns:
+        Number of symbols actually warmed (parquet existed and loaded
+        cleanly). Missing/corrupt parquets and unexpected per-symbol load
+        errors are swallowed (debug-logged) and simply not counted.
+    """
+    if not symbols:
+        return 0
+
+    def _warm(sym: str) -> bool:
+        if stop_flag is not None and stop_flag.is_set():
+            return False
+        try:
+            return load_ohlcv(sym) is not None
+        except Exception as exc:
+            log.debug("prefetch_ohlcv: load failed for %s — %s", sym, exc)
+            return False
+
+    total = len(symbols)
+    warmed = 0
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = []
+        for sym in symbols:
+            if stop_flag is not None and stop_flag.is_set():
+                break
+            futures.append(ex.submit(_warm, sym))
+        for fut in as_completed(futures):
+            if fut.result():  # _warm never raises
+                warmed += 1
+            done += 1
+            if progress_cb:
+                progress_cb(done, total)
+    return warmed
 
 
 # ── Parquet schema stamp (Phase 4 R18) ──────────────────────────────────

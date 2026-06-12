@@ -16,7 +16,7 @@ from trade_scanner_fh import config
 
 @pytest.fixture
 def _ucfg_tmp(tmp_path, monkeypatch):
-    """Redirect config.DATA_DIR to a temp dir and register the three
+    """Redirect config.DATA_DIR to a temp dir and register the four
     overridable attributes with monkeypatch (re-set to their current
     values) so anything a test applies via load/save_user_config() is
     rolled back at teardown — the rest of the suite must keep seeing
@@ -30,6 +30,8 @@ def _ucfg_tmp(tmp_path, monkeypatch):
         config, "EARNINGS_HISTORY_YEARS", config.EARNINGS_HISTORY_YEARS)
     monkeypatch.setattr(
         config, "REFERENCE_TICKERS", list(config.REFERENCE_TICKERS))
+    monkeypatch.setattr(
+        config, "PREFETCH_OHLCV_AT_LAUNCH", config.PREFETCH_OHLCV_AT_LAUNCH)
     config.load_user_config()  # no file yet → baked-in defaults
     return tmp_path
 
@@ -59,6 +61,7 @@ def test_baked_in_defaults_pinned():
     assert d["EARNINGS_HISTORY_YEARS"] == 10
     assert list(d["REFERENCE_TICKERS"][:2]) == ["SPY", "ONEQ"]
     assert len(d["REFERENCE_TICKERS"]) == 13
+    assert d["PREFETCH_OHLCV_AT_LAUNCH"] is False
 
 
 def test_load_user_config_called_at_import():
@@ -203,6 +206,89 @@ def test_ticker_list_normalized(_ucfg_tmp):
     assert config.REFERENCE_TICKERS == ["SPY", "BRK.B", "BF-B"]
 
 
+def test_plausible_ticker_re_rejects_trailing_newline():
+    """PLAUSIBLE_TICKER_RE must anchor with \\Z, not $: with $,
+    re.match("AAPL\\n") would MATCH (a $ matches just before a trailing
+    newline), letting a newline-bearing 'ticker' through validation.
+    Pins both the accept and the reject."""
+    assert config.PLAUSIBLE_TICKER_RE.match("AAPL") is not None
+    assert config.PLAUSIBLE_TICKER_RE.match("AAPL\n") is None
+
+
+# ----------------------------------------------------------------------
+# PREFETCH_OHLCV_AT_LAUNCH validation (F5)
+# ----------------------------------------------------------------------
+
+def test_prefetch_flag_defaults_false(_ucfg_tmp):
+    """No file → the launch-prefetch toggle stays OFF (the baked-in
+    default), so old installs and old user_config.json files see no
+    behavior change."""
+    applied = config.load_user_config()
+    assert applied == {}
+    assert config.PREFETCH_OHLCV_AT_LAUNCH is False
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_prefetch_flag_valid_override_applied(_ucfg_tmp, value):
+    """A genuine JSON bool round-trips: applied to the live attribute
+    and reported in the applied-overrides dict (explicit false too —
+    it's a valid value, not 'missing')."""
+    _write(_ucfg_tmp, {"PREFETCH_OHLCV_AT_LAUNCH": value})
+    applied = config.load_user_config()
+    assert applied == {"PREFETCH_OHLCV_AT_LAUNCH": value}
+    assert config.PREFETCH_OHLCV_AT_LAUNCH is value
+
+
+@pytest.mark.parametrize("bad", [
+    1,            # int — truthy but not a bool
+    0,            # int — falsy but not a bool
+    "true",       # string
+    "False",      # string
+    1.0,          # float
+    None,
+    [True],       # wrong container
+    {"on": True},
+])
+def test_prefetch_flag_rejects_non_bool(_ucfg_tmp, bad):
+    """Anything but a genuine JSON true/false falls back to the baked-in
+    default — same strictness as the int fields' bool rejection."""
+    _write(_ucfg_tmp, {"PREFETCH_OHLCV_AT_LAUNCH": bad})
+    applied = config.load_user_config()
+    assert applied == {}
+    assert config.PREFETCH_OHLCV_AT_LAUNCH is False
+
+
+def test_prefetch_flag_reverts_on_delete(_ucfg_tmp):
+    """An applied true override must not stick in module state once the
+    file is gone — mirrors test_reload_after_delete_restores_defaults."""
+    _write(_ucfg_tmp, {"PREFETCH_OHLCV_AT_LAUNCH": True})
+    config.load_user_config()
+    assert config.PREFETCH_OHLCV_AT_LAUNCH is True
+    config.user_config_path().unlink()
+    config.load_user_config()
+    assert config.PREFETCH_OHLCV_AT_LAUNCH is False
+
+
+def test_prefetch_flag_save_round_trip(_ucfg_tmp):
+    """save_user_config persists the bool, applies it live, and drops an
+    invalid value back to default (never written to disk)."""
+    assert config.save_user_config({
+        "PREFETCH_OHLCV_AT_LAUNCH": True,
+    }) is True
+    assert config.PREFETCH_OHLCV_AT_LAUNCH is True
+    on_disk = json.loads(
+        config.user_config_path().read_text(encoding="utf-8"))
+    assert on_disk == {"PREFETCH_OHLCV_AT_LAUNCH": True}
+    # Invalid on save → dropped from disk AND reverted in memory.
+    assert config.save_user_config({
+        "PREFETCH_OHLCV_AT_LAUNCH": "yes",
+    }) is True
+    on_disk = json.loads(
+        config.user_config_path().read_text(encoding="utf-8"))
+    assert on_disk == {}
+    assert config.PREFETCH_OHLCV_AT_LAUNCH is False
+
+
 # ----------------------------------------------------------------------
 # Corrupt file: must never crash, always defaults
 # ----------------------------------------------------------------------
@@ -222,6 +308,7 @@ def test_corrupt_file_falls_back_silently(_ucfg_tmp, payload):
     assert config.OHLCV_HISTORY_YEARS == 5
     assert config.EARNINGS_HISTORY_YEARS == 10
     assert len(config.REFERENCE_TICKERS) == 13
+    assert config.PREFETCH_OHLCV_AT_LAUNCH is False
 
 
 # ----------------------------------------------------------------------

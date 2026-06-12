@@ -48,6 +48,8 @@ Public API (mirrors earnings_cache.py):
     get_ticker_history(t, df)      -> pd.DataFrame  (sorted period_ending DESC)
     get_most_recent_quarter(t, df) -> pd.Series | None
     compute_consecutive_beats(...) -> int
+    find_cross_source_disagreements(df, ...) -> pd.DataFrame  (report-only)
+    report_cross_source_disagreements(df)    -> pd.DataFrame  (+ CSV + log)
 
 Bulk + targeted fills via Zacks:
     bulk_fill_zacks(...)
@@ -266,7 +268,9 @@ def save_earnings_history(
             Defaults to the value of ``sort`` — final / canonical writes
             dedup; per-flush writes don't (kept the same shape as the
             sort gate so a single ``sort=True`` flips both). Pass an
-            explicit bool to override.
+            explicit bool to override. Canonical (dedup=True) saves also
+            refresh the report-only cross-source disagreement CSV just
+            before deduping (see ``report_cross_source_disagreements``).
     """
     if df is None or df.empty:
         return
@@ -291,6 +295,18 @@ def save_earnings_history(
             pd.to_datetime(out["period_ending"], errors="coerce") >= _cap_cutoff
         ].reset_index(drop=True)
     if dedup:
+        # F4 — report-only cross-source disagreement scan. Runs HERE
+        # because the canonical (dedup=True) save is the single choke
+        # point every fill's end-of-run write passes through (zacks'
+        # _finalize_fill and fill_framework's flush/finalize all land
+        # here), and it's the last moment the per-slot loser rows still
+        # exist — dedupe_history drops them on the next line. Per-flush
+        # saves (dedup=False) skip it. Never allowed to break the
+        # parquet save (e.g. the CSV is locked open in Excel).
+        try:
+            report_cross_source_disagreements(out)
+        except Exception as exc:  # noqa: BLE001 — diagnostics must not block saves
+            log.warning("Cross-source disagreement report failed: %s", exc)
         out = dedupe_history(out)
     # Sanity guard: null EPS fields on rows whose reported_eps is an
     # impossible-magnitude reverse-split artifact. Absolute cap only here —
@@ -501,6 +517,149 @@ def dedupe_history(
     keep = [c for c in COLUMNS if c in df.columns]
     extra = [c for c in df.columns if c not in keep]
     return df[keep + extra].reset_index(drop=True)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Cross-source EPS disagreement flagging (F4 — report-only)
+# ──────────────────────────────────────────────────────────────────────
+
+# Column order of the find_cross_source_disagreements result / the CSV.
+DISAGREEMENT_COLUMNS: list[str] = [
+    "ticker", "period_ending", "source_a", "source_b",
+    "eps_a", "eps_b", "surprise_a", "surprise_b",
+    "delta_eps", "delta_surprise_pp",
+]
+
+
+def _disagreements_csv_path() -> Path:
+    """scanner_data/earnings_disagreements.csv — resolved at call time
+    (mirrors the migration-flag path helpers) so test fixtures that
+    monkeypatch ``config.DATA_DIR`` redirect the report file too."""
+    return config.DATA_DIR / config.EARNINGS_DISAGREEMENTS_CSV_NAME
+
+
+def find_cross_source_disagreements(
+    df: Optional[pd.DataFrame],
+    eps_abs_tol: Optional[float] = None,
+    surprise_pp_tol: Optional[float] = None,
+) -> pd.DataFrame:
+    """Report-only scan for (ticker, period_ending) slots where two
+    sources materially disagree — the cases ``dedupe_history`` resolves
+    silently by keeping the priority winner.
+
+    A cross-source pair is flagged when BOTH rows have a non-null
+    ``reported_eps`` and ``|Δeps| > eps_abs_tol`` (default
+    ``config.EPS_DISAGREEMENT_ABS_TOL``), OR both have a non-null
+    ``surprise_eps_pct`` and the values differ by more than
+    ``surprise_pp_tol`` percentage points (default
+    ``config.SURPRISE_DISAGREEMENT_PP_TOL``). Strict ``>`` on both axes,
+    so a delta exactly at tolerance passes. Slots with rows from a
+    single source are never flagged (same-source duplicates collapse to
+    the most-recently-updated copy first, matching the dedup's
+    same-source winner).
+
+    Returns a frame with columns ``DISAGREEMENT_COLUMNS``. ``source_a``
+    is the dedup-priority winner of the pair (the row ``dedupe_history``
+    keeps) so each row reads "kept a / dropped b". ``delta_eps`` /
+    ``delta_surprise_pp`` are absolute differences; NaN when either side
+    is null (the pair was flagged on the other axis).
+
+    Purely diagnostic: never mutates ``df`` and has NO effect on dedup
+    outcomes. Vectorized via a self-merge on (ticker, period_ending)
+    restricted to contested slots — no Python row loops, safe on the
+    full ~138k-row parquet.
+    """
+    empty = pd.DataFrame(columns=DISAGREEMENT_COLUMNS)
+    if df is None or df.empty:
+        return empty
+    if not {"ticker", "period_ending", "source"}.issubset(df.columns):
+        return empty
+    if eps_abs_tol is None:
+        eps_abs_tol = config.EPS_DISAGREEMENT_ABS_TOL
+    if surprise_pp_tol is None:
+        surprise_pp_tol = config.SURPRISE_DISAGREEMENT_PP_TOL
+
+    def _num(col: str) -> pd.Series:
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors="coerce")
+        return pd.Series(float("nan"), index=df.index)
+
+    sub = pd.DataFrame({
+        "ticker": df["ticker"].astype(str),
+        "period_ending": pd.to_datetime(df["period_ending"], errors="coerce"),
+        "source": df["source"].astype(str).str.lower(),
+        "eps": _num("reported_eps"),
+        "surprise": _num("surprise_eps_pct"),
+        "updated_at": (pd.to_datetime(df["updated_at"], errors="coerce")
+                       if "updated_at" in df.columns
+                       else pd.Series(pd.NaT, index=df.index)),
+    })
+    sub = sub.dropna(subset=["period_ending"])
+
+    # One row per (ticker, period_ending, source) — most recently updated
+    # copy wins, same as dedupe_history's within-source pick.
+    sub = (
+        sub.sort_values("updated_at", na_position="first", kind="stable")
+           .drop_duplicates(subset=["ticker", "period_ending", "source"],
+                            keep="last")
+           .drop(columns="updated_at")
+    )
+
+    # Only slots holding ≥2 (distinct-source) rows can produce a pair —
+    # pre-filtering keeps the self-merge near-free on an already-deduped
+    # frame where virtually every slot is single-row.
+    contested = sub.duplicated(subset=["ticker", "period_ending"], keep=False)
+    sub = sub.loc[contested]
+    if sub.empty:
+        return empty
+
+    # Self-merge → every ordered same-slot pair; keep each unordered
+    # CROSS-source pair exactly once, with `a` = dedup-priority winner
+    # (string-order tiebreak for sources outside _SOURCE_PRIORITY).
+    # Same-source pairs (incl. self-pairs) fail both conditions.
+    m = sub.merge(sub, on=["ticker", "period_ending"],
+                  suffixes=("_a", "_b"), sort=False)
+    prio_a = m["source_a"].map(_SOURCE_PRIORITY).fillna(_SOURCE_PRIORITY_FALLBACK)
+    prio_b = m["source_b"].map(_SOURCE_PRIORITY).fillna(_SOURCE_PRIORITY_FALLBACK)
+    m = m.loc[(prio_a < prio_b)
+              | ((prio_a == prio_b) & (m["source_a"] < m["source_b"]))]
+    if m.empty:
+        return empty
+
+    m = m.copy()
+    m["delta_eps"] = (m["eps_a"] - m["eps_b"]).abs()
+    m["delta_surprise_pp"] = (m["surprise_a"] - m["surprise_b"]).abs()
+    eps_bad = (m["eps_a"].notna() & m["eps_b"].notna()
+               & (m["delta_eps"] > float(eps_abs_tol)))
+    sur_bad = (m["surprise_a"].notna() & m["surprise_b"].notna()
+               & (m["delta_surprise_pp"] > float(surprise_pp_tol)))
+    out = m.loc[eps_bad | sur_bad, DISAGREEMENT_COLUMNS]
+    if out.empty:
+        return empty
+    return (
+        out.sort_values(["ticker", "period_ending", "source_a", "source_b"],
+                        ascending=[True, False, True, True], kind="stable")
+           .reset_index(drop=True)
+    )
+
+
+def report_cross_source_disagreements(
+    history_df: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Run the disagreement scan and persist the result to
+    scanner_data/earnings_disagreements.csv (atomic overwrite — the file
+    always reflects the most recent canonical-save scan, so previously
+    reported slots that the dedup has since resolved disappear on the
+    next run). Logs loudly when any disagreement is found; silent when
+    clean. Returns the report frame."""
+    rep = find_cross_source_disagreements(history_df)
+    config.atomic_write_csv(rep, _disagreements_csv_path(), index=False)
+    if len(rep):
+        log.warning(
+            "%d cross-source EPS disagreements — see %s",
+            len(rep), config.EARNINGS_DISAGREEMENTS_CSV_NAME,
+        )
+    return rep
 
 
 def get_ticker_history(ticker: str, history_df: Optional[pd.DataFrame]) -> pd.DataFrame:

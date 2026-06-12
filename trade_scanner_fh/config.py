@@ -303,6 +303,13 @@ SAVE_FTP_RAW = False               # Phase 2 I12: persist raw NASDAQ FTP files f
 # (scanner_data/user_config.json; see the user-config section at the bottom).
 OHLCV_HISTORY_YEARS = 5          # max years of daily data to cache
 
+# Warm the load_ohlcv LRU cache across the universe at launch
+# (data_engine.prefetch_ohlcv) so the first scan isn't dominated by cold
+# parquet reads (~85% of a cold scan is parquet I/O). Baked-in default —
+# user-overridable via scanner_data/user_config.json (same mechanism as
+# OHLCV_HISTORY_YEARS above).
+PREFETCH_OHLCV_AT_LAUNCH = False
+
 # -- Parquet schema versioning (Phase 4 R18) -------------------------------
 # Bump when the per-ticker OHLCV parquet column set or dtypes change in a way
 # that breaks forward/backward load compatibility. On mismatch, the scanner
@@ -371,6 +378,23 @@ EPS_PRICE_IMPLAUSIBLE_MULT = 10.0
 # NaN instead of a meaningless blow-up. EPS in $/share; revenue in $millions.
 MIN_YOY_EPS_BASE = 0.05
 MIN_YOY_REV_BASE = 1.0
+# Cross-source EPS disagreement flagging (report-only diagnostics).
+# When two sources both carry a row for the same (ticker, period_ending)
+# slot, dedupe_history silently keeps the priority winner
+# (finviz > zacks > finnhub). earnings_history.find_cross_source_disagreements
+# additionally FLAGS the slots where the sources materially disagree so the
+# silent resolution stays visible. A pair is flagged when both rows have a
+# non-null reported_eps differing by MORE than EPS_DISAGREEMENT_ABS_TOL
+# dollars, OR both have a non-null surprise_eps_pct differing by MORE than
+# SURPRISE_DISAGREEMENT_PP_TOL percentage points (strict >; ties pass). The
+# report is written to scanner_data/<EARNINGS_DISAGREEMENTS_CSV_NAME> on
+# every canonical (deduping) history save. Purely diagnostic — changing
+# these tolerances never changes which row the dedup keeps.
+EPS_DISAGREEMENT_ABS_TOL = 0.10        # dollars of reported_eps
+SURPRISE_DISAGREEMENT_PP_TOL = 2.0     # percentage points of surprise_eps_pct
+# Name only — resolved against DATA_DIR at call time (like the migration
+# flags) so test fixtures that monkeypatch DATA_DIR redirect the report too.
+EARNINGS_DISAGREEMENTS_CSV_NAME = "earnings_disagreements.csv"
 # Finnhub /calendar/earnings is fetched as a SINGLE from→to call to recover
 # real announcement dates for /stock/earnings rows. Its lookback is kept
 # bounded (independent of the larger history cap) so the date range can't
@@ -663,6 +687,7 @@ _USER_CONFIG_DEFAULTS: dict = {
     "OHLCV_HISTORY_YEARS": OHLCV_HISTORY_YEARS,
     "EARNINGS_HISTORY_YEARS": EARNINGS_HISTORY_YEARS,
     "REFERENCE_TICKERS": tuple(REFERENCE_TICKERS),
+    "PREFETCH_OHLCV_AT_LAUNCH": PREFETCH_OHLCV_AT_LAUNCH,
 }
 
 # Clamp ranges for the integer overrides (years of history). Public — the
@@ -695,6 +720,16 @@ def _coerce_history_years(key: str, value) -> Optional[int]:
         return None
     lo, hi = USER_CONFIG_INT_RANGES[key]
     return max(lo, min(hi, value))
+
+
+def _coerce_bool_flag(value) -> Optional[bool]:
+    """Validate a boolean override. Only a genuine JSON true/false passes;
+    anything else — including 0/1 ints and "true" strings — returns None
+    so the caller falls back to the baked-in default (mirrors the strict
+    bool rejection in _coerce_history_years, inverted)."""
+    if isinstance(value, bool):
+        return value
+    return None
 
 
 def _coerce_reference_tickers(value) -> Optional[list]:
@@ -743,6 +778,17 @@ def _validated_user_overrides(raw: dict) -> dict:
             )
         else:
             out["REFERENCE_TICKERS"] = val
+    if "PREFETCH_OHLCV_AT_LAUNCH" in raw:
+        val = _coerce_bool_flag(raw["PREFETCH_OHLCV_AT_LAUNCH"])
+        if val is None:
+            log.debug(
+                "user_config PREFETCH_OHLCV_AT_LAUNCH invalid (%r) — "
+                "using default %r",
+                raw["PREFETCH_OHLCV_AT_LAUNCH"],
+                _USER_CONFIG_DEFAULTS["PREFETCH_OHLCV_AT_LAUNCH"],
+            )
+        else:
+            out["PREFETCH_OHLCV_AT_LAUNCH"] = val
     return out
 
 

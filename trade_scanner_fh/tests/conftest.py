@@ -32,16 +32,40 @@ def _qapp():
     # mid-suite makes subsequent fixture instantiations flaky.
 
 
-@pytest.fixture
-def tmp_parquets(tmp_path, monkeypatch):
-    """Redirect both earnings parquet paths (and DATA_DIR) to a tmp
-    directory so tests never touch the user's real cache."""
-    from trade_scanner_fh import config
-    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+def _redirect_data_dir_derived_paths(config, tmp_path, monkeypatch) -> None:
+    """Redirect the config paths computed from DATA_DIR at import time.
+
+    Monkeypatching config.DATA_DIR alone is a trap: these module-level
+    Path constants were already baked from the REAL scanner_data/ when
+    config was imported, so any fixture that swaps DATA_DIR must swap
+    them too or a fill/raw-layer code path under test silently writes
+    into the user's real tree."""
     monkeypatch.setattr(config, "EARNINGS_HISTORY_PARQUET",
                         tmp_path / "earnings_history.parquet")
     monkeypatch.setattr(config, "EARNINGS_PARQUET",
                         tmp_path / "earnings_dates.parquet")
+    monkeypatch.setattr(config, "FINVIZ_BULK_CHECKPOINT",
+                        tmp_path / ".finviz_bulk_checkpoint.json")
+    monkeypatch.setattr(config, "FINNHUB_BULK_CHECKPOINT",
+                        tmp_path / ".finnhub_bulk_checkpoint.json")
+    raw_root = tmp_path / "earnings_raw"
+    monkeypatch.setattr(config, "RAW_EARNINGS_DIR", raw_root)
+    # Pre-create the per-source folders (mirrors config.ensure_dirs and
+    # the per-module tmp_raw fixtures) so raw-layer read paths don't
+    # trip over a missing directory.
+    for src in config.RAW_SOURCES:
+        (raw_root / src).mkdir(parents=True, exist_ok=True)
+
+
+@pytest.fixture
+def tmp_parquets(tmp_path, monkeypatch):
+    """Redirect both earnings parquet paths (and DATA_DIR, plus every
+    other import-time DATA_DIR-derived path: the finviz/finnhub bulk
+    checkpoints and the raw earnings layer) to a tmp directory so tests
+    never touch the user's real cache."""
+    from trade_scanner_fh import config
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    _redirect_data_dir_derived_paths(config, tmp_path, monkeypatch)
     return tmp_path
 
 
@@ -51,10 +75,7 @@ def fake_scan_cache(tmp_path, monkeypatch):
     from trade_scanner_fh import config
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     monkeypatch.setattr(config, "PARQUET_DIR", tmp_path / "ohlcv")
-    monkeypatch.setattr(config, "EARNINGS_HISTORY_PARQUET",
-                        tmp_path / "earnings_history.parquet")
-    monkeypatch.setattr(config, "EARNINGS_PARQUET",
-                        tmp_path / "earnings_dates.parquet")
+    _redirect_data_dir_derived_paths(config, tmp_path, monkeypatch)
     monkeypatch.setattr(config, "SECTOR_MAP_PARQUET",
                         tmp_path / "sector_map.parquet")
     (tmp_path / "ohlcv").mkdir(parents=True, exist_ok=True)

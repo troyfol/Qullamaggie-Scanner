@@ -27,6 +27,11 @@ from .data_engine import load_ohlcv
 
 log = logging.getLogger("scanner.scan")
 
+# ATR-based stop distance for the informational "ATR Stop" results
+# column: stop = last Close − ATR_STOP_MULTIPLIER × ATR(atr_period).
+# Display-only by design — no filter stage and no IndicatorPanel row.
+ATR_STOP_MULTIPLIER = 2.0
+
 
 # ============================================================================
 # Sequenced-run period chunker
@@ -252,6 +257,16 @@ class ScanParams:
     dollar_vol_display_only: bool = False
     dollar_vol_lookback: int = 20
     dollar_vol_min: float = 5_000_000
+
+    # #14b Relative Volume (RVOL) — last bar's volume / mean volume of
+    # the prior `rvol_lookback` bars (excluding the last bar). Defaults
+    # OFF so legacy presets (which lack these keys) load unchanged.
+    # NaN (insufficient history / zero base) fails the filter via the
+    # standard `>=` comparison.
+    rvol_enabled: bool = False
+    rvol_display_only: bool = False
+    rvol_lookback: int = 20
+    rvol_min: float = 1.5
 
     # --- Relative Strength ---
     # #15  RS vs S&P 500 (SPY)
@@ -573,7 +588,17 @@ def _compute_ticker(
         row["adr_pct"] = indicators.adr_pct(full_to_end, lookback=params.adr_lookback)
 
     if params.atr_enabled or params.atr_display_only:
-        row["atr"] = indicators.atr_value(full_to_end, period=params.atr_period)
+        atr_v = indicators.atr_value(full_to_end, period=params.atr_period)
+        row["atr"] = atr_v
+        # ATR Stop — informational column only (no filter, no panel
+        # row): suggested stop level = last Close − 2.0 × ATR. Reuses
+        # the single atr_value computation above (compute once, reuse).
+        # NaN-safe: NaN ATR or NaN close → NaN stop (renders blank).
+        if (atr_v is not None and np.isfinite(atr_v)
+                and close_val is not None and np.isfinite(close_val)):
+            row["atr_stop"] = float(close_val) - ATR_STOP_MULTIPLIER * float(atr_v)
+        else:
+            row["atr_stop"] = np.nan
 
     if params.bbw_enabled or params.bbw_display_only:
         row["bbw"] = indicators.bollinger_band_width(
@@ -599,6 +624,14 @@ def _compute_ticker(
     if params.dollar_vol_enabled or params.dollar_vol_display_only:
         row["dollar_vol"] = indicators.avg_dollar_volume(
             full_to_end, lookback=params.dollar_vol_lookback
+        )
+
+    # #14b RVOL — computed on full_to_end so the "last bar" is the scan
+    # End-date bar (and the prior-volume base can reach back before the
+    # window start, matching the other lookback indicators).
+    if params.rvol_enabled or params.rvol_display_only:
+        row["rvol"] = indicators.relative_volume(
+            full_to_end, lookback=params.rvol_lookback
         )
 
     if (params.rs_market_enabled or params.rs_market_display_only) \
@@ -941,6 +974,7 @@ def _compute_display_only_fails(
     _flag_min("max_gap", "max_gap_pct", "max_gap_min_pct")
     _flag_min("surge", "surge_pct", "surge_min_pct")
     _flag_min("adr", "adr_pct", "adr_min_pct")
+    _flag_min("rvol", "rvol", "rvol_min")
     _flag_min("rs_market", "rs_market", "rs_market_min")
     _flag_min("rs_nasdaq", "rs_nasdaq", "rs_nasdaq_min")
     _flag_min("rs_sector", "rs_sector", "rs_sector_min")
@@ -1223,6 +1257,13 @@ def _build_filter_stages(params: ScanParams) -> list[tuple[str, Callable]]:
         stages.append((
             f"Vol Dry-Up <= {params.vol_dryup_max_ratio}",
             lambda df, p=params: df["vol_dryup"] <= p.vol_dryup_max_ratio,
+        ))
+
+    # #14b RVOL — NaN fails via the >= comparison (standard convention).
+    if params.rvol_enabled and not params.rvol_display_only:
+        stages.append((
+            f"RVOL >= {params.rvol_min:.1f}",
+            lambda df, p=params: df["rvol"] >= p.rvol_min,
         ))
 
     # #15 RS vs S&P 500. Fail CLOSED when the rs_market column is absent — that

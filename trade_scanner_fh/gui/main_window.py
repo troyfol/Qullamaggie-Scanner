@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QTextEdit, QToolBar, QVBoxLayout, QWidget,
 )
 
-from .. import __version__, config, finnhub_client
+from .. import __version__, config, finnhub_client, scan_history
 from .. import hotkey as hotkey_mod
 from ..data_engine import check_schema_version, load_ohlcv, rebuild_ticker
 from ..hotkey import HotkeyConfig
@@ -52,11 +52,12 @@ from .hotkey_dialog import HotkeySettingsDialog
 from .theme import DARK_STYLESHEET
 from .widgets import (
     _fmt_date, IndicatorPanel, LogPanel, QtLogHandler, RESULT_COLUMNS,
-    ResultsTable,
+    ResultsTable, restore_rows_at_positions,
 )
 from .workers import (
-    BridgeWorker, EarningsFillWorker, ScanWorker, SectorFillWorker,
-    UniverseRefreshWorker, UniverseWorker, UpdateWorker, ZacksFillWorker,
+    BridgeWorker, EarningsFillWorker, PrefetchWorker, ScanWorker,
+    SectorFillWorker, UniverseRefreshWorker, UniverseWorker, UpdateWorker,
+    ZacksFillWorker,
 )
 
 log = logging.getLogger("scanner.gui")
@@ -102,7 +103,21 @@ class MainWindow(QMainWindow):
         self.resize(1500, 900)
 
         self._worker: Optional[ScanWorker] = None
+        # F3: True only while the scheduler's _fire() is driving
+        # _load_preset/_run_scan. Routes "scan cannot start" notices to
+        # the log panel instead of modal QMessageBoxes so an unattended
+        # scheduled fire can never block on a dialog. Read via
+        # __dict__.get so bare __new__ test shells stay safe.
+        self._scheduled_fire_active: bool = False
         self._update_worker: Optional[UpdateWorker] = None
+        # F5: launch-time OHLCV cache prefetch (Settings → Advanced…,
+        # config.PREFETCH_OHLCV_AT_LAUNCH). One-shot per launch — started
+        # from the two launch-path terminals (_load_universe_and_update's
+        # cache-current early return / _on_update_done) so it never
+        # overlaps the startup UpdateWorker. See
+        # _maybe_start_ohlcv_prefetch for the race notes.
+        self._prefetch_worker: Optional[PrefetchWorker] = None
+        self._prefetch_started: bool = False
         self._universe_worker: Optional[UniverseWorker] = None
         self._sector_worker: Optional[SectorFillWorker] = None
         self._earnings_worker: Optional[EarningsFillWorker] = None
@@ -213,6 +228,14 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._install_log_handler()
+
+        # ── Scan scheduler (F3) ──
+        # Created lazily via the `_scheduler` property; started here so
+        # the ~30s due-check timer only runs for fully-constructed
+        # windows (bare test shells never start it). Entries load from
+        # scanner_data/schedules.json (corrupt-file-safe).
+        self._scheduler.start()
+
         self._startup()
 
     # ── UI construction ────────────────────────────────────────────────
@@ -982,6 +1005,35 @@ class MainWindow(QMainWindow):
         )
         settings_menu.addAction(self.act_advanced_settings)
 
+        # --- Scans menu (F3, 2026-06) ---
+        # Quick Export (no-dialog XLSX snapshot) + the in-app scan
+        # scheduler management dialog.
+        scans_menu = menubar.addMenu("Scans")
+
+        self.act_quick_export = QAction("Quick Export", self)
+        self.act_quick_export.setToolTip(
+            "Write the current results (all periods, current visible "
+            "columns) straight to scanner_data/exports/ as a "
+            "timestamped .xlsx — no dialog. The full path is written "
+            "to the log panel."
+        )
+        # Lambda swallows QAction.triggered's `checked` bool so it
+        # can't be mistaken for the injectable `now` parameter.
+        self.act_quick_export.triggered.connect(
+            lambda _checked=False: self._quick_export()
+        )
+        scans_menu.addAction(self.act_quick_export)
+
+        self.act_schedule_scans = QAction("Schedule…", self)
+        self.act_schedule_scans.setToolTip(
+            "Manage scheduled scans. Each entry loads a saved preset "
+            "and runs a scan at the configured time on the configured "
+            "weekdays (at most once per day), then auto Quick-Exports "
+            "the results and shows a Windows toast."
+        )
+        self.act_schedule_scans.triggered.connect(self._open_schedule_dialog)
+        scans_menu.addAction(self.act_schedule_scans)
+
         # --- Central layout ---
         central = QWidget()
         self.setCentralWidget(central)
@@ -1116,6 +1168,9 @@ class MainWindow(QMainWindow):
         self.results_table.rows_deletion_requested.connect(
             self._on_rows_deletion_requested
         )
+        self.results_table.undo_delete_requested.connect(
+            self._on_undo_delete_requested
+        )
         self.results_table.rows_paste_requested.connect(
             self._on_rows_paste_requested
         )
@@ -1131,6 +1186,12 @@ class MainWindow(QMainWindow):
         # so the underlying scan data is preserved. Reset on every
         # fresh scan (alongside the cut clipboard).
         self._deleted_column_keys: set[str] = set()
+        # F2 undo-delete: single-level snapshot of the most recent row
+        # deletion — {"period": str, "rows": DataFrame, "positions":
+        # list[int]} or None. Overwritten by each delete, consumed by
+        # Ctrl+Z / context-menu "Undo delete", cleared on every fresh
+        # scan (alongside the cut clipboard).
+        self._undo_delete_snapshot: Optional[dict] = None
         # Per-row HOTKEY: intercept the configured cue.
         #   - Mouse cues (right-click, shift+left, ctrl+left, middle):
         #     filter on the viewport — that's where Qt routes mouse
@@ -1577,6 +1638,9 @@ class MainWindow(QMainWindow):
             self._arm_or_run_smart_refresh(
                 want_smart=bool(self._earnings_auto_refresh_ref[0]),
             )
+            # No startup UpdateWorker on this path (cache is current),
+            # so the launch prefetch can't race it — start it now.
+            self._maybe_start_ohlcv_prefetch()
             return
 
         # Start background OHLCV update for all tickers
@@ -1694,6 +1758,56 @@ class MainWindow(QMainWindow):
         self._arm_or_run_smart_refresh(
             want_smart=bool(self._earnings_auto_refresh_ref[0] and not stopped),
         )
+
+        # The startup OHLCV update just finished — the launch prefetch
+        # can run now without contending with UpdateWorker's writes.
+        self._maybe_start_ohlcv_prefetch()
+
+    def _maybe_start_ohlcv_prefetch(self) -> None:
+        """Start the one-shot launch-time OHLCV cache prefetch (F5) when
+        the user opted in via Settings → Advanced…
+        (config.PREFETCH_OHLCV_AT_LAUNCH; default off).
+
+        Called only from the two launch-path terminals — the
+        cache-current early return in _load_universe_and_update and
+        _on_update_done — i.e. strictly AFTER the startup OHLCV update
+        finished (or was skipped), so the prefetch never contends with
+        the startup UpdateWorker's parquet writes. A LATER manual update
+        ("Update Now" / missing-only) could still overlap a
+        still-running prefetch; that's safe for correctness — the
+        load_ohlcv LRU cache is keyed by (symbol, mtime_ns), so a
+        rewritten parquet self-invalidates and the next load re-reads
+        fresh bars; worst case is a wasted warm read of the pre-update
+        file (writes are atomic temp+replace, never half-written).
+
+        One-shot per launch (_prefetch_started): re-warming after every
+        manual update would silently re-read the full universe's
+        parquets each time. Stopped cleanly on app close via the
+        closeEvent worker sweep (request_stop + wait)."""
+        if not config.PREFETCH_OHLCV_AT_LAUNCH:
+            return
+        if self._prefetch_started:
+            return
+        if self._prefetch_worker is not None and self._prefetch_worker.isRunning():
+            return
+        # Universe symbols with cached OHLCV, plus the reference
+        # benchmarks (always cache-resident but not always in the
+        # universe). Symbols without a parquet are cheap no-ops inside
+        # prefetch_ohlcv, so no existence pre-filter needed for refs.
+        syms = list(self._symbols)
+        seen = set(syms)
+        for ref in config.REFERENCE_TICKERS:
+            if ref not in seen:
+                syms.append(ref)
+                seen.add(ref)
+        if not syms:
+            return
+        self._prefetch_started = True
+        self.log_panel.write_line(
+            f"Prefetching OHLCV cache for {len(syms)} tickers "
+            "in the background..."
+        )
+        self._prefetch_worker = self._start_worker(PrefetchWorker(syms))
 
     # Same-launch capture flag — owned by the coordinator, re-exposed
     # under the historical name (tests and __init__ assign it directly).
@@ -4736,11 +4850,13 @@ class MainWindow(QMainWindow):
 
     def _show_advanced_settings(self) -> None:
         """Settings → Advanced… — edit the user-configurable tunables:
-        OHLCV cache depth, earnings-history depth, and the reference/
-        benchmark ticker list. OK validates, persists via
-        config.save_user_config() (scanner_data/user_config.json), and
-        applies the values to the live config module immediately — no
-        restart. Cancel changes nothing."""
+        OHLCV cache depth, earnings-history depth, the reference/
+        benchmark ticker list, and the launch-time OHLCV prefetch
+        toggle. OK validates, persists via config.save_user_config()
+        (scanner_data/user_config.json), and applies the values to the
+        live config module immediately — no restart (the prefetch
+        toggle takes effect at the NEXT launch; it gates a
+        launch-sequence step). Cancel changes nothing."""
         dlg = QDialog(self)
         dlg.setWindowTitle("Advanced Settings")
         dlg.setModal(True)
@@ -4807,6 +4923,20 @@ class MainWindow(QMainWindow):
         txt.setMinimumHeight(80)
         layout.addWidget(txt)
 
+        # Launch-time OHLCV cache prefetch (F5)
+        chk_prefetch = QCheckBox(
+            "Prefetch OHLCV cache at launch "
+            "(uses ~RAM for the full universe)"
+        )
+        chk_prefetch.setToolTip(
+            "Warm the OHLCV read cache in the background after the "
+            "launch update finishes, so the first scan isn't dominated "
+            "by cold parquet reads. Memory cost grows with the cached "
+            "universe size. Takes effect at the next launch."
+        )
+        chk_prefetch.setChecked(bool(config.PREFETCH_OHLCV_AT_LAUNCH))
+        layout.addWidget(chk_prefetch)
+
         # OK / Cancel
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -4849,6 +4979,7 @@ class MainWindow(QMainWindow):
             "OHLCV_HISTORY_YEARS": spin_ohlcv.value(),
             "EARNINGS_HISTORY_YEARS": spin_earn.value(),
             "REFERENCE_TICKERS": tickers,
+            "PREFETCH_OHLCV_AT_LAUNCH": chk_prefetch.isChecked(),
         }):
             QMessageBox.warning(
                 self, "Write Error",
@@ -4859,8 +4990,11 @@ class MainWindow(QMainWindow):
             "Advanced settings saved: OHLCV depth="
             f"{config.OHLCV_HISTORY_YEARS}y, earnings depth="
             f"{config.EARNINGS_HISTORY_YEARS}y, "
-            f"{len(config.REFERENCE_TICKERS)} reference ticker(s). "
-            "OHLCV depth applies to new downloads only."
+            f"{len(config.REFERENCE_TICKERS)} reference ticker(s), "
+            "launch prefetch="
+            f"{'on' if config.PREFETCH_OHLCV_AT_LAUNCH else 'off'}. "
+            "OHLCV depth applies to new downloads only; the prefetch "
+            "toggle takes effect at the next launch."
         )
 
     def _load_menu_toggles_pref(self) -> None:
@@ -5146,18 +5280,42 @@ class MainWindow(QMainWindow):
 
     # ── Scan execution ─────────────────────────────────────────────────
 
+    def _notify_scan_blocked(self, title: str, message: str, *,
+                             icon: str = "warning") -> None:
+        """Surface a "scan cannot start" notice. Modal QMessageBox for
+        interactive runs; log-panel line only while a scheduled fire is
+        driving the scan (F3) — an unattended machine must never block
+        on a dialog waiting for a click that isn't coming.
+
+        The flag is read via ``__dict__`` (not getattr) because bare
+        ``MainWindow.__new__`` test shells raise RuntimeError when
+        attribute lookup falls through to the uninitialized Qt C++
+        side — same convention as the ``_scan_scheduler`` lookups."""
+        if self.__dict__.get("_scheduled_fire_active", False):
+            try:
+                self.log_panel.write_line(f"{title}: {message}")
+            except (AttributeError, RuntimeError):
+                log.warning("%s: %s", title, message)
+            return
+        if icon == "info":
+            QMessageBox.information(self, title, message)
+        else:
+            QMessageBox.warning(self, title, message)
+
     def _run_scan(self):
         if not self._symbols:
-            QMessageBox.warning(self, "No Data",
-                                "No cached OHLCV data yet. Wait for the background "
-                                "update to finish, or check your internet connection.")
+            self._notify_scan_blocked(
+                "No Data",
+                "No cached OHLCV data yet. Wait for the background "
+                "update to finish, or check your internet connection.")
             return
 
         filtered = self._filtered_symbols()
         if not filtered:
-            QMessageBox.warning(self, "No Tickers",
-                                "No tickers remain after applying universe filters "
-                                "(ETF/ADR/IPO). Adjust your filters and try again.")
+            self._notify_scan_blocked(
+                "No Tickers",
+                "No tickers remain after applying universe filters "
+                "(ETF/ADR/IPO). Adjust your filters and try again.")
             return
 
         # Session deduplication — exclude tickers seen in prior scans
@@ -5170,11 +5328,12 @@ class MainWindow(QMainWindow):
                 f"({len(filtered)} remaining)"
             )
             if not filtered:
-                QMessageBox.information(
-                    self, "All Omitted",
+                self._notify_scan_blocked(
+                    "All Omitted",
                     f"All {before} tickers were already seen this session.\n"
                     "Uncheck 'Omit previously scanned tickers' or click "
-                    "'Reset Session' to scan them again.")
+                    "'Reset Session' to scan them again.",
+                    icon="info")
                 return
 
         # Build labeled timeframe list — Sequenced Run takes priority and
@@ -5189,11 +5348,10 @@ class MainWindow(QMainWindow):
             seq_start, seq_end, chunk_n, unit = self._sequenced_cfg
             chunks = chunk_periods(seq_start, seq_end, chunk_n, unit)
             if not chunks:
-                QMessageBox.warning(
-                    self, "Sequenced Run",
+                self._notify_scan_blocked(
+                    "Sequenced Run",
                     "Sequenced Run produced no chunks. Check the date "
-                    "range and chunk size, then try again.",
-                )
+                    "range and chunk size, then try again.")
                 return
             for s, e in chunks:
                 labeled_tfs.append((f"{s.isoformat()} → {e.isoformat()}", s, e))
@@ -5323,6 +5481,15 @@ class MainWindow(QMainWindow):
             self.btn_scan.setEnabled(True)
             self.btn_stop.setEnabled(False)
             self._worker = None
+            # F3: a crashed scheduled scan must not leave the scheduler
+            # waiting on a completion that will never arrive (that
+            # would block every future scheduled fire).
+            try:
+                sched = self.__dict__.get("_scan_scheduler")
+                if sched is not None:
+                    sched.on_scan_failed()
+            except Exception as sched_exc:
+                log.debug("scheduler scan-failed hook failed: %s", sched_exc)
             try:
                 self.log_panel.write_line(
                     f"── Scan post-processing crashed: {exc} — "
@@ -5361,6 +5528,57 @@ class MainWindow(QMainWindow):
             self.results_table.clear_cut_clipboard()
         except Exception as exc:
             log.debug("cut-clipboard clear after scan failed: %s", exc)
+        # ... and any pending undo-delete snapshot (F2): it refers to
+        # the PRIOR result set; restoring it into fresh results would
+        # resurrect rows the new scan never produced.
+        self._undo_delete_snapshot = None
+        try:
+            self.results_table.set_undo_available(False)
+        except Exception as exc:
+            log.debug("undo-state clear after scan failed: %s", exc)
+
+        # F2 watchlist diffing: compare each period's ticker set with
+        # the previous run of the same (preset-or-adhoc, period) key,
+        # stamp the per-row "Chg" column (NEW / blank), persist the new
+        # snapshot atomically, and log one line per period. Runs BEFORE
+        # the column-order reconcile + populate below so the `chg`
+        # column participates in both. A diff/persist failure must
+        # never block scan completion.
+        #
+        # Stopped/crashed scans emit PARTIAL results (ScanWorker breaks
+        # between timeframes on Stop, run_scan returns partial results
+        # when the cancel token trips mid-period, and a worker crash
+        # appends a '<scan>' error). Recording such a truncated ticker
+        # set would overwrite the diff baseline — logging false DROPPED
+        # now and flooding the next full run with false NEW — so the
+        # diff is skipped and the prior baseline preserved. Same
+        # stop-detection pattern as the OHLCV stamp guard in
+        # _on_update_done (worker._stop.is_set()).
+        worker = getattr(self, "_worker", None)
+        scan_stopped = bool(
+            worker is not None
+            and getattr(worker, "_stop", None) is not None
+            and worker._stop.is_set()
+        )
+        scan_crashed = any(
+            (err.get("symbol") if isinstance(err, dict) else None) == "<scan>"
+            for err in (getattr(result, "errors", None) or [])
+        )
+        if scan_stopped or scan_crashed:
+            try:
+                reason = "stopped" if scan_stopped else "crashed"
+                self.log_panel.write_line(
+                    f"Watchlist diff skipped — scan {reason} with partial "
+                    "results; prior baseline preserved."
+                )
+            except Exception as exc:
+                log.debug("watchlist diff skip log line failed: %s", exc)
+        else:
+            try:
+                self._apply_watchlist_diff()
+            except Exception as exc:
+                log.error("watchlist diff after scan failed: %s", exc)
+
         # Reconcile the saved column order against the new canonical
         # set: NEW filter/display columns (variables added since last
         # scan) get prepended to the user's saved layout in indicator-
@@ -5466,6 +5684,71 @@ class MainWindow(QMainWindow):
             f"Session: {self._session_scan_count} scans, "
             f"{len(self._session_seen)} tickers seen"
         )
+
+        # F3: notify the scheduler so a scheduled scan can auto
+        # quick-export + toast on completion. No-op for manual scans
+        # (no pending entry) and for bare test shells (no scheduler in
+        # __dict__). Guarded — a scheduler failure must never break
+        # scan completion.
+        try:
+            sched = self.__dict__.get("_scan_scheduler")
+            if sched is not None:
+                sched.on_scan_completed()
+        except Exception as exc:
+            log.error("scheduler scan-completion hook failed: %s", exc)
+
+    # ── F2 watchlist diffing ──────────────────────────────────────────
+
+    def _scan_history_key(self) -> str:
+        """Preset half of the scan-history key: the currently selected
+        preset name, or "adhoc" when none is selected. Keying on the
+        combo (not the last-LOADED preset) matches what the user sees
+        in the toolbar at scan time."""
+        try:
+            name = self.preset_combo.currentText().strip()
+        except Exception:
+            name = ""
+        if not name or name == "(select preset)":
+            return scan_history.ADHOC_KEY
+        return name
+
+    def _apply_watchlist_diff(self) -> None:
+        """Diff every period's ticker set against the previous run of
+        the same (preset, period) key (scanner_data/scan_history.json),
+        add the "Chg" column ("NEW" for tickers absent from the prior
+        run) to each period df in `_period_results`, and write one
+        log-panel line per period. First-ever run for a key logs "no
+        prior run". Persistence is atomic + corrupt-file-safe inside
+        scan_history; the caller wraps this whole method in try/except
+        so scan completion can never be blocked by the diff."""
+        preset = self._scan_history_key()
+        period_symbols: dict[str, list[str]] = {}
+        for label in self._period_order:
+            df = self._period_results.get(label)
+            if df is None or df.empty or "symbol" not in df.columns:
+                period_symbols[label] = []
+            else:
+                period_symbols[label] = [str(s) for s in df["symbol"].tolist()]
+
+        diffs = scan_history.record_scan_results(preset, period_symbols)
+
+        for label in self._period_order:
+            diff = diffs.get(label)
+            if diff is None:
+                continue
+            df = self._period_results.get(label)
+            if df is not None and not df.empty and "symbol" in df.columns:
+                # No prior run → every ticker is technically new, but
+                # flagging the whole table as NEW is noise; leave the
+                # column blank and let the log line say "no prior run".
+                new_set = set(diff.new) if diff.has_prior else set()
+                df["chg"] = df["symbol"].astype(str).map(
+                    lambda s: "NEW" if s in new_set else ""
+                )
+            try:
+                self.log_panel.write_line(diff.log_line())
+            except Exception as exc:
+                log.debug("watchlist diff log line failed: %s", exc)
 
     # ── Export Results ────────────────────────────────────────────────
 
@@ -5708,7 +5991,12 @@ class MainWindow(QMainWindow):
         change persists across view-filter toggles, sort changes, and
         tab switches. Reset implicitly on the next scan (fresh
         `_period_results` overwrites the dict). Re-renders the table
-        to reflect the deletion."""
+        to reflect the deletion.
+
+        F2 undo: before mutating, snapshot the doomed rows + their
+        positional indices so a single-level Ctrl+Z / "Undo delete"
+        can restore the batch at its original spots. A new delete
+        overwrites the snapshot; a fresh scan clears it."""
         if not symbols:
             return
         period = self._active_period or ""
@@ -5719,6 +6007,21 @@ class MainWindow(QMainWindow):
             return
         before = len(df)
         keep = ~df["symbol"].astype(str).isin(set(symbols))
+        # Snapshot the deleted batch (rows + original positions) for
+        # single-level undo BEFORE the frame is rebuilt.
+        removed_mask = ~keep
+        if removed_mask.any():
+            self._undo_delete_snapshot = {
+                "period": period,
+                "rows": df.loc[removed_mask].copy(),
+                "positions": [
+                    i for i, flag in enumerate(removed_mask.tolist()) if flag
+                ],
+            }
+            try:
+                self.results_table.set_undo_available(True)
+            except Exception as exc:
+                log.debug("undo-state set after delete failed: %s", exc)
         df = df.loc[keep].reset_index(drop=True)
         self._period_results[period] = df
         deleted = before - len(df)
@@ -5736,6 +6039,43 @@ class MainWindow(QMainWindow):
             self.results_table.populate(shown)
         except Exception as exc:
             log.debug("populate after delete failed: %s", exc)
+
+    @pyqtSlot()
+    def _on_undo_delete_requested(self):
+        """F2 undo: restore the most recently deleted row batch at its
+        original positional indices. Single-level — the snapshot is
+        consumed here (double-undo is a no-op) and cleared on every
+        fresh scan. Restores into the snapshot's PERIOD even if the
+        user has since switched timeframes; the table only re-renders
+        when that period is the active one."""
+        snap = self._undo_delete_snapshot
+        if not snap:
+            return
+        self._undo_delete_snapshot = None
+        try:
+            self.results_table.set_undo_available(False)
+        except Exception as exc:
+            log.debug("undo-state clear after undo failed: %s", exc)
+        period = snap.get("period") or ""
+        if period not in self._period_results:
+            return
+        df = self._period_results[period]
+        rows = snap.get("rows")
+        restored = restore_rows_at_positions(
+            df, rows, snap.get("positions") or [],
+        )
+        self._period_results[period] = restored
+        n_rows = 0 if rows is None else len(rows)
+        log.info(
+            "Undo: restored %d deleted row(s) to period '%s'",
+            n_rows, period,
+        )
+        if period == (self._active_period or ""):
+            try:
+                shown = self._apply_view_filters(restored)
+                self.results_table.populate(shown)
+            except Exception as exc:
+                log.debug("populate after undo failed: %s", exc)
 
     @pyqtSlot(list)
     def _on_columns_deletion_requested(self, keys: list):
@@ -6031,6 +6371,36 @@ class MainWindow(QMainWindow):
 
     def _export_results(self):
         self._exports._export_results()
+
+    def _quick_export(self, now=None):
+        """F3 (a): no-dialog XLSX snapshot of the current results into
+        scanner_data/exports/. Returns the written path or None."""
+        return self._exports.quick_export(now=now)
+
+    # ── Scan scheduler (F3) ──────────────────────────────────────────
+    # The scheduler (due-check timer, schedules.json persistence,
+    # quick-export + toast on completion) lives in ScanScheduler
+    # (scheduler.py). MainWindow owns one instance and notifies it
+    # from the scan-done paths.
+
+    @property
+    def _scheduler(self) -> "ScanScheduler":
+        """Lazily-created scan scheduler. Looked up via ``__dict__``
+        (not getattr) because bare ``MainWindow.__new__`` test shells
+        raise RuntimeError when attribute lookup falls through to the
+        uninitialized Qt C++ side."""
+        sched = self.__dict__.get("_scan_scheduler")
+        if sched is None:
+            from .scheduler import ScanScheduler
+            sched = ScanScheduler(self)
+            self.__dict__["_scan_scheduler"] = sched
+        return sched
+
+    def _open_schedule_dialog(self):
+        """Scans → Schedule… — management dialog (table of entries,
+        Add/Edit/Remove, enable checkbox)."""
+        from .scheduler import ScheduleDialog
+        ScheduleDialog(self._scheduler, parent=self).exec()
 
     # ── Watchlist Bridge (Phase 4) ───────────────────────────────────
 
@@ -6379,14 +6749,20 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self.preset_combo.setCurrentIndex(idx)
 
-    def _load_preset(self):
+    def _load_preset(self) -> bool:
+        """Load the combo-selected preset into the session. Returns True
+        on success, False on any failure / no-op (nothing selected,
+        file missing, corrupt) — the F3 scheduler aborts its fire on a
+        False return so a scheduled scan can never silently run with
+        whatever settings happened to be active."""
         name = self.preset_combo.currentText()
         if name == "(select preset)":
-            return
+            return False
         path = PRESETS_DIR / f"{name}.json"
         if not path.exists():
-            QMessageBox.warning(self, "Not Found", f"Preset '{name}' not found.")
-            return
+            self._notify_scan_blocked(
+                "Not Found", f"Preset '{name}' not found.")
+            return False
         # Guard the read+parse: a truncated/hand-edited/non-UTF-8 preset raises
         # here, and an exception escaping this Qt slot can abort the app under
         # PyInstaller windowed mode (no sys.excepthook in main()). Fail with a
@@ -6394,11 +6770,11 @@ class MainWindow(QMainWindow):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as exc:
-            QMessageBox.warning(
-                self, "Load Preset",
+            self._notify_scan_blocked(
+                "Load Preset",
                 f"Preset '{name}' is corrupt or unreadable:\n{exc}",
             )
-            return
+            return False
 
         # Phase 6 O11: warn when a preset comes from a newer build than this
         # code understands. Missing keys are tolerated by the .get() loads
@@ -6570,6 +6946,7 @@ class MainWindow(QMainWindow):
                 self.chk_custom_range.setChecked(bool(data["custom_range"]))
 
         self.log_panel.write_line(f"Preset loaded: {name}")
+        return True
 
     def _delete_preset(self):
         name = self.preset_combo.currentText()
@@ -6593,6 +6970,11 @@ class MainWindow(QMainWindow):
         workers = [
             self._worker,
             self._update_worker,
+            # F5 launch prefetch — read-only cache warmer, but it holds a
+            # thread pool over thousands of parquet reads; request_stop
+            # makes it bail between loads instead of being torn down
+            # mid-flight.
+            getattr(self, "_prefetch_worker", None),
             self._universe_worker,
             self._sector_worker,
             self._earnings_worker,
@@ -6616,6 +6998,14 @@ class MainWindow(QMainWindow):
             self._qsettings().setValue("main_window/geometry", self.saveGeometry())
         except Exception as exc:
             log.debug("Could not persist window geometry: %s", exc)
+        # F3: stop the scheduler's due-check timer + hide its tray icon
+        # so no tick fires into a torn-down window.
+        try:
+            sched = self.__dict__.get("_scan_scheduler")
+            if sched is not None:
+                sched.stop()
+        except Exception as exc:
+            log.debug("scheduler stop on close failed: %s", exc)
         # Phase 1: signal stop to every live worker
         for w in workers:
             if w is None or not w.isRunning():

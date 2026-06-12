@@ -15,7 +15,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from .. import config
 from ..data_engine import (
-    _last_cached_date, download_many, download_one,
+    _last_cached_date, download_many, download_one, prefetch_ohlcv,
 )
 from ..scanner import ScanParams, ScanResult, run_scan
 from ..ticker_universe import refresh_universe
@@ -448,6 +448,49 @@ class UpdateWorker(QThread):
         log.info(msg)
         self.error_tickers.emit(self._failed_tickers)
         self.finished.emit(updated, errors)
+
+
+class PrefetchWorker(QThread):
+    """Launch-time OHLCV cache prefetch (F5) — warms the load_ohlcv LRU
+    across the universe when the user opted in via Settings → Advanced…
+    (config.PREFETCH_OHLCV_AT_LAUNCH).
+
+    Pure cache warmer: no network, no writes — it just reads each
+    symbol's parquet once so the first scan isn't dominated by cold
+    reads. request_stop() aborts promptly: data_engine.prefetch_ohlcv
+    checks the event between pool submissions and again at the start of
+    each per-symbol load."""
+
+    finished = pyqtSignal(int, int)  # warmed, total
+    log_msg = pyqtSignal(str)
+
+    def __init__(self, symbols: list[str]):
+        super().__init__()
+        self.symbols = list(symbols)
+        self._stop = threading.Event()
+
+    def request_stop(self):
+        self._stop.set()
+
+    def run(self):
+        total = len(self.symbols)
+        warmed = 0
+        try:
+            warmed = prefetch_ohlcv(self.symbols, stop_flag=self._stop)
+        except Exception as exc:
+            # A failed warmer must never look like an app problem —
+            # log and fall through to the finished signal.
+            log.error("PrefetchWorker crashed: %s", exc, exc_info=True)
+            self.log_msg.emit(f"OHLCV prefetch error: {exc}")
+        if self._stop.is_set():
+            self.log_msg.emit(
+                f"OHLCV prefetch stopped ({warmed}/{total} warmed)."
+            )
+        else:
+            self.log_msg.emit(
+                f"OHLCV prefetch complete: {warmed}/{total} tickers warmed."
+            )
+        self.finished.emit(warmed, total)
 
 
 # ============================================================================

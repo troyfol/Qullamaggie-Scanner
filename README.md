@@ -1636,6 +1636,23 @@ Multi-select via standard Qt extended selection (shift-click for ranges, ctrl-cl
 
 `ResultsTable.rows_deletion_requested` signal is the wire — emitted by both triggers, handled by `MainWindow._on_rows_deletion_requested`.
 
+**Undo delete (single level, F2).** The most recent deletion batch can be restored via **Ctrl+Z** (results table focused) or **right-click → "Undo delete"**. The delete handler snapshots the doomed rows + their positional indices before mutating; `_on_undo_delete_requested` reinserts them at their original spots via the pure helper `widgets.restore_rows_at_positions`. One level only — a new delete overwrites the snapshot, an undo consumes it (double-undo no-ops), and a fresh scan clears it (alongside the cut clipboard). Wire: `ResultsTable.undo_delete_requested` → `MainWindow._on_undo_delete_requested`; the table only tracks availability (`set_undo_available`) so its context menu can show/hide the action.
+
+### Watchlist diffing (Chg column + per-period log lines)
+
+On every scan completion, `MainWindow._apply_watchlist_diff` (backed by the GUI-free `scan_history.py`) compares each period's ticker set with the previous run of the same **(preset name or `adhoc`, period)** key, persisted in `scanner_data/scan_history.json` (atomic writes via `config.atomic_write_text`; corrupt/missing file = "no prior run"). Effects:
+
+- **"Chg" column** in the results table — `NEW` for tickers absent from the prior run of the same key, blank otherwise (blank everywhere on a key's first-ever run).
+- **One log-panel line per period** — `vs last <preset>/<period> run: N new, M dropped (DROPPED: ...)`, listing up to 20 dropped symbols (`+k more` beyond that); first run logs `no prior run`.
+
+Only the latest prior set per key is stored (single-level diff), plus a bounded rolling summary list (timestamp, preset, period, count — last 200) for the future scheduler to extend. A diff/persist failure never blocks scan completion (whole step wrapped in try/except).
+
+### Quick Export + scan scheduler (F3)
+
+**Quick Export** (menu **Scans → Quick Export**, also fired automatically after every scheduled scan): writes the current results — ALL periods, current visible columns (the table's active layout in the user's drag order, view filters applied) — straight to `scanner_data/exports/scan_<presetOrAdhoc>_<YYYYMMDD-HHMMSS>.xlsx` via the same multi-sheet XLSX pipeline as the Excel dialog, with defaults (no News columns, no colors) and **no dialog**. The full path lands in the log panel. The exports dir is created lazily; implementation in `ExportsController.quick_export` (gui/exports.py).
+
+**Scan scheduler** (`gui/scheduler.py`, managed via **Scans → Schedule…**): entries `{label, preset_name, time "HH:MM" local, days (weekday list, 0=Mon), enabled}` persist atomically to `scanner_data/schedules.json` (corrupt file degrades to "no schedules"). A ~30s `QTimer` owned by `ScanScheduler` (a QObject on MainWindow) fires due entries — each **at most once per day** (last-fired date recorded per entry; an app launched after the configured time still fires that day's entry). Firing loads the named preset through the existing preset-load path and triggers the existing scan path, so the F2 watchlist diff + `scan_history.json` rolling summary extend automatically. On completion the scheduler auto Quick-Exports the results and shows a Windows toast via a lazily-created `QSystemTrayIcon.showMessage` ("Scheduled scan '<label>': N results, M new" — counts from the primary period). Firing is skipped with a log line when a scan is already running (entry retries on a later tick, NOT consumed) or the preset no longer exists (consumed for the day). The Schedule… dialog is a table of entries with Add/Edit/Remove and an in-place Enabled checkbox; every mutation persists immediately.
+
 ### Cut + Paste rows (manual reorder)
 
 Reorder rows manually via right-click:
@@ -1877,6 +1894,9 @@ Loader (`MainWindow._load_preset`) tolerates missing keys via `.get()` for forwa
 | `finnhub_blacklist.txt` | newline-separated text | Auto + user | Finnhub-specific skip list (auto-added on empty `/stock/earnings` response — typically ETFs); one ticker per line |
 | `sec_contact.txt` | text | User (Settings → Set SEC Contact Email…) | Contact email SEC EDGAR requires in the request User-Agent for the universe download. Absent → SEC source skipped. Also settable via the `SEC_CONTACT_EMAIL` env var. |
 | `presets/{name}.json` | JSON | User | Saved indicator + scan-window configs |
+| `scan_history.json` | JSON | `scan_history.py` (written on every scan completion) | F2 watchlist diffing: latest per-(preset-or-adhoc, period) ticker set + bounded rolling run summary (200 entries). Atomic writes; corrupt file degrades to "no prior run" |
+| `schedules.json` | JSON | `gui/scheduler.py` (Scans → Schedule… dialog + per-fire marker updates) | F3 scan scheduler entries ({label, preset, time, days, enabled} + last-fired date). Atomic writes; corrupt file degrades to "no schedules" |
+| `exports/scan_*.xlsx` | XLSX | Quick Export (Scans → Quick Export, or auto after a scheduled scan) | Timestamped no-dialog result snapshots — all periods, current visible columns. Dir created lazily |
 | `logs/*.log` | text | LogPanel | Per-session diagnostic logs (`scan_*`, `ohlcv_*`, `universe_*`, `bridge_*`) |
 | `failed_tickers.log` | text | `ticker_universe` | Tickers dropped during yfinance universe validation |
 | `ftp_raw/` | text | NASDAQ FTP (when SAVE_FTP_RAW=True) | Raw downloads for debugging |

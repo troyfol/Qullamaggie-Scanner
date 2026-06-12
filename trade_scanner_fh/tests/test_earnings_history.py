@@ -311,9 +311,12 @@ def test_zacks_fill_writes_raw_layer(tmp_parquets, monkeypatch):
 
     raw_root = tmp_parquets / "earnings_raw"
     monkeypatch.setattr(config, "RAW_EARNINGS_DIR", raw_root)
-    raw_root.mkdir()
+    # exist_ok: the tmp_parquets fixture itself now redirects
+    # RAW_EARNINGS_DIR here and pre-creates the per-source folders
+    # (conftest trap fix) — this inline setup stays as belt-and-braces.
+    raw_root.mkdir(exist_ok=True)
     for src in config.RAW_SOURCES:
-        (raw_root / src).mkdir()
+        (raw_root / src).mkdir(exist_ok=True)
 
     monkeypatch.setattr(eh.time, "sleep", lambda *_: None)
 
@@ -360,9 +363,12 @@ def test_zacks_fill_caps_consumer_rows_on_period_ending(tmp_parquets, monkeypatc
 
     raw_root = tmp_parquets / "earnings_raw"
     monkeypatch.setattr(config, "RAW_EARNINGS_DIR", raw_root)
-    raw_root.mkdir()
+    # exist_ok: the tmp_parquets fixture itself now redirects
+    # RAW_EARNINGS_DIR here and pre-creates the per-source folders
+    # (conftest trap fix) — this inline setup stays as belt-and-braces.
+    raw_root.mkdir(exist_ok=True)
     for src in config.RAW_SOURCES:
-        (raw_root / src).mkdir()
+        (raw_root / src).mkdir(exist_ok=True)
     monkeypatch.setattr(eh.time, "sleep", lambda *_: None)
 
     today = pd.Timestamp.today().normalize()
@@ -1099,9 +1105,12 @@ def test_migrate_backfill_finviz_recovers_old_quarters_from_raw(tmp_parquets, mo
 
     raw_root = tmp_parquets / "earnings_raw"
     monkeypatch.setattr(config, "RAW_EARNINGS_DIR", raw_root)
-    raw_root.mkdir()
+    # exist_ok: the tmp_parquets fixture itself now redirects
+    # RAW_EARNINGS_DIR here and pre-creates the per-source folders
+    # (conftest trap fix) — this inline setup stays as belt-and-braces.
+    raw_root.mkdir(exist_ok=True)
     for src in config.RAW_SOURCES:
-        (raw_root / src).mkdir()
+        (raw_root / src).mkdir(exist_ok=True)
 
     today = pd.Timestamp.today().normalize()
     mid = (today - pd.DateOffset(years=7)).replace(day=1)            # within 10y

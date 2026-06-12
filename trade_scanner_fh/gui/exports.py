@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import csv
 import logging
+import re
+from datetime import datetime
 from typing import Optional
 
 import pandas as pd
@@ -35,6 +37,7 @@ import pandas as pd
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QDialog, QFileDialog, QMessageBox
 
+from .. import config
 from .dialogs import ExcelExportDialog
 from .widgets import _fmt_date, RESULT_COLUMNS
 
@@ -145,6 +148,93 @@ class ExportsController:
             i += 1
         used.add(safe)
         return safe
+
+    @staticmethod
+    def _safe_filename_component(name: str) -> str:
+        """Strip Windows-illegal / control characters from a preset
+        name so it can be embedded in the quick-export filename.
+        Falls back to 'adhoc' when nothing usable remains."""
+        safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", (name or "").strip())
+        safe = safe.strip(" .")
+        return safe or "adhoc"
+
+    def quick_export(self, now: Optional[datetime] = None) -> Optional[str]:
+        """F3 (a): one-click XLSX snapshot of the current results — NO
+        dialog. Writes ALL periods of the cached scan with the current
+        visible columns (the table's active layout in the user's drag
+        order, view filters applied — same pipeline as the Excel
+        dialog) to::
+
+            scanner_data/exports/scan_<presetOrAdhoc>_<YYYYMMDD-HHMMSS>.xlsx
+
+        with defaults (no News columns, no colors). The exports dir is
+        created lazily. Returns the written path (str), or None when
+        there was nothing to export or the write failed. ``now`` is
+        injectable for tests; production callers use the wall clock.
+        """
+        win = self.win
+        if not getattr(win, "_period_results", None):
+            win.log_panel.write_line(
+                "Quick Export: no results to export — run a scan first."
+            )
+            return None
+        when = now if now is not None else datetime.now()
+
+        try:
+            preset = win._scan_history_key()
+        except (AttributeError, RuntimeError):
+            preset = "adhoc"
+        safe = self._safe_filename_component(preset)
+
+        # Current visible columns: the table's active layout already
+        # excludes user-hidden columns; the export helper reorders per
+        # the user's saved drag order. Falls back to the canonical set
+        # for shells without a populated table.
+        try:
+            keys = [
+                k for _h, k, _f in win._ordered_active_columns_for_export()
+            ]
+        except (AttributeError, RuntimeError):
+            keys = [k for _h, k, _f in RESULT_COLUMNS]
+
+        periods = list(getattr(win, "_period_order", []) or [])
+        if not periods:
+            periods = list(win._period_results.keys())
+
+        # The exports-dir mkdir lives INSIDE the OSError guard: this
+        # method runs in a Qt-slot path (Scans → Quick Export), and an
+        # OSError escaping a slot aborts the whole exe under PyInstaller
+        # windowed mode (see the _on_scan_done docstring). A full disk /
+        # readonly DATA_DIR / an 'exports' FILE squatting on the dir
+        # name must degrade to a logged failure, not a crash.
+        try:
+            exports_dir = config.DATA_DIR / "exports"
+            exports_dir.mkdir(parents=True, exist_ok=True)
+            path = exports_dir / (
+                f"scan_{safe}_{when.strftime('%Y%m%d-%H%M%S')}.xlsx"
+            )
+            win._write_xlsx_multi_sheet(
+                str(path), periods, keys, False, apply_colors=False,
+            )
+        except OSError as exc:
+            win.log_panel.write_line(f"Quick Export failed: {exc}")
+            return None
+        except ImportError as exc:
+            win.log_panel.write_line(
+                f"Quick Export failed — XLSX export requires the "
+                f"openpyxl package: {exc}"
+            )
+            return None
+
+        win.log_panel.write_line(
+            f"Quick Export: XLSX → {path} "
+            f"({len(periods)} period(s), {len(keys)} columns)"
+        )
+        try:
+            win.status.showMessage(f"Quick Export → {path}")
+        except (AttributeError, RuntimeError):
+            pass
+        return str(path)
 
     def _excel_export_dialog(self):
         """Open column / period / format / News dialog, then write the

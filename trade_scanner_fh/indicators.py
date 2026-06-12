@@ -642,3 +642,33 @@ def avg_dollar_volume(df: pd.DataFrame, *, lookback: int = 20) -> float:
     if tail.empty:
         return np.nan
     return (tail["Close"] * tail["Volume"]).mean()
+
+
+def relative_volume(df: pd.DataFrame, *, lookback: int = 20) -> float:
+    """
+    #14b  RVOL — Relative Volume of the LAST bar.
+    = Volume[last] / mean(Volume of the prior `lookback` bars,
+      EXCLUDING the last bar).
+
+    A value of 1.0 means the last bar traded exactly its trailing
+    average volume; 2.0 means double, 0.5 means half. NaN when:
+      * fewer than `lookback` + 1 bars (need a full prior window plus
+        the bar being measured), or
+      * the prior-window mean is zero / non-finite (e.g. a halted name
+        with all-zero volume — a ratio against 0 is meaningless), or
+      * the last bar's volume is itself NaN.
+
+    NOTE: deliberately separate from `surge_ignition`'s internal
+    volume gate — that one is a *median*-based multiple evaluated at
+    each candidate bar inside a rally. RVOL is a simple *mean*-based
+    snapshot of the latest bar only; keep the two independent.
+    """
+    if "Volume" not in df.columns or len(df) < lookback + 1:
+        return np.nan
+    last_vol = df["Volume"].iloc[-1]
+    base = df["Volume"].iloc[-(lookback + 1):-1].mean()
+    if not np.isfinite(base) or base <= 0:
+        return np.nan
+    if last_vol is None or not np.isfinite(last_vol):
+        return np.nan
+    return float(last_vol) / float(base)

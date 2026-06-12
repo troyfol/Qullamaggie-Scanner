@@ -402,3 +402,126 @@ def test_download_many_respects_stop_flag():
     # Some were stopped and/or cancellation pruned the pool — either way
     # we must not have completed all 30 as "ok".
     assert statuses.count("ok") < 30
+
+
+# ----------------------------------------------------------------------
+# F5 -- prefetch_ohlcv (LRU cache warmer)
+# ----------------------------------------------------------------------
+
+def _write_tiny_parquets(tmp_path, symbols):
+    """Seed one tiny per-symbol parquet each, mirroring the I11 fixtures."""
+    for i, sym in enumerate(symbols):
+        pd.DataFrame(
+            {"Close": [100.0 + i]},
+            index=pd.to_datetime(["2026-04-01"]),
+        ).to_parquet(tmp_path / f"{sym}.parquet")
+
+
+def test_prefetch_warms_cache_and_reports_progress(tmp_path, monkeypatch):
+    """prefetch_ohlcv loads every symbol once; subsequent load_ohlcv calls
+    are pure LRU hits (verified via cache_info deltas). progress_cb fires
+    once per symbol with (done, total)."""
+    monkeypatch.setattr(data_engine.config, "PARQUET_DIR", tmp_path)
+    clear_ohlcv_cache()
+    syms = ["AAA", "BBB", "CCC"]
+    _write_tiny_parquets(tmp_path, syms)
+
+    progress = []
+    count = data_engine.prefetch_ohlcv(
+        syms, max_workers=2,
+        progress_cb=lambda done, total: progress.append((done, total)),
+    )
+    assert count == 3
+    assert len(progress) == 3
+    assert progress[-1] == (3, 3)
+
+    # Cache is warm: 3 more loads are all hits, zero new misses.
+    info_before = data_engine._load_ohlcv_cached.cache_info()
+    for s in syms:
+        assert load_ohlcv(s) is not None
+    info_after = data_engine._load_ohlcv_cached.cache_info()
+    assert info_after.hits - info_before.hits == 3
+    assert info_after.misses == info_before.misses
+
+
+def test_prefetch_empty_list_returns_zero():
+    """Empty symbol list is a no-op: returns 0, never raises."""
+    assert data_engine.prefetch_ohlcv([]) == 0
+
+
+def test_prefetch_skips_bad_symbols(tmp_path, monkeypatch):
+    """Missing and corrupt parquets are skipped (load_ohlcv -> None);
+    only the cleanly-loaded symbol counts as warmed."""
+    monkeypatch.setattr(data_engine.config, "PARQUET_DIR", tmp_path)
+    clear_ohlcv_cache()
+    _write_tiny_parquets(tmp_path, ["AAA"])
+    (tmp_path / "CORRUPT.parquet").write_bytes(b"\x00not a parquet")
+
+    count = data_engine.prefetch_ohlcv(
+        ["AAA", "MISSING", "CORRUPT"], max_workers=2)
+    assert count == 1
+
+
+def test_prefetch_swallows_per_symbol_load_errors(tmp_path, monkeypatch):
+    """An unexpected exception out of load_ohlcv for one symbol must be
+    swallowed (debug-logged), not raised -- the rest still warm."""
+    monkeypatch.setattr(data_engine.config, "PARQUET_DIR", tmp_path)
+    clear_ohlcv_cache()
+    _write_tiny_parquets(tmp_path, ["AAA", "BBB"])
+
+    real_load = data_engine.load_ohlcv
+
+    def sometimes_boom(sym):
+        if sym == "BBB":
+            raise RuntimeError("simulated load blow-up")
+        return real_load(sym)
+
+    monkeypatch.setattr(data_engine, "load_ohlcv", sometimes_boom)
+    assert data_engine.prefetch_ohlcv(["AAA", "BBB"], max_workers=2) == 1
+
+
+def test_prefetch_stop_flag_preset_warms_nothing(tmp_path, monkeypatch):
+    """A stop_flag already set before the call aborts before any
+    submission: nothing is loaded, 0 warmed."""
+    monkeypatch.setattr(data_engine.config, "PARQUET_DIR", tmp_path)
+    clear_ohlcv_cache()
+    syms = ["AAA", "BBB", "CCC"]
+    _write_tiny_parquets(tmp_path, syms)
+
+    calls = []
+    real_load = data_engine.load_ohlcv
+
+    def tracking_load(sym):
+        calls.append(sym)
+        return real_load(sym)
+
+    monkeypatch.setattr(data_engine, "load_ohlcv", tracking_load)
+    stop = threading.Event()
+    stop.set()
+    assert data_engine.prefetch_ohlcv(syms, stop_flag=stop) == 0
+    assert calls == []
+    assert data_engine._load_ohlcv_cached.cache_info().currsize == 0
+
+
+def test_prefetch_stop_flag_aborts_early(tmp_path, monkeypatch):
+    """Setting the stop_flag during the first load makes the remaining
+    workers skip: exactly one symbol is loaded/warmed (max_workers=1
+    keeps it deterministic)."""
+    monkeypatch.setattr(data_engine.config, "PARQUET_DIR", tmp_path)
+    clear_ohlcv_cache()
+    syms = [f"S{i:02d}" for i in range(8)]
+    _write_tiny_parquets(tmp_path, syms)
+
+    stop = threading.Event()
+    calls = []
+    real_load = data_engine.load_ohlcv
+
+    def load_then_stop(sym):
+        calls.append(sym)
+        stop.set()  # request abort as soon as the first load runs
+        return real_load(sym)
+
+    monkeypatch.setattr(data_engine, "load_ohlcv", load_then_stop)
+    count = data_engine.prefetch_ohlcv(syms, max_workers=1, stop_flag=stop)
+    assert count == 1
+    assert calls == ["S00"]

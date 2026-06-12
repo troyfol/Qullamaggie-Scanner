@@ -570,6 +570,15 @@ class IndicatorPanel(QScrollArea):
             {"name": "min_dv", "label": "Min $", "type": "float", "default": 5000000.0, "min": 0.0, "max": 999999999999.0, "step": 1000000.0, "decimals": 0},
         ])
 
+        # RVOL — last bar's volume vs the mean of the prior N bars
+        # (excluding the last bar). Simple mean-based latest-bar ratio;
+        # independent of surge_ignition's median-based volume gate.
+        self._add("rvol", "Relative Volume (RVOL)", [
+            {"name": "lookback", "label": "Days", "type": "int", "default": 20, "min": 1, "max": 200},
+            {"name": "min_ratio", "label": "Min", "type": "float", "default": 1.5, "min": 0.1, "max": 50.0, "step": 0.1},
+        ])
+        self.rows["rvol"].set_enabled(False)
+
         # --- Earnings Filters ---
         self._section("Earnings Filters")
 
@@ -910,6 +919,11 @@ class IndicatorPanel(QScrollArea):
             dollar_vol_display_only=r["dollar_vol"].is_display_only(),
             dollar_vol_lookback=r["dollar_vol"].value("lookback"),
             dollar_vol_min=r["dollar_vol"].value("min_dv"),
+            # RVOL (Relative Volume)
+            rvol_enabled=r["rvol"].is_enabled(),
+            rvol_display_only=r["rvol"].is_display_only(),
+            rvol_lookback=int(r["rvol"].value("lookback")),
+            rvol_min=r["rvol"].value("min_ratio"),
             # RS vs S&P 500
             rs_market_enabled=r["rs_market"].is_enabled(),
             rs_market_display_only=r["rs_market"].is_display_only(),
@@ -1089,6 +1103,12 @@ def _fmt_date(x) -> str:
 # they index, so the value and the date that produced it travel together.
 RESULT_COLUMNS = [
     ("Ticker",            "symbol",              str),
+    # F2 watchlist diffing: "NEW" when the ticker was absent from the
+    # previous run of the same (preset, period) key, "" otherwise. The
+    # column only renders when the scan-done diff populated the `chg`
+    # key in the result df (always, post-F2) — older frames without it
+    # simply omit the column via the present-in-df gate below.
+    ("Chg",               "chg",                 lambda x: str(x) if x else ""),
     ("Close",             "close",               lambda x: f"${x:.2f}"),
     ("% Gain",            "pct_gain",            lambda x: f"{x:.1f}%"),
     ("Gain Start",        "gain_start_date",     _fmt_date),
@@ -1096,6 +1116,7 @@ RESULT_COLUMNS = [
     ("Dist High %",       "dist_high_pct",       lambda x: f"{x:.1f}%"),
     ("ADR%",              "adr_pct",             lambda x: f"{x:.2f}%"),
     ("ATR",               "atr",                 lambda x: f"${x:.2f}"),
+    ("ATR Stop",          "atr_stop",            lambda x: f"${x:.2f}"),
     ("BBW",               "bbw",                 lambda x: f"{x:.4f}"),
     ("ATR Ratio",         "atr_ratio",           lambda x: f"{x:.3f}"),
     ("ConsecGaps",        "consec_gaps",         lambda x: str(int(x))),
@@ -1111,6 +1132,7 @@ RESULT_COLUMNS = [
     ("Surge Start",       "surge_start_date",    _fmt_date),
     ("Surge Window",      "surge_window",        lambda x: str(x) if x else ""),
     ("VolDryUp",          "vol_dryup",           lambda x: f"{x:.3f}"),
+    ("RVOL",              "rvol",                lambda x: f"{x:.2f}"),
     ("Avg Vol",           "avg_vol",             lambda x: f"{x:,.0f}"),
     ("$ Vol",             "dollar_vol",          lambda x: f"${x:,.0f}"),
     ("RS S&P",            "rs_market",           lambda x: f"{x:.2f}"),
@@ -1434,6 +1456,45 @@ def _build_dynamic_columns(
                 cols.extend(_rev_block_for_quarter(k))
 
     return cols, n_eps, n_rev
+
+
+def restore_rows_at_positions(df, rows, positions):
+    """F2 undo-delete: reinsert previously-deleted rows at their
+    original positional indices.
+
+    ``rows`` is the snapshot DataFrame of the deleted rows (in original
+    top-to-bottom order) and ``positions`` their 0-based positional
+    indices in the PRE-DELETE frame. Inserting in ascending position
+    order exactly reconstructs the original frame: by the time row p_k
+    is inserted, every original row above it (kept rows + already-
+    restored p_1..p_{k-1}) occupies the first p_k slots again.
+
+    Defensive clamping: positions beyond the current frame length
+    append at the end (covers the frame having shrunk via a later
+    paste/reorder — single-level undo only promises best effort once
+    the frame was mutated again). Pure function — no Qt, no I/O —
+    so it's unit-testable headless.
+    """
+    if rows is None or len(rows) == 0:
+        return df
+    if df is None:
+        df = pd.DataFrame(columns=rows.columns)
+    n = len(rows)
+    pos_list = [int(p) for p in list(positions)[:n]]
+    # Missing positions (shouldn't happen — same-length lists are
+    # snapshotted together) append at the end.
+    while len(pos_list) < n:
+        pos_list.append(len(df) + n)
+    pairs = sorted(zip(pos_list, range(n)), key=lambda t: t[0])
+    new_df = df
+    for pos, ridx in pairs:
+        pos = min(max(pos, 0), len(new_df))
+        piece = rows.iloc[[ridx]]
+        new_df = pd.concat(
+            [new_df.iloc[:pos], piece, new_df.iloc[pos:]],
+            ignore_index=True,
+        )
+    return new_df
 
 
 def _date_to_ordinal(val):
@@ -1975,6 +2036,16 @@ class ResultsTable(QTableView):
     # the move persists across re-renders.
     rows_paste_requested = pyqtSignal(list, str)
 
+    # F2 undo-delete. Emitted on Ctrl+Z (table focused) or the
+    # context-menu "Undo delete" action. MainWindow owns the actual
+    # snapshot (rows + original positions captured at delete time) and
+    # restores it into `_period_results`; the table only tracks WHETHER
+    # an undo is available (via set_undo_available) so the context menu
+    # can show/hide the action without reaching into window state.
+    # Single-level: a new delete overwrites the snapshot; a new scan
+    # clears it.
+    undo_delete_requested = pyqtSignal()
+
     # Emitted when the user requests deletion of one or more columns
     # via the header right-click menu. Payload is the list of column
     # KEYS (already filtered to exclude always-visible core columns).
@@ -2073,6 +2144,13 @@ class ResultsTable(QTableView):
         # with a different df).
         self._cut_clipboard: list[str] = []
 
+        # F2 undo-delete availability flag. MainWindow flips it on
+        # after a row delete and off after an undo / a fresh scan.
+        # Drives whether the context menu offers "Undo delete" and
+        # whether Ctrl+Z emits the request (passes through to the
+        # default handler otherwise).
+        self._undo_available: bool = False
+
     # ── Delete-rows: collect symbols + emit the request signal ───────
 
     def _selected_symbols(self) -> list[str]:
@@ -2144,8 +2222,9 @@ class ResultsTable(QTableView):
 
         # No menu when there's nothing useful to offer:
         # - no selection AND no clipboard AND no target row (clicked
-        #   on empty space) → bail.
-        if not selected and not clipboard and not target:
+        #   on empty space) AND no pending undo → bail.
+        if (not selected and not clipboard and not target
+                and not self._undo_available):
             return
 
         menu = QMenu(self)
@@ -2186,6 +2265,14 @@ class ResultsTable(QTableView):
                 lambda: self.rows_deletion_requested.emit(selected)
             )
 
+        # F2 undo-delete: offered only while a snapshot is pending
+        # (single level — flag is cleared by MainWindow after the
+        # restore or on a fresh scan). Ctrl+Z is the keyboard twin.
+        if self._undo_available:
+            menu.addSeparator()
+            undo_act = menu.addAction("Undo delete\tCtrl+Z")
+            undo_act.triggered.connect(self.undo_delete_requested.emit)
+
         if menu.isEmpty():
             return
         menu.exec(self.viewport().mapToGlobal(pos))
@@ -2204,6 +2291,17 @@ class ResultsTable(QTableView):
         a delete, or on every fresh scan populate."""
         self._cut_clipboard = []
 
+    def set_undo_available(self, available: bool) -> None:
+        """F2 undo-delete: MainWindow flips this after a row delete
+        (True) and after an undo / fresh scan (False). Public for
+        tests."""
+        self._undo_available = bool(available)
+
+    def undo_available(self) -> bool:
+        """Whether a deleted-row snapshot is pending. Public for
+        tests."""
+        return self._undo_available
+
     def _fire_paste(self, cut_symbols: list[str], target: str) -> None:
         """Emit the paste signal. The MainWindow handler does the
         actual df reorder + re-render and is responsible for clearing
@@ -2214,8 +2312,12 @@ class ResultsTable(QTableView):
 
     def keyPressEvent(self, event):
         """Delete key on a selected row → emit deletion request.
-        Falls through to the default handler for everything else so
-        sort hotkeys / arrow navigation still work."""
+        Ctrl+Z with a pending undo snapshot → emit undo request
+        (F2 undo-delete; scoped to the table like the Delete key so
+        it never steals Ctrl+Z from text-edit widgets elsewhere in
+        the window). Falls through to the default handler for
+        everything else so sort hotkeys / arrow navigation still
+        work."""
         from PyQt6.QtCore import Qt as _Qt
         if event.key() in (_Qt.Key.Key_Delete, _Qt.Key.Key_Backspace):
             symbols = self._selected_symbols()
@@ -2223,6 +2325,12 @@ class ResultsTable(QTableView):
                 self.rows_deletion_requested.emit(symbols)
                 event.accept()
                 return
+        if (event.key() == _Qt.Key.Key_Z
+                and event.modifiers() & _Qt.KeyboardModifier.ControlModifier
+                and self._undo_available):
+            self.undo_delete_requested.emit()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     @property
