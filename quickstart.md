@@ -14,7 +14,7 @@ architecture, module map, and extension points, see [README.md](README.md).
 | 2 | Let the **universe download** + **OHLCV download** finish | Automatic, background | Any scan at all |
 | 3 | (Optional) Set the **SEC contact email**, then Force Universe Refresh | Settings menu → Data menu | SEC EDGAR universe source |
 | 4 | **Bulk Fill Sector Map** | Data menu | Relative-strength / sector-ETF filters |
-| 5 | Fill **earnings dates** (Nasdaq) and **earnings history** (Zacks / Finnhub) | Data menu | Any earnings filter |
+| 5 | Fill **earnings dates** (Nasdaq) and **earnings history** (Finviz / Zacks / Finnhub) | Data menu | Any earnings filter |
 | 6 | Configure the indicator panel and **Run Scan** | Main window | Results |
 
 Steps 3–5 are optional and depend on which filters you intend to use. The
@@ -34,7 +34,7 @@ credential prompts show in sequence:
 2. **Zacks cookies** — multi-line paste field. Enables the Zacks earnings
    scraper. Leave blank / Cancel to skip.
 
-You can skip both and set them later (see [§3](#3-credentials--what-each-unlocks)).
+You can skip both and set them later (see [§2](#2-credentials--what-each-unlocks)).
 The scanner is fully usable for price/technical scans without either.
 
 Once the window opens, two things start **automatically in the background**:
@@ -112,8 +112,9 @@ missing a mapping.
 
 ## 5. Fill earnings data (only if you use earnings filters)
 
-Earnings come from four independent sources writing to two parquet files.
-Fill only what your filters need.
+Earnings come from five independent sources writing to two parquet files:
+Nasdaq + Yahoo for last/next report *dates*, and Finviz + Zacks + Finnhub
+for per-quarter *history*. Fill only what your filters need.
 
 ### Earnings dates (last / next report date)
 
@@ -122,26 +123,36 @@ Fill only what your filters need.
 | `Data → Bulk Fill Earnings Dates (Nasdaq)` | Nasdaq calendar | Fast; ±90-day window. Best first step. |
 | `Data → Targeted Fill Earnings Dates (Yahoo)` | yfinance | Gap-fills tickers Nasdaq missed. |
 
-A once-per-week Nasdaq calendar sweep also auto-fires at launch (toggle:
-`Data → Auto-refresh Nasdaq calendar weekly`).
+A once-per-day Nasdaq calendar sweep also auto-fires at launch (toggle:
+`Data → Auto-refresh Nasdaq calendar daily`), and the launch sequence
+chains an earnings smart refresh after it so newly-reported quarters are
+captured in the same session.
 
 ### Earnings history (per-quarter EPS / revenue)
 
 | Action | Source | Notes |
 |--------|--------|-------|
-| `Data → Bulk Fill Earnings (Zacks)` | Zacks scraper | **Primary source.** ~6.5 h for the full universe; needs Zacks cookies. |
-| `Data → Bulk Fill Earnings (Finnhub)` | Finnhub | Needs a Finnhub key. Resumable. Fills only tickers Zacks doesn't cover. |
-| `Data → Targeted / Gap Fill …` | either | Fills just the tickers with no rows yet — much faster than a bulk run. |
+| `Data → Bulk Fill Earnings (Finviz)` | Finviz scraper | **Top-priority source** — adjusted EPS + revenue with real report dates. Paced slow; run the full universe overnight. |
+| `Data → Gap Fill / Spot Fill Earnings (Finviz)` | Finviz scraper | Gap = only tickers with no Finviz rows yet; Spot = one ticker on demand. |
+| `Data → Bulk Fill Earnings (Zacks)` | Zacks scraper | ~6.5 h for the full universe; needs Zacks cookies. |
+| `Data → Targeted Fill Earnings (Zacks)` | Zacks scraper | Only tickers with no rows yet — much faster than a bulk run. |
+| `Data → Bulk / Gap / Spot Fill Earnings (Finnhub)` | Finnhub | Needs a Finnhub key. Resumable. |
 
-Zacks wins at the ticker level: any ticker with Zacks rows drops all its
-Finnhub rows. Each fill auto-reconciles affected tickers. After a manual
-multi-source fill you can also run `Data → Reconcile earnings_dates.parquet`.
+All three history sources report the same adjusted (non-GAAP) figures, and
+one ticker can carry rows from several sources covering different quarters.
+Deduplication is per fiscal-quarter slot: for each `(ticker, period_ending)`
+the highest-priority source wins, in the order **Finviz > Zacks > Finnhub**.
+Each fill auto-reconciles affected tickers. After a manual multi-source fill
+you can also run `Data → Reconcile earnings_dates.parquet`.
 
 ### Check coverage
 
-`Data → Diagnostics → Earnings Coverage Report` shows the zacks-only /
-finnhub-only / both / neither breakdown. `Verify earnings_history Integrity`
-runs schema/policy checks with one-click auto-fix.
+`Data → Diagnostics → Earnings Coverage Report` shows per-source coverage
+(Finviz / Zacks / Finnhub — overlapping sets, since gap-fill lets one ticker
+carry rows from several sources), the tickers with no coverage from any
+source, and the most-recent reported quarter per source.
+`Verify earnings_history Integrity` runs schema/policy checks with one-click
+auto-fix.
 
 ---
 
@@ -181,15 +192,21 @@ is **sacred** — no rebuild, update, or migration ever touches it.
 
 ```
 scanner_data/
-  ohlcv/*.parquet            per-ticker daily OHLCV (5 yr)
+  ohlcv/*.parquet            per-ticker daily OHLCV (years configurable)
   universe.csv               ticker universe snapshot
   sector_map.parquet         ticker → sector ETF
   earnings_dates.parquet     last / next earnings dates
   earnings_history.parquet   per-quarter EPS + revenue
+  earnings_disagreements.csv cross-source EPS disagreement report
   zacks_cookies.txt          Zacks session tokens
   sec_contact.txt            SEC EDGAR contact email
+  user_config.json           Settings → Advanced… overrides
+  scan_history.json          watchlist-diff baselines + run summaries
+  schedules.json             scheduled-scan entries
+  exports/                   Quick Export XLSX output
   presets/                   saved scan configs
   logs/                      per-session diagnostic logs
+  *_blacklist.txt            per-source no-coverage skip lists
 ```
 
 The Finnhub API key lives in the Windows Credential Manager, not in this

@@ -1029,6 +1029,12 @@ def verify_integrity(
       8. period_predates_cap - period_ending older than the configured
                                 EARNINGS_HISTORY_YEARS cap → drop
                                 (warning only — silent fix)
+      9. cross_source_slot_overlap - same (ticker, period_ending) carried
+                                by >1 source → report-only (dedup picks
+                                the priority winner at save time)
+     10. calendar_quarter_overlap - finnhub fiscal row collides with a
+                                fiscal-accurate source's calendar quarter
+                                → report-only (dropped by dedupe_history)
     """
     findings: list[IntegrityFinding] = []
 

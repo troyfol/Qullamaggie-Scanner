@@ -1,5 +1,5 @@
 """
-Indicator Library — 21 Modular Technical / Momentum Indicators
+Indicator Library — 22 Modular Technical / Momentum Indicators
 ================================================================
 Every indicator is a standalone function:
     func(df, **params) -> scalar value

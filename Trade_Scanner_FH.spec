@@ -177,6 +177,6 @@ exe = EXE(
     entitlements_file=None,
     icon='barchart_zacks.ico',
     # Windows VERSIONINFO resource — versions mirror
-    # trade_scanner_fh.__version__ ("1.0.0-zacks.0").
+    # trade_scanner_fh.__version__.
     version='version_info.txt',
 )
