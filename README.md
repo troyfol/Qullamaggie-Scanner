@@ -2275,7 +2275,7 @@ ls -lh dist/Trade_Scanner_FH.exe          # fresh timestamp (~184 MB —
                                           #  the scipy exclusion shaves
                                           #  ~18 MB vs the ~201 MB
                                           #  pre-2026-06 builds; measured
-                                          #  183,750,623 B on 2026-06-12)
+                                          #  183,751,951 B on 2026-06-12)
 ls dist/scanner_data/                     # all data files preserved
 ```
 
