@@ -374,17 +374,34 @@ def test_atr_ratio_insufficient_data():
 # ======================================================================
 
 def test_adr_pct_basic():
-    # (H-L)/C = (101-99)/100 = 2% for every bar → ADR% = 2.0
+    # Classic ratio form (2026-06): 100*(H/L - 1) = 100*(101/99 - 1)
+    # = 200/99 ≈ 2.020202% for every bar → ADR% = 200/99.
+    # (The retired mean((H-L)/C) form gave exactly 2.0 here — the tight
+    # tolerance pins the new formula and fails on a regression.)
     closes = [100.0] * 20
     highs  = [101.0] * 20
     lows   = [99.0]  * 20
     df = _ohlcv(closes, highs=highs, lows=lows)
-    assert indicators.adr_pct(df, lookback=14) == pytest.approx(2.0)
+    assert indicators.adr_pct(df, lookback=14) == pytest.approx(200.0 / 99.0)
 
 
 def test_adr_pct_empty_tail_returns_nan():
     df = _ohlcv([])
     assert np.isnan(indicators.adr_pct(df, lookback=14))
+
+
+def test_adr_pct_default_lookback_is_20():
+    # 25 bars: the oldest 5 have a 100% H/L range; the trailing 20 have
+    # exactly 3% (H=103, L=100). The default lookback must cover ONLY
+    # the trailing 20 bars → exactly 3.0. A 14-bar default would also
+    # give 3.0, but a 21+-bar window would pull in a 100% bar
+    # ((20*3 + 100)/21 ≈ 7.6) — combined with the explicit-lookback
+    # window test in test_adr_dollar_stops.py this pins default=20.
+    highs = [200.0] * 5 + [103.0] * 20
+    lows  = [100.0] * 25
+    df = _ohlcv([101.0] * 25, highs=highs, lows=lows)
+    assert indicators.adr_pct(df) == pytest.approx(3.0)
+    assert indicators.adr_pct(df, lookback=21) != pytest.approx(3.0)
 
 
 def test_bollinger_band_width_nonzero_for_volatile():

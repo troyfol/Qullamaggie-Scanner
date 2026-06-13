@@ -518,16 +518,41 @@ class IndicatorPanel(QScrollArea):
         # and `Max DD %` is unused in the legacy fixed-window modes.
         self._wire_surge_mode_dependent_fields()
 
+        # ADR% — 2026-06: classic ratio form mean(100×(High/Low−1)),
+        # default lookback 14 → 20. Presets that stored a lookback keep
+        # their stored value (from_dict only overwrites present keys).
         self._add("adr", "ADR% (Avg Daily Range)", [
-            {"name": "lookback", "label": "Days", "type": "int", "default": 14, "min": 1, "max": 200},
+            {"name": "lookback", "label": "Days", "type": "int", "default": 20, "min": 1, "max": 200},
             {"name": "min_pct", "label": "Min %", "type": "float", "default": 3.0, "min": 0.0, "max": 100.0, "step": 0.5},
         ])
+        # $ADR — ADR% in dollars at the End-date close. Shares the ADR%
+        # row's "Days" lookback (one lookback drives both, so the two
+        # always agree). "Stop ×" feeds the informational ADR Stop
+        # column ONLY (stop = Close − mult × $ADR) — it never affects
+        # the Min $ filter.
+        self._add("adr_dollar", "$ADR (Avg Daily Range $)", [
+            {"name": "min_val", "label": "Min $", "type": "float", "default": 0.50, "min": 0.05, "max": 100.0, "step": 0.05},
+            {"name": "stop_mult", "label": "Stop col ×", "type": "float", "default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1, "decimals": 1},
+        ])
+        self.rows["adr_dollar"].set_enabled(False)
+        self.rows["adr_dollar"].spinboxes["stop_mult"].setToolTip(
+            "Multiplier for the ADR Stop results column only "
+            "(stop = Close − mult × $ADR). Does not affect the $ADR filter."
+        )
+        # ATR row — "Stop ×" mirrors the $ADR row's: it scales the
+        # informational ATR Stop column (Close − mult × ATR) and has no
+        # effect on the Min/Max $ range filter.
         self._add("atr", "ATR (Avg True Range $)", [
             {"name": "period", "label": "Period", "type": "int", "default": 14, "min": 1, "max": 200},
             {"name": "min_val", "label": "Min $", "type": "float", "default": 0.50, "min": 0.0, "max": 9999.0, "step": 0.25},
             {"name": "max_val", "label": "Max $", "type": "float", "default": 999.0, "min": 0.0, "max": 9999.0, "step": 1.0},
+            {"name": "stop_mult", "label": "Stop col ×", "type": "float", "default": 2.0, "min": 0.1, "max": 10.0, "step": 0.1, "decimals": 1},
         ])
         self.rows["atr"].set_enabled(False)
+        self.rows["atr"].spinboxes["stop_mult"].setToolTip(
+            "Multiplier for the ATR Stop results column only "
+            "(stop = Close − mult × ATR). Does not affect the ATR filter."
+        )
 
         # --- Volatility Contraction ---
         self._section("Volatility Contraction")
@@ -882,12 +907,19 @@ class IndicatorPanel(QScrollArea):
             adr_display_only=r["adr"].is_display_only(),
             adr_lookback=r["adr"].value("lookback"),
             adr_min_pct=r["adr"].value("min_pct"),
-            # ATR (absolute)
+            # $ADR (dollar daily range) — shares the ADR% row's
+            # lookback; "Stop col ×" drives the ADR Stop column only.
+            adr_dollar_enabled=r["adr_dollar"].is_enabled(),
+            adr_dollar_display_only=r["adr_dollar"].is_display_only(),
+            adr_dollar_min=r["adr_dollar"].value("min_val"),
+            adr_stop_multiplier=float(r["adr_dollar"].value("stop_mult")),
+            # ATR (absolute) — "Stop col ×" drives the ATR Stop column only.
             atr_enabled=r["atr"].is_enabled(),
             atr_display_only=r["atr"].is_display_only(),
             atr_period=r["atr"].value("period"),
             atr_min=r["atr"].value("min_val"),
             atr_max=r["atr"].value("max_val"),
+            atr_stop_multiplier=float(r["atr"].value("stop_mult")),
             # BBW
             bbw_enabled=r["bbw"].is_enabled(),
             bbw_display_only=r["bbw"].is_display_only(),
@@ -1115,6 +1147,8 @@ RESULT_COLUMNS = [
     ("STI",               "sti",                 lambda x: f"{x:.3f}"),
     ("Dist High %",       "dist_high_pct",       lambda x: f"{x:.1f}%"),
     ("ADR%",              "adr_pct",             lambda x: f"{x:.2f}%"),
+    ("$ADR",              "adr_dollar",          lambda x: f"${x:.2f}"),
+    ("ADR Stop",          "adr_stop",            lambda x: f"${x:.2f}"),
     ("ATR",               "atr",                 lambda x: f"${x:.2f}"),
     ("ATR Stop",          "atr_stop",            lambda x: f"${x:.2f}"),
     ("BBW",               "bbw",                 lambda x: f"{x:.4f}"),

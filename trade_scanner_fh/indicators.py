@@ -1,5 +1,5 @@
 """
-Indicator Library — 22 Modular Technical / Momentum Indicators
+Indicator Library — 23 Modular Technical / Momentum Indicators
 ================================================================
 Every indicator is a standalone function:
     func(df, **params) -> scalar value
@@ -525,21 +525,53 @@ def atr_value(df: pd.DataFrame, *, period: int = 14) -> float:
     return tr[-period:].mean()
 
 
-def adr_pct(df: pd.DataFrame, *, lookback: int = 14) -> float:
+def adr_pct(df: pd.DataFrame, *, lookback: int = 20) -> float:
     """
-    #8  ADR% — Average Daily Range excluding gaps.
-    = mean((High - Low) / Close) * 100 over last N bars.
+    #8  ADR% — Average Daily Range, classic ratio form (2026-06).
+    = mean(100 * (High / Low - 1)) over the trailing `lookback` bars
+    ending at the last bar.
+
+    Formula change history: previously mean((High - Low) / Close) * 100
+    with default lookback 14. The ratio form measures the bar's range
+    against its own Low (the convention popularized for momentum
+    screens) and the default lookback moved to 20.
     """
     tail = df.iloc[-lookback:] if len(df) >= lookback else df
     if tail.empty:
         return np.nan
-    # Guard against a zero/negative Close (bad bar) producing inf/NaN that
+    # Guard against a zero/negative Low (bad bar) producing inf/NaN that
     # would propagate into the filter (inf >= threshold reads as a false pass)
     # and render as "inf%". Mask those bars out before averaging, consistent
     # with the sibling indicators' zero-denominator guards.
-    close = tail["Close"]
-    ranges = (tail["High"] - tail["Low"]) / close.where(close > 0) * 100.0
-    return ranges.mean()
+    low = tail["Low"]
+    ratios = (tail["High"] / low.where(low > 0) - 1.0) * 100.0
+    return ratios.mean()
+
+
+def adr_dollar(df: pd.DataFrame, *, lookback: int = 20) -> float:
+    """
+    #8c  $ADR — Average Daily Range expressed in dollars at the latest
+    close.
+    = (adr_pct / 100) * last Close, where adr_pct is the masked ratio
+    mean above. Deriving from the SAME adr_pct computation (same
+    lookback, same zero/negative-Low masking) guarantees ADR% and $ADR
+    always agree.
+
+    NaN when: df is empty / missing High, Low or Close columns, ADR%
+    itself is NaN (no usable bars), or the last Close is NaN /
+    non-positive (bad bar).
+    """
+    if df is None or len(df) == 0:
+        return np.nan
+    if not {"High", "Low", "Close"}.issubset(df.columns):
+        return np.nan
+    pct = adr_pct(df, lookback=lookback)
+    if pct is None or not np.isfinite(pct):
+        return np.nan
+    last_close = df["Close"].iloc[-1]
+    if last_close is None or not np.isfinite(last_close) or last_close <= 0:
+        return np.nan
+    return (float(pct) / 100.0) * float(last_close)
 
 
 def bollinger_band_width(

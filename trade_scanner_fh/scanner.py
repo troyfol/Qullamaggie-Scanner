@@ -27,10 +27,19 @@ from .data_engine import load_ohlcv
 
 log = logging.getLogger("scanner.scan")
 
-# ATR-based stop distance for the informational "ATR Stop" results
-# column: stop = last Close − ATR_STOP_MULTIPLIER × ATR(atr_period).
-# Display-only by design — no filter stage and no IndicatorPanel row.
+# Default ATR-based stop distance for the informational "ATR Stop"
+# results column: stop = last Close − multiplier × ATR(atr_period).
+# Display-only by design — no filter stage. 2026-06: the multiplier is
+# now per-scan tunable via ScanParams.atr_stop_multiplier; this module
+# constant is its default, so legacy presets (no stored multiplier)
+# reproduce the previously hard-coded 2.0× behavior exactly.
 ATR_STOP_MULTIPLIER = 2.0
+
+# Default $ADR-based stop distance for the informational "ADR Stop"
+# column: stop = last Close − multiplier × $ADR(adr_lookback). Same
+# display-only contract as ATR Stop (no filter stage); per-scan
+# override via ScanParams.adr_stop_multiplier.
+ADR_STOP_MULTIPLIER = 1.0
 
 
 # ============================================================================
@@ -206,10 +215,32 @@ class ScanParams:
     surge_ignition_min_pct: float = 5.0
 
     # #8   ADR% (momentum — looking for expansion)
+    # 2026-06 formula change: ADR% is now the classic ratio form
+    # mean(100 × (High/Low − 1)) and the default lookback moved
+    # 14 → 20. Presets that explicitly stored a lookback keep their
+    # stored value (only the default changed).
     adr_enabled: bool = True
     adr_display_only: bool = False
-    adr_lookback: int = 14
+    adr_lookback: int = 20
     adr_min_pct: float = 3.0  # at least 3% ADR = momentum
+
+    # #8c  $ADR — ADR% expressed in dollars at the End-date close:
+    # adr_dollar = adr_pct/100 × Close. Shares `adr_lookback` with ADR%
+    # (one lookback drives both, so the two always agree). Defaults OFF
+    # so legacy presets (which lack these keys) load unchanged. NaN
+    # (insufficient data / bad bars) fails the filter via the standard
+    # `>=` comparison.
+    adr_dollar_enabled: bool = False
+    adr_dollar_display_only: bool = False
+    adr_dollar_min: float = 0.50
+
+    # Stop-column multipliers (informational columns — no filter
+    # stages, see ATR_STOP_MULTIPLIER / ADR_STOP_MULTIPLIER above).
+    # ADR Stop = Close − adr_stop_multiplier × $ADR. The defaults
+    # reproduce the previously shipped behavior (ATR Stop at the
+    # hard-coded 2.0×), so an old preset with no stored multiplier
+    # renders ATR Stop identical to before.
+    adr_stop_multiplier: float = ADR_STOP_MULTIPLIER
 
     # #8b  ATR (Average True Range — absolute dollar value)
     atr_enabled: bool = False
@@ -217,6 +248,9 @@ class ScanParams:
     atr_period: int = 14
     atr_min: float = 0.50
     atr_max: float = 999.0
+    # ATR Stop = Close − atr_stop_multiplier × ATR (column only — the
+    # ATR range filter above is unaffected by the multiplier).
+    atr_stop_multiplier: float = ATR_STOP_MULTIPLIER
 
     # --- Volatility Contraction ---
 
@@ -587,16 +621,40 @@ def _compute_ticker(
     if params.adr_enabled or params.adr_display_only:
         row["adr_pct"] = indicators.adr_pct(full_to_end, lookback=params.adr_lookback)
 
+    # #8c $ADR + ADR Stop. $ADR shares params.adr_lookback with ADR%
+    # (one lookback drives both) and derives from the same masked
+    # ratio mean, so the two always agree:
+    # adr_dollar = adr_pct/100 × End-date Close. ADR Stop piggybacks
+    # on $ADR exactly like ATR Stop piggybacks on ATR — informational
+    # column only (no filter stage, no panel row of its own), present
+    # whenever $ADR is computed (enabled OR display-only). NaN-safe:
+    # NaN $ADR or NaN close → NaN stop (renders blank).
+    if params.adr_dollar_enabled or params.adr_dollar_display_only:
+        adr_d = indicators.adr_dollar(full_to_end, lookback=params.adr_lookback)
+        row["adr_dollar"] = adr_d
+        if (adr_d is not None and np.isfinite(adr_d)
+                and close_val is not None and np.isfinite(close_val)):
+            row["adr_stop"] = (
+                float(close_val)
+                - float(params.adr_stop_multiplier) * float(adr_d)
+            )
+        else:
+            row["adr_stop"] = np.nan
+
     if params.atr_enabled or params.atr_display_only:
         atr_v = indicators.atr_value(full_to_end, period=params.atr_period)
         row["atr"] = atr_v
         # ATR Stop — informational column only (no filter, no panel
-        # row): suggested stop level = last Close − 2.0 × ATR. Reuses
-        # the single atr_value computation above (compute once, reuse).
+        # row): suggested stop level = last Close −
+        # atr_stop_multiplier × ATR (default 2.0). Reuses the single
+        # atr_value computation above (compute once, reuse).
         # NaN-safe: NaN ATR or NaN close → NaN stop (renders blank).
         if (atr_v is not None and np.isfinite(atr_v)
                 and close_val is not None and np.isfinite(close_val)):
-            row["atr_stop"] = float(close_val) - ATR_STOP_MULTIPLIER * float(atr_v)
+            row["atr_stop"] = (
+                float(close_val)
+                - float(params.atr_stop_multiplier) * float(atr_v)
+            )
         else:
             row["atr_stop"] = np.nan
 
@@ -974,6 +1032,7 @@ def _compute_display_only_fails(
     _flag_min("max_gap", "max_gap_pct", "max_gap_min_pct")
     _flag_min("surge", "surge_pct", "surge_min_pct")
     _flag_min("adr", "adr_pct", "adr_min_pct")
+    _flag_min("adr_dollar", "adr_dollar", "adr_dollar_min")
     _flag_min("rvol", "rvol", "rvol_min")
     _flag_min("rs_market", "rs_market", "rs_market_min")
     _flag_min("rs_nasdaq", "rs_nasdaq", "rs_nasdaq_min")
@@ -1229,6 +1288,14 @@ def _build_filter_stages(params: ScanParams) -> list[tuple[str, Callable]]:
         stages.append((
             f"ADR% >= {params.adr_min_pct}%",
             lambda df, p=params: df["adr_pct"] >= p.adr_min_pct,
+        ))
+
+    # #8c $ADR (dollar daily range — minimum). NaN fails via the
+    # standard `>=` comparison.
+    if params.adr_dollar_enabled and not params.adr_dollar_display_only:
+        stages.append((
+            f"$ADR >= {params.adr_dollar_min:.2f}",
+            lambda df, p=params: df["adr_dollar"] >= p.adr_dollar_min,
         ))
 
     # #8b ATR (absolute dollar range)

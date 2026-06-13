@@ -10,7 +10,7 @@ This README is written to be self-sufficient for any developer (human or LLM) wh
 
 > **Security & robustness audit (2026-06-09).** A multi-vector audit (efficiency, security, robustness, GUI usability) was run and remediated. Findings live in [`AUDIT_2026-06-09.md`](AUDIT_2026-06-09.md); the remediation log (what was fixed / deferred / how verified) is in [`AUDIT_FIXES_2026-06-09.md`](AUDIT_FIXES_2026-06-09.md). Highlights now in the codebase: per-writer unique temp names + `HISTORY_WRITE_LOCK`/`DATES_WRITE_LOCK` serialization on the parquet caches (no concurrent lost-updates/corruption), download-then-swap `rebuild_ticker`, vectorized `compute_yoy_columns`, DPAPI-encrypted Zacks cookies (backward-compatible), response-size caps on the Imperva-fronted scrapers, `pyautogui` failsafe/coordinate guards, and the NYSE holiday table extended through 2032. Suite at the time of that audit: 933 tests (since grown — see [Testing](#testing)).
 
-> **2026-06 refactor + feature waves.** Three follow-up waves landed in June 2026: **(1)** observability + version stamping (window title + Windows VERSIONINFO resource mirror `trade_scanner_fh.__version__`) + the **Settings → Advanced…** user-config (`scanner_data/user_config.json`); **(2)** a MainWindow decomposition (`gui/earnings_coordinator.py`, `gui/blacklists.py`, `gui/exports.py`, `gui/columns.py`), the shared `fill_framework.py` fill orchestrator, and scraper resilience (drift-tolerant fallback parsers + a parse-failure spike alarm); **(3)** new scan features — RVOL filter, ATR Stop column, watchlist diffing (`Chg` column), single-level undo delete, Quick Export, an in-app scan scheduler (`gui/scheduler.py`), a report-only cross-source EPS disagreement CSV, and an opt-in launch-time OHLCV prefetch. Each is documented in its section below. Suite: **1,187 tests pass**.
+> **2026-06 refactor + feature waves.** Three follow-up waves landed in June 2026: **(1)** observability + version stamping (window title + Windows VERSIONINFO resource mirror `trade_scanner_fh.__version__`) + the **Settings → Advanced…** user-config (`scanner_data/user_config.json`); **(2)** a MainWindow decomposition (`gui/earnings_coordinator.py`, `gui/blacklists.py`, `gui/exports.py`, `gui/columns.py`), the shared `fill_framework.py` fill orchestrator, and scraper resilience (drift-tolerant fallback parsers + a parse-failure spike alarm); **(3)** new scan features — RVOL filter, ATR Stop column, watchlist diffing (`Chg` column), single-level undo delete, Quick Export, an in-app scan scheduler (`gui/scheduler.py`), a report-only cross-source EPS disagreement CSV, and an opt-in launch-time OHLCV prefetch. A follow-up (2026-06) reworked the **ADR% formula** (classic ratio form `mean(100 × (High/Low − 1))`, default lookback 14 → 20) and added the **$ADR filter + ADR Stop column + per-scan stop multipliers** for both stop columns. Each is documented in its section below. Suite: **1,238 tests pass**.
 
 ---
 
@@ -76,7 +76,7 @@ This README is written to be self-sufficient for any developer (human or LLM) wh
 │  Pipeline layer                                                  │
 │   scanner.py        ScanParams, _compute_ticker, _build_filter_  │
 │                     stages, _compute_display_only_fails, run_scan│
-│   indicators.py     22 pure indicator functions (SMA, ATR, RVOL…)│
+│   indicators.py     23 pure indicator functions (SMA, ATR, RVOL…)│
 └────────────────────┬─────────────────────────────────────────────┘
                      │ load_ohlcv() / load_earnings_*
                      ▼
@@ -305,8 +305,8 @@ log line when non-empty, silent when clean. Tests in
 ## Module-by-module map
 
 Line counts and entry points as of 2026-06 (post the Phase 1–3 waves).
-The package is **100 Python files** including tests (23 top-level
-modules, 12 `gui/` modules, 1 `tools/` helper, 64 files under `tests/`).
+The package is **101 Python files** including tests (23 top-level
+modules, 12 `gui/` modules, 1 `tools/` helper, 65 files under `tests/`).
 
 ### Top-level package
 | File | Lines | Role | Key entry points |
@@ -317,8 +317,8 @@ modules, 12 `gui/` modules, 1 `tools/` helper, 64 files under `tests/`).
 | `config.py` | 865 | All paths, constants, tunables + the user-config override layer | `DATA_DIR`, `EARNINGS_HISTORY_PARQUET`, `REFERENCE_TICKERS`, `SECTOR_ETF_MAP`, `atomic_write_parquet` / `atomic_write_text` / `atomic_write_csv`, `most_recent_trading_day`, `get_sec_user_agent` / `get_sec_contact_email` / `set_sec_contact_email` / `sec_contact_is_configured`, `load_user_config` / `save_user_config` / `user_config_path` |
 | `data_engine.py` | 613 | OHLCV download & cache | `download_one`, `download_many`, `load_ohlcv`, `validate_ticker`, `rebuild_ticker`, `prefetch_ohlcv` |
 | `ticker_universe.py` | 603 | Universe download (3 sources) | `refresh_universe`, `load_universe` |
-| `indicators.py` | 674 | 22 pure indicator functions | One function per indicator (see §[Adding a new indicator](#adding-a-new-indicator)) |
-| `scanner.py` | 1709 | The funnel pipeline | `ScanParams`, `_compute_ticker`, `_compute_display_only_fails`, `_build_filter_stages`, `run_scan`, `ScanResult`, `ATR_STOP_MULTIPLIER` |
+| `indicators.py` | 706 | 23 pure indicator functions | One function per indicator (see §[Adding a new indicator](#adding-a-new-indicator)) |
+| `scanner.py` | 1776 | The funnel pipeline | `ScanParams`, `_compute_ticker`, `_compute_display_only_fails`, `_build_filter_stages`, `run_scan`, `ScanResult`, `ATR_STOP_MULTIPLIER`, `ADR_STOP_MULTIPLIER` |
 | `scan_history.py` | 304 | GUI-free watchlist-diff persistence (`scan_history.json`) | `diff_and_record`, `record_scan_results`, `load_history`, `save_history`, `prune_latest`, `ScanDiff` |
 | `sector_map.py` | 288 | Sector mapping persistence | `bulk_fill_sectors`, `targeted_fill_sectors`, `load_sector_map` |
 | `earnings_cache.py` | 180 | Schema/IO for earnings_dates.parquet (bulk + targeted fills now live in nasdaq_fill / yahoo_fill) | `load_earnings_cache`, `save_earnings_cache`, `get_earnings_dates`, `_merge_and_save`, `COLUMNS` |
@@ -347,7 +347,7 @@ modules, 12 `gui/` modules, 1 `tools/` helper, 64 files under `tests/`).
 | `exports.py` | 558 | XLSX/CSV export pipeline + Quick Export | `ExportsController` (incl. `quick_export`) |
 | `columns.py` | 281 | Manual column order + hidden-set state and the cross-scan reconcile rules | `ColumnManager` |
 | `scheduler.py` | 762 | In-app scan scheduler (F3): persistence, due-entry math, manager dialog, tray-icon toasts | `ScanScheduler`, `ScheduleEntry`, `ScheduleDialog`, `ScheduleEntryDialog`, `load_schedules` / `save_schedules`, `entry_is_due` |
-| `widgets.py` | 2888 | Reusable widgets | `IndicatorRow`, `IndicatorPanel`, `ResultsTable`, `ReorderableHeader`, `LogPanel`, `RESULT_COLUMNS`, `_ALIGN_PALETTE`, `_safe_streak`, `_anchor_date_value`, `restore_rows_at_positions` |
+| `widgets.py` | 2922 | Reusable widgets | `IndicatorRow`, `IndicatorPanel`, `ResultsTable`, `ReorderableHeader`, `LogPanel`, `RESULT_COLUMNS`, `_ALIGN_PALETTE`, `_safe_streak`, `_anchor_date_value`, `restore_rows_at_positions` |
 | `workers.py` | 1360 | All QThread workers | `ScanWorker`, `ZacksFillWorker`, `FinnhubFillWorker`, `FinvizFillWorker`, `FirefoxCookieWaitWorker`, `UpdateWorker`, `PrefetchWorker`, `UniverseWorker`, `UniverseRefreshWorker`, `SectorFillWorker`, `EarningsFillWorker`, `BridgeWorker` |
 | `dialogs.py` | 770 | Modal dialogs | `WatchlistDialog`, `ExcelExportDialog`, `SequencedRunDialog`, `ColumnsManagerDialog` |
 | `hotkey_dialog.py` | 544 | Per-row HOTKEY settings UI | `HotkeySettingsDialog`, `PositionCaptureCountdown` |
@@ -440,9 +440,9 @@ A user-initiated scan flows like this:
 
 ## Key data structures
 
-### `ScanParams` (scanner.py:98 ff.)
+### `ScanParams` (scanner.py:107 ff.)
 
-A `@dataclass` with EVERY tunable for the funnel. ~142 fields organized as follows:
+A `@dataclass` with EVERY tunable for the funnel. ~147 fields organized as follows:
 
 ```python
 @dataclass
@@ -479,7 +479,9 @@ The number of Q-i columns rendered is **based on populated data**, not capped by
 | `sma{period}` | Iff sma1/sma2 enabled-or-display | `indicators.price_above_sma` |
 | `sti`, `dist_high_pct`, `consec_gaps`, ... | Iff matching filter active | `indicators.*` |
 | `rvol` | Iff rvol enabled-or-display | `indicators.relative_volume` (last bar's volume ÷ mean of the prior `rvol_lookback` bars) |
-| `atr_stop` | Iff the ATR row is enabled-or-display (derived display column — no own filter, no own panel row) | `close − ATR_STOP_MULTIPLIER(2.0) × ATR` computed inline in `_compute_ticker` |
+| `adr_dollar` | Iff the $ADR row is enabled-or-display | `indicators.adr_dollar` = `adr_pct/100 × End-date Close` (shares `adr_lookback` with ADR% — same masked ratio mean, so the two always agree) |
+| `adr_stop` | Iff the $ADR row is enabled-or-display (derived display column — no own filter, no own panel row) | `close − adr_stop_multiplier (default 1.0) × $ADR` computed inline in `_compute_ticker` |
+| `atr_stop` | Iff the ATR row is enabled-or-display (derived display column — no own filter, no own panel row) | `close − atr_stop_multiplier (default 2.0, the old hard-coded ATR_STOP_MULTIPLIER) × ATR` computed inline in `_compute_ticker` |
 | `chg` | Stamped post-scan into `_period_results` by the watchlist diff (`NEW` / blank) | `MainWindow._apply_watchlist_diff` via `scan_history.diff_and_record` |
 | `max_gap_pct` + `max_gap_date` | Iff max_gap active | `indicators.max_positive_gap` (returns tuple) |
 | `surge_pct` + `surge_start_date` + `surge_end_date` + `surge_window` | Iff surge active | `indicators.surge_*` |
@@ -490,7 +492,7 @@ The number of Q-i columns rendered is **based on populated data**, not capped by
 | `_earnings_aligned_dates` | Iff any non-earnings indicator date matches an earnings date | hidden — drives match-color in widget |
 | `_display_only_fails` | Iff any display-only filter has fail flags for this row | hidden — drives red-on-fail in widget |
 
-### `RESULT_COLUMNS` (widgets.py:1104 ff.)
+### `RESULT_COLUMNS` (widgets.py:1136 ff.)
 
 A list of `(header_label, dataframe_key, formatter_fn)` tuples. The display-side mapping. The widget's `_build_dynamic_columns` filters this list to only include columns whose `dataframe_key` is in `_ALWAYS_VISIBLE_KEYS` or appears in the result frame's columns. Then dynamic Q-i blocks are appended based on the **maximum populated quarter count** in the frame (the `_max_present(suffix)` helper), NOT the maximum streak length. This decoupling is what lets post-streak earnings cells remain eligible for match-coloring.
 
@@ -628,8 +630,8 @@ All three filters are AND-combined when more than one is on. Invariant: a row pa
 ## Display-only mode & red-on-fail coloring
 
 Implemented at:
-- **Scanner side**: `scanner._compute_display_only_fails(params, row)` (scanner.py:928 ff.) returns a `{column_key: True}` dict for cells that would have failed the threshold. Stashed on the row as `_display_only_fails`.
-- **Widget side**: `ResultsTable._populate_row` (widgets.py:2598 ff.) reads `_display_only_fails` and applies `_FAIL_RED` (`#e74c3c`) foreground to flagged cells.
+- **Scanner side**: `scanner._compute_display_only_fails(params, row)` (scanner.py:986 ff.) returns a `{column_key: True}` dict for cells that would have failed the threshold. Stashed on the row as `_display_only_fails`.
+- **Widget side**: `ResultsTable._populate_row` (widgets.py:2632 ff.) reads `_display_only_fails` and applies `_FAIL_RED` (`#e74c3c`) foreground to flagged cells.
 
 **Order of foreground precedence** (later wins on conflict):
 1. Default text color
@@ -671,9 +673,9 @@ Four modes ship in [`indicators.py`](trade_scanner_fh/indicators.py), selected v
 
 ---
 
-## RVOL filter + ATR Stop column (2026-06)
+## RVOL filter, ADR%/$ADR, and stop columns (2026-06)
 
-Two additions that follow the standard pipeline but are easy to confuse,
+Additions that follow the standard pipeline but are easy to confuse,
 so the contracts are spelled out:
 
 **RVOL (Relative Volume)** is a full standard indicator row — 3-state
@@ -694,27 +696,65 @@ panel row, funnel stage, output column:
   (that one is a *median*-based multiple evaluated per candidate bar
   inside a rally; RVOL is a *mean*-based snapshot of the latest bar).
 
-**ATR Stop** is NOT a filter and has **no panel row and no ScanParams
-fields**. It is a derived display column that piggybacks on the existing
-ATR row: whenever ATR is enabled-or-display-only, `_compute_ticker` also
-emits `atr_stop = close − ATR_STOP_MULTIPLIER × ATR(atr_period)` with
-`ATR_STOP_MULTIPLIER = 2.0` (module constant in `scanner.py`). NaN when
-ATR is NaN; absent when the ATR row is off. Rendered as `$x.xx` via
-`RESULT_COLUMNS` key `atr_stop`. There is deliberately no filter stage —
-a stop level is trade context, not a screening criterion.
+**ADR% formula change (2026-06):** `indicators.adr_pct` now uses the
+classic ratio form `mean(100 × (High/Low − 1))` over the trailing
+`lookback` bars (previously `mean((High − Low)/Close) × 100`), and the
+default lookback moved **14 → 20** (`ScanParams.adr_lookback` + the
+panel row's "Days" spinbox). Bad bars (Low ≤ 0) are masked out of the
+mean, mirroring the old form's zero-Close guard. **Presets that
+explicitly stored a lookback keep their stored value** — only the
+default changed (`from_dict` only overwrites present keys).
+
+**$ADR (Avg Daily Range $)** is a full standard indicator row — 3-state
+panel row, funnel stage, output column:
+
+- `indicators.adr_dollar(df, lookback=20)` =
+  `adr_pct/100 × End-date Close` — derived from the SAME masked ratio
+  mean as ADR%, so the two always agree. NaN when ADR% is NaN or the
+  last Close is NaN / non-positive.
+- **Shares the ADR% row's lookback** (`ScanParams.adr_lookback` — there
+  is deliberately no separate `adr_dollar_lookback`), so one "Days"
+  value drives both.
+- `ScanParams`: `adr_dollar_enabled` / `adr_dollar_display_only`
+  (both default **off** — old presets load unchanged) /
+  `adr_dollar_min` (default 0.50). Funnel stage: `$ADR >= {min}`
+  (NaN fails); display-only red-on-fail via `_flag_min`.
+
+**ATR Stop and ADR Stop** are NOT filters and have **no panel rows of
+their own**. Each is a derived display column that piggybacks on its
+parent row: whenever ATR ($ADR) is enabled-or-display-only,
+`_compute_ticker` also emits
+`atr_stop = close − atr_stop_multiplier × ATR(atr_period)`
+(`adr_stop = close − adr_stop_multiplier × $ADR(adr_lookback)`). NaN
+when the parent value is NaN; absent when the parent row is off.
+Rendered as `$x.xx` via `RESULT_COLUMNS` keys `atr_stop` / `adr_stop`.
+There is deliberately no filter stage — a stop level is trade context,
+not a screening criterion.
+
+**Configurable stop multipliers (2026-06):** the multipliers are
+per-scan tunable via `ScanParams.atr_stop_multiplier` (**default 2.0**
+— the previously hard-coded behavior; `scanner.ATR_STOP_MULTIPLIER` is
+now the dataclass default) and `ScanParams.adr_stop_multiplier`
+(**default 1.0** = `scanner.ADR_STOP_MULTIPLIER`), edited via the
+"Stop col ×" spinboxes on the ATR / $ADR panel rows. The multipliers
+feed the stop **columns only** — they never affect the ATR Min/Max $
+or $ADR Min $ filters.
 
 Presets saved before these existed load unchanged (missing keys default
-off). Tests: [`tests/test_rvol_atr_stop.py`](trade_scanner_fh/tests/test_rvol_atr_stop.py).
+off; missing multipliers default to 2.0 / 1.0, so an old preset renders
+ATR Stop identical to before). Tests:
+[`tests/test_rvol_atr_stop.py`](trade_scanner_fh/tests/test_rvol_atr_stop.py)
+and [`tests/test_adr_dollar_stops.py`](trade_scanner_fh/tests/test_adr_dollar_stops.py).
 
 ---
 
 ## Match-color anchoring system
 
-When a non-earnings indicator date (max_gap_date, surge_start_date, up_gap_start_date, down_gap_start_date, min_gap_date, surge_end_date) matches a ticker's earnings report date, the scanner stashes that date in `_earnings_aligned_dates` (scanner.py:905 ff.). The widget then assigns each matched date a deterministic-random palette color (per-ticker seeded so cross-ticker matches get distinct colors) and **paints every cell in the matched "unit" with that color**.
+When a non-earnings indicator date (max_gap_date, surge_start_date, up_gap_start_date, down_gap_start_date, min_gap_date, surge_end_date) matches a ticker's earnings report date, the scanner stashes that date in `_earnings_aligned_dates` (scanner.py:963 ff.). The widget then assigns each matched date a deterministic-random palette color (per-ticker seeded so cross-ticker matches get distinct colors) and **paints every cell in the matched "unit" with that color**.
 
 ### How the unit definition works
 
-The widget defines an "anchor date" for each column via `_anchor_date_value(key, row_data)` (widgets.py:1285 ff.):
+The widget defines an "anchor date" for each column via `_anchor_date_value(key, row_data)` (widgets.py:1319 ff.):
 
 | Column type | Anchor date |
 |-------------|-------------|
@@ -726,7 +766,7 @@ The widget defines an "anchor date" for each column via `_anchor_date_value(key,
 
 For each cell, the widget looks up its anchor date value, checks if that value is in `aligned_color_map`, and applies the matching palette color. This means an entire unit (e.g. `max_gap_pct` + `max_gap_date`, or a Q-i triplet `q3_report_date_rev` + `q3_reported_rev` + `q3_surprise_rev_dollar` + `q3_surprise_rev_pct`) shares one color.
 
-### The palette (`_ALIGN_PALETTE`, widgets.py:1996 ff.)
+### The palette (`_ALIGN_PALETTE`, widgets.py:2030 ff.)
 
 10 hand-curated colors restricted to the cool half of the wheel (cyan → teal → blue → indigo → purple → violet). Excludes:
 - Reds: hue ∈ [330°, 30°]
@@ -787,7 +827,7 @@ def vwap_distance_pct(df: pd.DataFrame, *, lookback: int = 20) -> float:
 
 Keep the function pure: takes a DataFrame slice, returns a scalar (or tuple if it also produces a date — see `max_positive_gap` for the pattern).
 
-### Step 2: Add `ScanParams` fields (`scanner.py:98 ff.`)
+### Step 2: Add `ScanParams` fields (`scanner.py:107 ff.`)
 
 ```python
 # In the appropriate section (Trend / Momentum / Volume / etc.):
@@ -797,7 +837,7 @@ vwap_dist_lookback: int = 20
 vwap_dist_min: float = 0.0     # default: anything above VWAP
 ```
 
-### Step 3: Wire computation into `_compute_ticker` (`scanner.py:453 ff.`)
+### Step 3: Wire computation into `_compute_ticker` (`scanner.py:487 ff.`)
 
 ```python
 if params.vwap_dist_enabled or params.vwap_dist_display_only:
@@ -808,7 +848,7 @@ if params.vwap_dist_enabled or params.vwap_dist_display_only:
 
 Use the `enabled OR display_only` gate — without it, display-only mode wouldn't compute the value.
 
-### Step 4: Wire filter stage into `_build_filter_stages` (`scanner.py:1100 ff.`)
+### Step 4: Wire filter stage into `_build_filter_stages` (`scanner.py:1159 ff.`)
 
 ```python
 if params.vwap_dist_enabled and not params.vwap_dist_display_only:
@@ -878,7 +918,7 @@ def test_vwap_distance_pct():
 
 A "filter" without a new indicator (e.g., re-defining the threshold semantics of an existing indicator):
 
-1. Edit the `_build_filter_stages` block at `scanner.py:1100 ff.`. Update the lambda to reflect the new comparison.
+1. Edit the `_build_filter_stages` block at `scanner.py:1159 ff.`. Update the lambda to reflect the new comparison.
 2. Update the corresponding `_flag_min` / `_flag_max` call in `_compute_display_only_fails` so the red-on-fail logic mirrors the new filter logic. **THIS IS A COMMON FOOT-GUN**: forgetting to update both means display-only mode shows misleading red coloring.
 3. Add a regression test that uses the new threshold semantics.
 
@@ -2091,7 +2131,7 @@ data directory.
 
 ## Testing
 
-Test suite at `trade_scanner_fh/tests/` — **1,187 tests, all passing** as of 2026-06. (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
+Test suite at `trade_scanner_fh/tests/` — **1,238 tests, all passing** as of 2026-06. (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
 
 ```bash
 cd c:/python/EDA_Project/Trade_Scanner_FH
@@ -2151,6 +2191,7 @@ client's rate limiter).
 | `test_parse_spike.py` | Parse-failure spike alarm (threshold math, checkpoint preservation, no-blacklist guarantee) |
 | `test_disagreements.py` | Cross-source EPS disagreement report (detection tolerances, CSV rewrite, report-only guarantee) |
 | `test_rvol_atr_stop.py` | RVOL indicator + funnel stage + panel row; ATR Stop derived column |
+| `test_adr_dollar_stops.py` | ADR% ratio-form formula + lookback-20 default; $ADR indicator/filter/panel row; ADR Stop column; configurable stop multipliers; preset back-compat |
 | `test_watchlist_diff.py` | scan_history persistence, Chg column stamping, baseline-poisoning guards, 90-day prune |
 | `test_scheduler.py` | Schedule persistence, due-entry math, once-per-day firing, toast/quick-export chain |
 | `test_prefetch_wiring.py` | Launch-time OHLCV prefetch gating + stop + no-contention ordering |

@@ -202,22 +202,37 @@ def panel(_qapp):
 
 
 def test_display_only_checkbox_added_to_filter_rows(panel):
-    """Every filter row that supports display-only has the checkbox."""
-    expected_supported = [
+    """Three-state inventory, enforced BOTH ways via set-equality.
+
+    * Every key listed here must have a display_only checkbox.
+    * Every panel row that HAS a display_only checkbox must be listed
+      here — so adding a new indicator row without updating this
+      inventory fails loudly (this is how 'rvol' originally slipped
+      through unlisted; the only intentionally-unsupported rows are
+      pinned in test_display_only_NOT_supported_for_top_pct_and_min_price).
+    """
+    expected_supported = {
         "sma1", "sma2", "sti", "dist_high", "pct_gain",
         "consec_gaps", "consec_gaps_down", "current_gap",
-        "max_gap", "max_neg_gap", "surge", "adr", "atr",
-        "bbw", "atr_ratio", "vol_dryup", "avg_vol", "dollar_vol",
+        "max_gap", "max_neg_gap", "surge", "adr", "adr_dollar", "atr",
+        "bbw", "atr_ratio", "vol_dryup", "avg_vol", "dollar_vol", "rvol",
         "rs_market", "rs_nasdaq", "rs_sector",
         "days_since_er", "days_until_er", "days_until_er_max",
         "reported_eps", "surprise_eps_dollar", "surprise_eps_pct",
         "reported_rev", "surprise_rev_dollar", "surprise_rev_pct",
+        "yoy_eps_pct", "yoy_rev_pct",
         "consec_eps_beats", "consec_rev_beats",
-    ]
-    for k in expected_supported:
-        assert panel.rows[k].display_only is not None, (
-            f"row {k!r} should have display_only checkbox"
-        )
+    }
+    actual_supported = {
+        k for k, row in panel.rows.items() if row.display_only is not None
+    }
+    missing_checkbox = expected_supported - actual_supported
+    unlisted_rows = actual_supported - expected_supported
+    assert actual_supported == expected_supported, (
+        f"display-only inventory drift — rows missing the checkbox: "
+        f"{sorted(missing_checkbox)}; rows with the checkbox but absent "
+        f"from expected_supported (update this test): {sorted(unlisted_rows)}"
+    )
 
 
 def test_display_only_NOT_supported_for_top_pct_and_min_price(panel):
