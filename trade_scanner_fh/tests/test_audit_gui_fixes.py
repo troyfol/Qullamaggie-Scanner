@@ -1974,6 +1974,79 @@ def test_preset_load_wipes_results_and_restores_columns(_qapp, tmp_path,
         mw.deleteLater()
 
 
+def test_preset_load_nonsequenced_reanchors_end_preserves_span(
+    _qapp, tmp_path, monkeypatch,
+):
+    """A NON-sequenced preset re-anchors End to the current most recent
+    trading day and preserves the saved window LENGTH for Start (Issue 2):
+    a preset saved with a stale 10-day window loads as
+    (latest-10d) .. latest, not its stale saved dates."""
+    import json
+    from datetime import date
+    from PyQt6.QtCore import QDate
+    from trade_scanner_fh.gui import main_window as mw_mod
+    monkeypatch.setattr(mw_mod, "PRESETS_DIR", tmp_path)
+    preset = {
+        "_preset_version": mw_mod.PRESET_SCHEMA_VERSION,
+        "indicators": {},
+        "start_date": "2025-01-01",
+        "end_date": "2025-01-11",   # 10-day span
+        "sequenced_run": False,
+    }
+    (tmp_path / "stale.json").write_text(json.dumps(preset), encoding="utf-8")
+    mw = mw_mod.MainWindow()
+    try:
+        latest = date(2026, 6, 16)
+        mw._latest_data_date = lambda: latest
+        mw.preset_combo.addItem("stale")
+        mw.preset_combo.setCurrentText("stale")
+        assert mw._load_preset() is True
+
+        assert mw.date_end.date() == QDate(2026, 6, 16)
+        # Saved span (10 days) preserved, anchored to the fresh End.
+        assert mw.date_start.date() == QDate(2026, 6, 6)
+    finally:
+        mw.close()
+        mw.deleteLater()
+
+
+def test_preset_load_sequenced_keeps_exact_saved_dates(
+    _qapp, tmp_path, monkeypatch,
+):
+    """A sequenced-run preset 'remembers' its exact saved start/end window
+    rather than re-anchoring to the latest trading day (Issue 2)."""
+    import json
+    from datetime import date
+    from PyQt6.QtCore import QDate
+    from trade_scanner_fh.gui import main_window as mw_mod
+    monkeypatch.setattr(mw_mod, "PRESETS_DIR", tmp_path)
+    preset = {
+        "_preset_version": mw_mod.PRESET_SCHEMA_VERSION,
+        "indicators": {},
+        "start_date": "2024-03-01",
+        "end_date": "2024-09-01",
+        "sequenced_run": True,
+        "sequenced_cfg": {
+            "start": "2024-03-01", "end": "2024-09-01",
+            "n": 2, "unit": "months",
+        },
+    }
+    (tmp_path / "seq.json").write_text(json.dumps(preset), encoding="utf-8")
+    mw = mw_mod.MainWindow()
+    try:
+        # Even if 'latest' were consulted, the sequenced branch must ignore it.
+        mw._latest_data_date = lambda: date(2026, 6, 16)
+        mw.preset_combo.addItem("seq")
+        mw.preset_combo.setCurrentText("seq")
+        assert mw._load_preset() is True
+
+        assert mw.date_start.date() == QDate(2024, 3, 1)
+        assert mw.date_end.date() == QDate(2024, 9, 1)
+    finally:
+        mw.close()
+        mw.deleteLater()
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Toolbar button: opens / focuses the singleton dropdown
 # ──────────────────────────────────────────────────────────────────────

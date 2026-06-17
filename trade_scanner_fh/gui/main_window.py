@@ -6788,10 +6788,50 @@ class MainWindow(QMainWindow):
 
         if "indicators" in data:
             self.indicator_panel.from_dict(data["indicators"])
-        if "start_date" in data:
-            self.date_start.setDate(QDate.fromString(data["start_date"], "yyyy-MM-dd"))
-        if "end_date" in data:
-            self.date_end.setDate(QDate.fromString(data["end_date"], "yyyy-MM-dd"))
+
+        # Date range handling differs by preset kind (Issue 2):
+        #   * Sequenced-run presets "remember" their exact saved window —
+        #     the actual scan walks sequenced_cfg, and the pickers are
+        #     restored verbatim so reopening the dialog shows them.
+        #   * Every NON-sequenced preset re-anchors to the CURRENT most
+        #     recent trading day so a preset saved weeks ago never scans a
+        #     stale date: End snaps to the latest available trading day and
+        #     Start preserves the saved window LENGTH (End − saved span).
+        #     The per-timeframe checkboxes (1D/1W/3M) already derive their
+        #     own start from End, so this only materially changes Custom
+        #     Range / no-checkbox single-window presets — but anchoring both
+        #     keeps every preset shape fresh on load.
+        def _parse_iso_date(s):
+            if not s:
+                return None
+            try:
+                return date.fromisoformat(str(s))
+            except (TypeError, ValueError):
+                return None
+
+        preset_is_sequenced = bool(data.get("sequenced_run", False))
+        saved_start = _parse_iso_date(data.get("start_date"))
+        saved_end = _parse_iso_date(data.get("end_date"))
+        if preset_is_sequenced:
+            if saved_start is not None:
+                self.date_start.setDate(
+                    QDate(saved_start.year, saved_start.month, saved_start.day))
+            if saved_end is not None:
+                self.date_end.setDate(
+                    QDate(saved_end.year, saved_end.month, saved_end.day))
+        else:
+            latest = self._latest_data_date()
+            self.date_end.setDate(QDate(latest.year, latest.month, latest.day))
+            # Preserve the saved window length (clamped non-negative); a
+            # preset that never saved dates collapses to a single-day window
+            # anchored on End (the timeframe checkboxes still set their own).
+            if saved_start is not None and saved_end is not None:
+                span_days = max(0, (saved_end - saved_start).days)
+            else:
+                span_days = 0
+            new_start = latest - timedelta(days=span_days)
+            self.date_start.setDate(
+                QDate(new_start.year, new_start.month, new_start.day))
         if "include_etf" in data:
             self.chk_include_etf.setChecked(data["include_etf"])
         if "include_adr" in data:
