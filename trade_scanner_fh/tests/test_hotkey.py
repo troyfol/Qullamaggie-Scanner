@@ -190,9 +190,11 @@ def test_send_ticker_default_sequence_is_click_type_enter():
     cfg = HotkeyConfig(click_x=100, click_y=200, delay_ms=0)
     ok = send_ticker("AAPL", cfg, pyautogui_module=fake)
     assert ok is True
+    # Typed LOWERCASE so pyautogui never holds Shift (which would fire
+    # platform Shift+letter order hotkeys — see send_ticker rationale).
     assert fake.calls == [
         ("click", 100, 200),
-        ("typewrite", "AAPL", 0.03),
+        ("typewrite", "aapl", 0.03),
         ("press", "enter"),
     ]
 
@@ -205,7 +207,7 @@ def test_send_ticker_end_none_skips_final_keypress():
     send_ticker("MSFT", cfg, pyautogui_module=fake)
     assert fake.calls == [
         ("click", 1, 2),
-        ("typewrite", "MSFT", 0.03),
+        ("typewrite", "msft", 0.03),
     ]
 
 
@@ -258,7 +260,7 @@ def test_send_ticker_fires_return_click_after_end_sequence():
     # Strip the interval arg from typewrite for a clean compare.
     expected = [
         ("click", 100, 200),
-        ("typewrite", "MSFT", 0.03),
+        ("typewrite", "msft", 0.03),
         ("press", "enter"),
         ("click", 500, 600),
     ]
@@ -276,9 +278,23 @@ def test_send_ticker_return_click_with_end_none():
     send_ticker("NVDA", cfg, pyautogui_module=fake)
     assert fake.calls == [
         ("click", 1, 2),
-        ("typewrite", "NVDA", 0.03),
+        ("typewrite", "nvda", 0.03),
         ("click", 99, 88),
     ]
+
+
+def test_send_ticker_types_lowercase_to_avoid_modifier_hotkeys():
+    """Regression: the ticker must be typed LOWERCASE. pyautogui holds Shift
+    to produce capitals, and Shift+letter collides with platform order-entry
+    hotkeys (TradeStation Trade Bar), placing orders. Lowercase carries no
+    modifier; symbol entry is case-insensitive so the search still works."""
+    fake = FakePyAutoGUI()
+    cfg = HotkeyConfig(click_x=1, click_y=2, delay_ms=0, end_sequence=END_NONE)
+    send_ticker("SDOT", cfg, pyautogui_module=fake)
+    typed = [c for c in fake.calls if c[0] == "typewrite"]
+    assert typed == [("typewrite", "sdot", 0.03)]
+    # No capital letters reach pyautogui (which would imply a held Shift).
+    assert not any(ch.isupper() for ch in typed[0][1])
 
 
 def test_send_ticker_return_click_independent_of_primary_position():

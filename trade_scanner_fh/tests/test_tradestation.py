@@ -56,3 +56,27 @@ def test_pyautogui_globals_not_set_at_import():
     finally:
         pyautogui.FAILSAFE = saved_failsafe
         pyautogui.PAUSE = saved_pause
+
+
+# ----------------------------------------------------------------------
+# Lowercase typing — keeps Shift off the wire so capital letters can't
+# trigger platform Shift+letter order hotkeys (TradeStation Trade Bar).
+# ----------------------------------------------------------------------
+
+def test_bridge_types_symbols_lowercase(monkeypatch):
+    """LIVE mode must type symbols LOWERCASE. pyautogui capitalizes by
+    holding Shift, and Shift+letter lands on order-entry hotkeys; lowercase
+    avoids that. Symbol entry is case-insensitive so the load still works."""
+    typed: list[str] = []
+    monkeypatch.setattr(tradestation.pyautogui, "typewrite",
+                        lambda text, interval=0: typed.append(text))
+    monkeypatch.setattr(tradestation.pyautogui, "press", lambda *a, **k: None)
+    monkeypatch.setattr(tradestation.pyautogui, "click", lambda *a, **k: None)
+    monkeypatch.setattr(tradestation.time, "sleep", lambda *a, **k: None)
+
+    cfg = BridgeConfig(dry_run=False, countdown_seconds=0,
+                       delay_between_tickers=0)
+    TradeStationBridge(["AAPL", "SDOT"], cfg).start()
+
+    assert typed == ["aapl", "sdot"]
+    assert not any(ch.isupper() for s in typed for ch in s)

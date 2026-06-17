@@ -153,7 +153,12 @@ class TradeStationBridge:
                 self._log(f"  [{i}/{total}] Would type: {sym}")
             else:
                 self._log(f"  [{i}/{total}] Typing: {sym}")
-                pyautogui.typewrite(sym, interval=0.03)
+                # Type LOWERCASE: pyautogui capitalizes by holding Shift, and a
+                # Shift+letter lands on platform order-entry hotkeys (e.g.
+                # TradeStation's Trade Bar), firing an order per capital letter.
+                # Symbol entry is case-insensitive, so lowercase is safe. Same
+                # fix as hotkey.send_ticker — see its rationale.
+                pyautogui.typewrite(sym.lower(), interval=0.03)
                 pyautogui.press(_safe_confirm_key(self.cfg.confirm_key))
 
             sent += 1

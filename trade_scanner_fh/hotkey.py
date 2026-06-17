@@ -218,6 +218,89 @@ def _wait_for_input_release(
         time.sleep(max(0.0, poll_s))
 
 
+# ── Focus diagnostics (TradeStation order-misfire investigation) ──────
+# When a hotkey send lands in the wrong place — e.g. TradeStation's Trade
+# Bar (firing an order) instead of the chart command line — the root cause
+# is almost always WHERE keyboard focus actually is at each step of the
+# send. TitanX accepts focus on the activating click; some TradeStation
+# layouts eat the first click for window activation and leave focus on the
+# Trade Bar, so the ticker types there and Enter submits an order ("partial
+# ticker entries before/after an attempted order entry"). These helpers
+# snapshot the foreground window + the control that actually holds keyboard
+# focus, so the GUI log records exactly what received the click and the
+# keystrokes. Flip HOTKEY_FOCUS_DIAGNOSTICS off once the cause is pinned.
+# All helpers FAIL OPEN (return a short marker, never raise) so diagnostics
+# can't block or crash a real send.
+
+HOTKEY_FOCUS_DIAGNOSTICS = False
+
+
+def _describe_hwnd(hwnd) -> str:
+    """Compact 'title [class] hwnd=N' for a window handle, or 'none'."""
+    if not hwnd:
+        return "none"
+    try:
+        import win32gui
+        title = (win32gui.GetWindowText(hwnd) or "")[:40]
+        cls = win32gui.GetClassName(hwnd) or ""
+        return f'"{title}" [{cls}] hwnd={int(hwnd)}'
+    except Exception:
+        return f"hwnd={hwnd}"
+
+
+def _focus_snapshot() -> str:
+    """Foreground window + the control holding keyboard focus on the
+    foreground thread (GetGUIThreadInfo). The focused control is what a
+    typewrite / press actually drives — the single most useful fact for
+    diagnosing a misrouted send."""
+    try:
+        import win32gui
+    except Exception:
+        return "diag-unavailable"
+    try:
+        fg = win32gui.GetForegroundWindow()
+    except Exception:
+        fg = 0
+    focus_desc = "?"
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _GUITHREADINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND),
+                ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND),
+                ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND),
+                ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT),
+            ]
+
+        gti = _GUITHREADINFO()
+        gti.cbSize = ctypes.sizeof(_GUITHREADINFO)
+        # Passing thread id 0 reports the GUI info for the FOREGROUND thread.
+        if ctypes.windll.user32.GetGUIThreadInfo(0, ctypes.byref(gti)):
+            focus_desc = _describe_hwnd(gti.hwndFocus)
+        else:
+            focus_desc = "no-gti"
+    except Exception:
+        focus_desc = "gti-error"
+    return f"foreground={_describe_hwnd(fg)} | focus={focus_desc}"
+
+
+def _window_at(x: int, y: int) -> str:
+    """Describe the window directly under a screen point — i.e. what the
+    click is about to land on."""
+    try:
+        import win32gui
+        return _describe_hwnd(win32gui.WindowFromPoint((int(x), int(y))))
+    except Exception:
+        return "n/a"
+
+
 def send_ticker(
     ticker: str,
     cfg: HotkeyConfig,
@@ -259,11 +342,37 @@ def send_ticker(
     if pyautogui_module is None:
         import pyautogui as pyautogui_module  # local import; see module docstring
 
+    # Diagnostics are skipped under test injection (they read live OS window
+    # state) and when the flag is off. `_diag` is a no-op in those cases so
+    # the send path stays identical for tests / production-once-resolved.
+    diag_on = HOTKEY_FOCUS_DIAGNOSTICS and not injected
+
+    def _diag(phase: str) -> None:
+        if not diag_on:
+            return
+        try:
+            snap = _focus_snapshot()
+        except Exception:
+            return
+        line = f"Hotkey[diag] {phase}: {snap}"
+        log.info(line)
+        msg(line)
+
     saved_failsafe = pyautogui_module.FAILSAFE
     saved_pause = pyautogui_module.PAUSE
     pyautogui_module.FAILSAFE = True
     pyautogui_module.PAUSE = 0.05
     try:
+        if diag_on:
+            try:
+                pre = (f"Hotkey[diag] pre-click: target-under-cursor="
+                       f"{_window_at(int(cfg.click_x), int(cfg.click_y))} | "
+                       f"{_focus_snapshot()} | input-held="
+                       f"{_any_cue_input_held()}")
+            except Exception:
+                pre = "Hotkey[diag] pre-click: (snapshot failed)"
+            log.info(pre)
+            msg(pre)
         # A mouse-button cue (right-click, middle-click, Shift/Ctrl+Left-click)
         # dispatches this send while the triggering button — and any modifier —
         # is STILL physically held. Moving the cursor and clicking the target
@@ -281,8 +390,28 @@ def send_ticker(
         pyautogui_module.click(int(cfg.click_x), int(cfg.click_y))
         if cfg.delay_ms > 0:
             time.sleep(cfg.delay_ms / 1000.0)
-        pyautogui_module.typewrite(str(ticker), interval=0.03)
+        # Where did focus actually land after the click + settle delay? If
+        # this is the Trade Bar (or the click only activated the window
+        # without focusing the command line), the ticker is about to type
+        # into the wrong control — this is the line that pins the bug.
+        _diag("post-click (focus before typing)")
+        # Type the ticker in LOWERCASE. pyautogui.typewrite emits each
+        # UPPERCASE letter as Shift+<letter> (it holds Shift to capitalize),
+        # and some target platforms bind Shift/Ctrl/Alt + letter to order-entry
+        # hotkeys — notably TradeStation's chart Trade Bar. Sending an uppercase
+        # ticker there fires one Trade Bar order hotkey PER capital letter (e.g.
+        # Shift+S, Shift+D …), staging/submitting orders and splitting the
+        # symbol across the order bar and the command line. Lowercase letters
+        # carry no modifier, so they can't trigger a modifier+key hotkey, and
+        # symbol entry is case-insensitive (sdot → SDOT) so the search still
+        # works. This is what makes the same send safe on TradeStation as it
+        # already was on TitanX. Do NOT "restore" uppercase here.
+        pyautogui_module.typewrite(str(ticker).lower(), interval=0.03)
+        # Focus may have shifted DURING typing (e.g. a stray char opened a
+        # symbol box, splitting the ticker) — snapshot before the end key.
+        _diag(f"after typing '{ticker}' (focus before end-key)")
         _press_end_sequence(pyautogui_module, cfg.end_sequence)
+        _diag("after end-key")
         # Optional return click — bring keyboard focus back to the
         # scanner (or wherever the user wants) so arrow-key navigation
         # in the results table keeps working between sends. Reuses the
