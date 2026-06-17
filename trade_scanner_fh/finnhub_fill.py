@@ -465,6 +465,11 @@ def _fill_via_finnhub(
         # Bad / revoked key. Halt immediately — no point churning.
         halt_failure_kind=finnhub_client.FAIL_AUTH,
         halt_log_message="%s: Finnhub returned 401 — halting run",
+        # 403 (endpoint/symbol not in the account's plan) is a permanent
+        # per-ticker gap: skip-list the symbol and don't let it drive the
+        # consecutive-block backoff. Routed through on_etf_identified so it
+        # lands in the Finnhub skip list and is persisted at run end.
+        skip_failure_kinds=(finnhub_client.FAIL_FORBIDDEN,),
     )
     return fill_framework.run_fill_loop(
         spec, tickers, blacklist,

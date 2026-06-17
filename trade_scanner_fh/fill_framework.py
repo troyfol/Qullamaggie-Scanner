@@ -229,6 +229,13 @@ class FillSpec:
     halt_failure_kind: Optional[str] = None   # e.g. finnhub FAIL_AUTH — break immediately
     halt_log_message: Optional[str] = None    # log.error format (gets ``label``) on halt
     warn_on_fetch_failure: bool = False       # finviz logs each real per-ticker failure
+    # Failure kinds that are a permanent per-TICKER coverage gap rather than
+    # the source blocking us (e.g. finnhub FAIL_FORBIDDEN — 403, symbol not in
+    # the account's plan). Handled like an empty response: routed to the source
+    # skip list via ``on_empty_identified`` and explicitly NOT counted toward
+    # the consecutive-block streak, so a handful of out-of-plan symbols can't
+    # trigger a backoff pause or a rewind-and-retry of the failure window.
+    skip_failure_kinds: tuple[str, ...] = ()
 
 
 def run_fill_loop(
@@ -423,6 +430,29 @@ def run_fill_loop(
                     pass
             errors += 1
             break
+        elif result.failure in spec.skip_failure_kinds:
+            # Permanent per-ticker coverage gap the source reports as a hard
+            # failure but that will NEVER succeed on retry (e.g. finnhub 403 —
+            # symbol not in the account's plan). Route it to the source skip
+            # list like an empty response and reset the streak: it's a property
+            # of the ticker, NOT the source blocking us, so it must not count
+            # toward the consecutive-block limit, trigger a backoff pause, or
+            # rewind-and-retry the window. The skip is persisted at run end via
+            # the same on_empty_identified → skip-list path as ETF/uncovered.
+            errors += 1
+            completed.add(sym)
+            consec_errors = 0
+            first_fail_idx = None
+            if on_empty_identified is not None:
+                try:
+                    on_empty_identified(sym)
+                except Exception:
+                    pass
+            if failed_cb is not None:
+                try:
+                    failed_cb(sym, result.failure)
+                except Exception:
+                    pass
         else:
             # Real failure (rate_limited / blocked / server / network /
             # parse / forbidden) — counts toward the block streak.

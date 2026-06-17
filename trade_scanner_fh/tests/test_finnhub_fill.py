@@ -402,6 +402,50 @@ def test_bulk_fill_etf_callback_fired_on_empty_response(tmp_world, fake_clients)
     assert seen_etfs == ["VTI"]
 
 
+def test_bulk_fill_forbidden_skips_listed_and_no_block(
+    tmp_world, fake_clients, monkeypatch,
+):
+    """A 403 (FAIL_FORBIDDEN — symbol not in the account's plan) must be
+    treated as a permanent per-ticker coverage gap: routed to the skip-list
+    callback and NOT counted toward the consecutive-block streak. With more
+    consecutive 403s than FINNHUB_CONSEC_BLOCK_LIMIT (3), the loop must NOT
+    pause/rewind — each ticker is fetched exactly once."""
+    history_mock, calendar_mock = fake_clients
+
+    seq: list[str] = []
+
+    def history_side_effect(sym):
+        seq.append(sym)
+        return None  # hard failure; kind supplied by last_failure_kind below
+
+    history_mock.side_effect = history_side_effect
+    calendar_mock.return_value = []
+    # Every history failure is a 403 (out of plan).
+    monkeypatch.setattr(finnhub_client, "last_failure_kind",
+                        lambda: finnhub_client.FAIL_FORBIDDEN)
+    # A backoff pause would call time.sleep — assert it never happens.
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(finnhub_fill.time, "sleep",
+                        lambda *a, **k: sleep_calls.append(a[0] if a else 0))
+
+    seen_skips: list[str] = []
+    syms = ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]  # 6 > CONSEC_BLOCK_LIMIT
+    filled, errors = finnhub_fill.bulk_fill_finnhub(
+        syms, blacklist=set(),
+        flush_every=10, resume_from_checkpoint=False,
+        on_etf_identified=seen_skips.append,
+    )
+
+    assert filled == 0
+    assert errors == len(syms)
+    # Routed to the skip list, in order, once each.
+    assert seen_skips == syms
+    # No block streak → no rewind → each ticker fetched exactly once.
+    assert seq == syms
+    # No backoff pause was taken.
+    assert sleep_calls == []
+
+
 def test_bulk_fill_resumes_from_checkpoint(tmp_world, fake_clients):
     """First run gets killed mid-way after writing checkpoint with one
     ticker complete. Second run resumes — only the remaining tickers
