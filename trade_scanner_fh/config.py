@@ -26,7 +26,22 @@ if getattr(sys, "frozen", False):
 else:
     APP_ROOT = Path(__file__).resolve().parent
 
-DATA_DIR = APP_ROOT / "scanner_data"
+# Optional override: point a dev/source run at an EXISTING scanner_data tree
+# (e.g. the packaged exe's data under dist/scanner_data) without rebuilding
+# the exe. Set TRADE_SCANNER_FH_DATA_DIR to that folder. Every derived path
+# below is `DATA_DIR / ...`, so this one override cascades to all of them.
+# Unset → the normal beside-the-app location. Useful for testing source
+# changes against real data; note that fills / OHLCV updates WRITE to it.
+#
+# The name is package-specific on purpose: a generic name (e.g.
+# SCANNER_DATA_DIR) risks colliding with an unrelated variable already in the
+# user's environment, which would silently redirect even the FROZEN exe's
+# data directory. Keep this prefixed so only an explicit opt-in takes effect.
+_DATA_DIR_OVERRIDE = os.environ.get("TRADE_SCANNER_FH_DATA_DIR", "").strip()
+if _DATA_DIR_OVERRIDE:
+    DATA_DIR = Path(_DATA_DIR_OVERRIDE).expanduser().resolve()
+else:
+    DATA_DIR = APP_ROOT / "scanner_data"
 PARQUET_DIR = DATA_DIR / "ohlcv"          # one .parquet per ticker
 LOG_DIR = DATA_DIR / "logs"
 TICKER_CSV = DATA_DIR / "universe.csv"    # cached ticker list (full metadata)
