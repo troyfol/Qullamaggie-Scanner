@@ -2407,6 +2407,9 @@ The developer(s) of this software:
 - Make no representations or warranties regarding the accuracy, completeness, or reliability of any data, calculations, or scan results produced by this application.
 - Are not responsible for any financial losses, damages, or other consequences arising from the use of this software or reliance on its output.
 - Do not guarantee that the data sourced from third-party providers (including but not limited to Yahoo Finance, NASDAQ, SEC EDGAR, Zacks, Finviz, Finnhub, or any future provider) is accurate, timely, or complete.
+- Accept no liability whatsoever for any order, trade, or other action accidentally or unintentionally triggered by the automated input features (HOTKEY mode / Send to Watchlist) interacting with your trading or order-entry software.
+
+**Automated-input / hotkey safety — test in a simulator first.** HOTKEY mode and Send to Watchlist send simulated mouse clicks and keystrokes into whatever external application is focused, including order-entry platforms. Those keystrokes can be intercepted by your trading software's own hotkeys and may trigger unintended orders. **You must test all autohotkey functionality with YOUR specific order-entry software in simulated / paper-trading mode before using it for live trading.** Verify the full click-and-type sequence behaves as expected against your exact platform and configuration; you assume all risk for any orders it produces.
 
 **Use at your own risk.** All investment decisions should be made based on your own research and judgment, ideally in consultation with a qualified financial professional. Past performance of any security identified by this scanner is not indicative of future results.
 
