@@ -6,8 +6,8 @@
 # Intentionally no personal/company identifiers.
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(5, 2, 0, 0),
-    prodvers=(5, 2, 0, 0),
+    filevers=(5, 3, 0, 0),
+    prodvers=(5, 3, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -23,12 +23,12 @@ VSVersionInfo(
           [
             StringStruct('CompanyName', ''),
             StringStruct('FileDescription', 'Trading Scanner — multi-source earnings scanner'),
-            StringStruct('FileVersion', '5.2.0'),
+            StringStruct('FileVersion', '5.3.0'),
             StringStruct('InternalName', 'Trade_Scanner_FH'),
             StringStruct('LegalCopyright', ''),
             StringStruct('OriginalFilename', 'Trade_Scanner_FH.exe'),
             StringStruct('ProductName', 'Trading Scanner'),
-            StringStruct('ProductVersion', '5.2.0')
+            StringStruct('ProductVersion', '5.3.0')
           ]
         )
       ]

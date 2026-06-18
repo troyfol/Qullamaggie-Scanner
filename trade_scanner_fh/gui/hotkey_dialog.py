@@ -1,7 +1,8 @@
 """Hotkey settings dialog + cursor-capture countdown.
 
 Used by the Settings → Hotkey Settings... menu entry. The dialog edits a
-`HotkeyConfig` (position, delay, cue, end-sequence). Clicking Set Click
+`HotkeyConfig` (position, click→type delay, cue, end-sequence, optional
+return click + its own end-key→return delay). Clicking Set Click
 Position hides the parent dialog, shows a small countdown widget in the
 top-right corner of the primary screen, then captures `QCursor.pos()` —
 GLOBAL screen coords across every monitor — when the countdown reaches 0.
@@ -329,6 +330,25 @@ class HotkeySettingsDialog(QDialog):
         return_wrap.setLayout(return_btn_box)
         grid.addWidget(return_wrap, 4, 2)
 
+        # ── Return click delay ──
+        # Independent of the click→type delay above: this is the pause
+        # between the end-sequence keystroke and the return click, so the
+        # target app has time to process the submit before focus is moved
+        # back. Only matters when a return click position is set.
+        grid.addWidget(QLabel("Delay end-key → return click (ms):"), 5, 0)
+        self.spin_return_delay = QSpinBox()
+        self.spin_return_delay.setRange(0, 5000)
+        self.spin_return_delay.setSingleStep(50)
+        self.spin_return_delay.setValue(int(cfg.return_delay_ms))
+        self.spin_return_delay.setSuffix(" ms")
+        self.spin_return_delay.setToolTip(
+            "Pause between the end-sequence keystroke and the return "
+            "click. Increase if the target app needs time to process the "
+            "submit before keyboard focus is moved back. Only applies "
+            "when a return click position is set."
+        )
+        grid.addWidget(self.spin_return_delay, 5, 1, 1, 2)
+
         layout.addLayout(grid)
 
         # ── Reset to Defaults ──
@@ -410,6 +430,7 @@ class HotkeySettingsDialog(QDialog):
         self.btn_reset.setEnabled(False)
         self.combo_cue.setEnabled(False)
         self.spin_delay.setEnabled(False)
+        self.spin_return_delay.setEnabled(False)
         self.combo_end.setEnabled(False)
         self.btn_clear_return.setEnabled(False)
         for b in self.button_box.buttons():
@@ -488,6 +509,7 @@ class HotkeySettingsDialog(QDialog):
         self.btn_reset.setEnabled(True)
         self.combo_cue.setEnabled(True)
         self.spin_delay.setEnabled(True)
+        self.spin_return_delay.setEnabled(True)
         self.combo_end.setEnabled(True)
         for b in self.button_box.buttons():
             b.setEnabled(True)
@@ -527,6 +549,7 @@ class HotkeySettingsDialog(QDialog):
         self.lbl_position.setText(self._position_text())
         self.lbl_return.setText(self._return_text())
         self.spin_delay.setValue(defaults.delay_ms)
+        self.spin_return_delay.setValue(defaults.return_delay_ms)
         self._select_combo(self.combo_cue, defaults.cue)
         self._select_combo(self.combo_end, defaults.end_sequence)
 
@@ -541,4 +564,5 @@ class HotkeySettingsDialog(QDialog):
             end_sequence=self.combo_end.currentData(),
             return_click_x=rx,
             return_click_y=ry,
+            return_delay_ms=int(self.spin_return_delay.value()),
         )

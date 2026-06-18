@@ -9,5 +9,5 @@ that Zacks doesn't cover.
 
 Forked from trading_scanner. See TINYEARNINGS_FORK.md for the spec.
 """
-__version__ = "5.2.0"
+__version__ = "5.3.0"
 __title__ = "trade_scanner_fh"

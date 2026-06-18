@@ -3752,15 +3752,22 @@ class MainWindow(QMainWindow):
             y = s.value("hotkey/click_y")
             rx = s.value("hotkey/return_click_x")
             ry = s.value("hotkey/return_click_y")
+            delay_ms = int(s.value("hotkey/delay_ms", 200))
+            # Back-compat: presets/prefs saved before the return-click delay
+            # existed have no key here, and the old code reused delay_ms for
+            # the return click — so default the missing value to delay_ms to
+            # preserve their exact prior timing.
+            rd = s.value("hotkey/return_delay_ms")
             cfg = HotkeyConfig(
                 click_x=int(x) if x is not None else None,
                 click_y=int(y) if y is not None else None,
-                delay_ms=int(s.value("hotkey/delay_ms", 200)),
+                delay_ms=delay_ms,
                 cue=str(s.value("hotkey/cue", hotkey_mod.CUE_RIGHT_CLICK)),
                 end_sequence=str(s.value("hotkey/end_sequence",
                                           hotkey_mod.END_ENTER)),
                 return_click_x=int(rx) if rx is not None else None,
                 return_click_y=int(ry) if ry is not None else None,
+                return_delay_ms=int(rd) if rd is not None else delay_ms,
             )
             return cfg.normalized()
         except Exception as exc:
@@ -3777,6 +3784,7 @@ class MainWindow(QMainWindow):
             s.setValue("hotkey/click_x", int(cfg.click_x))
             s.setValue("hotkey/click_y", int(cfg.click_y))
         s.setValue("hotkey/delay_ms", int(cfg.delay_ms))
+        s.setValue("hotkey/return_delay_ms", int(cfg.return_delay_ms))
         s.setValue("hotkey/cue", cfg.cue)
         s.setValue("hotkey/end_sequence", cfg.end_sequence)
         if cfg.return_click_x is None or cfg.return_click_y is None:
@@ -3858,12 +3866,16 @@ class MainWindow(QMainWindow):
                if new_cfg.has_position else "(no position)")
         ret = (f"({new_cfg.return_click_x},{new_cfg.return_click_y})"
                if new_cfg.has_return_position else "off")
+        # Only surface the return delay when a return click is actually set —
+        # it's a no-op otherwise and would just be noise in the log.
+        ret_delay = (f" return_delay={new_cfg.return_delay_ms}ms"
+                     if new_cfg.has_return_position else "")
         self.log_panel.write_line(
             f"Hotkey settings updated: pos={pos} "
             f"cue={hotkey_mod.cue_label(new_cfg.cue)} "
             f"delay={new_cfg.delay_ms}ms "
             f"end={hotkey_mod.end_sequence_label(new_cfg.end_sequence)} "
-            f"return={ret}."
+            f"return={ret}{ret_delay}."
         )
         # If the toggle was on but the new config has no position, the
         # cue would silently no-op — flip it off for honesty.

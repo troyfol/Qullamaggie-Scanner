@@ -1992,6 +1992,7 @@ Independent of the bulk **Send to Watchlist** flow (which pushes the entire resu
 | Delay click → type | 0 – 5000 ms | 200 ms |
 | End sequence | None, Enter, Tab, Ctrl/Shift/Alt+Enter | Enter |
 | Return click position (Set Return Click… / Clear) | Any global screen coord, optional | `(not set)` |
+| Delay end-key → return click | 0 – 5000 ms | 200 ms |
 | Reset to Defaults | Clears positions + restores defaults | — |
 
 **Click position capture:** the dialog runs an inline countdown — it shows a live readout of the current cursor coordinates plus a 5-second timer (`CAPTURE_SECONDS`), then snapshots `QCursor.pos()` as the target `(x, y)` when the timer elapses. The coords are global screen coords (multi-monitor safe). Cancel / Esc aborts. (The earlier click-intercepting transparent overlay was replaced because it misbehaved across monitors.)
@@ -2000,9 +2001,9 @@ Independent of the bulk **Send to Watchlist** flow (which pushes the entire resu
 
 **Safety — lowercase typing (v5.2.0):** `send_ticker` (and the bulk `tradestation.py` bridge) type the symbol in **lowercase**. `pyautogui.typewrite` produces capital letters by *holding Shift around each letter*, and `Shift`+letter collides with platform order-entry hotkeys — notably **TradeStation's chart Trade Bar**, where each capital of an UPPERCASE ticker fired a separate order hotkey (staging/submitting orders and splitting the symbol across the order bar and the command line). Lowercase letters carry no modifier, so they can't trigger a modifier+key hotkey; symbol entry is case-insensitive (`sdot` → SDOT) so search/load still works. A module-level `HOTKEY_FOCUS_DIAGNOSTICS` flag (default off) can re-enable per-send foreground/focused-window logging via `GetGUIThreadInfo` for future input-routing triage; `hotkey_probe.py` (repo root) is a standalone, staged (click-only / type / full) bisection probe for the same purpose (**SIM-mode only**).
 
-**Return click (optional):** when `return_click_x/y` are set, an extra click fires AFTER the end-sequence keystroke. Use case — pair with the `Enter key (selected row)` cue so the full loop is keyboard-only: arrow keys move through the table, Enter fires the send (primary click → type → end-key → return click brings focus back to the scanner), arrow keys move again. Reuses the same `delay_ms` knob between the end-key and the return click so the target app has time to process the submit before focus is stolen back. Toggle off via the `Clear` button next to the position label.
+**Return click (optional):** when `return_click_x/y` are set, an extra click fires AFTER the end-sequence keystroke. Use case — pair with the `Enter key (selected row)` cue so the full loop is keyboard-only: arrow keys move through the table, Enter fires the send (primary click → type → end-key → return click brings focus back to the scanner), arrow keys move again. The wait between the end-key and the return click is its **own** `return_delay_ms` knob (the *Delay end-key → return click* spinbox, default 200 ms) — independent of the click → type `delay_ms` — so the target app's submit-processing time can be tuned separately from its focus-acquisition time. (Pre-v5.3.0 configs that predate this field inherit their saved `delay_ms` on load, preserving prior behavior.) Toggle off via the `Clear` button next to the position label.
 
-**Persistence:** the config fields (`click_x`, `click_y`, `delay_ms`, `cue`, `end_sequence`, `return_click_x`, `return_click_y`) persist via `QSettings("trade_scanner_fh", "Trade_Scanner_FH")` under the `hotkey/` group. The on/off toggle does **NOT** persist — defaults to off on each launch so a stale screen position can't fire surprise input.
+**Persistence:** the config fields (`click_x`, `click_y`, `delay_ms`, `cue`, `end_sequence`, `return_click_x`, `return_click_y`, `return_delay_ms`) persist via `QSettings("trade_scanner_fh", "Trade_Scanner_FH")` under the `hotkey/` group. A missing `return_delay_ms` key (config saved before v5.3.0) defaults to the saved `delay_ms` so the older "shared delay" behavior is preserved verbatim. The on/off toggle does **NOT** persist — defaults to off on each launch so a stale screen position can't fire surprise input.
 
 **Edge cases:**
 
@@ -2011,7 +2012,7 @@ Independent of the bulk **Send to Watchlist** flow (which pushes the entire resu
 - `_open_hotkey_settings` after the user clears the position via Reset → if HOTKEY was on, force it off so the cue doesn't silently no-op.
 - Send sequence runs on a daemon thread so a slow target app (or a 5s delay) doesn't freeze the scanner UI.
 
-Tested in `tests/test_hotkey.py` (28 tests): config defaults, normalization clamping, option enumeration completeness, send guards (no position / empty ticker), full sequence per `end_sequence` variant, pyautogui FAILSAFE/PAUSE restoration on success and on exception, no-clobber-at-import (mirrors the `tradestation.py` invariant).
+Tested in `tests/test_hotkey.py` (38 tests): config defaults, normalization clamping (including the independent `return_delay_ms` bounds), option enumeration completeness, send guards (no position / empty ticker), full sequence per `end_sequence` variant, the return click firing with its own post-end-key delay, pyautogui FAILSAFE/PAUSE restoration on success and on exception, no-clobber-at-import (mirrors the `tradestation.py` invariant). The dialog's spinbox round-trip + reset are covered in `tests/test_hotkey_gui.py`.
 
 ### "Send All Misses to Zacks Skip List" button
 

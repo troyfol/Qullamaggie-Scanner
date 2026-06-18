@@ -55,6 +55,9 @@ def test_default_config_has_no_position_and_sane_defaults():
     assert cfg.return_click_x is None
     assert cfg.return_click_y is None
     assert cfg.has_return_position is False
+    # Return-click delay defaults to the same 200 ms as the click→type
+    # delay, so a fresh config behaves identically until the user adjusts it.
+    assert cfg.return_delay_ms == 200
 
 
 def test_has_return_position_true_only_when_both_x_and_y_set():
@@ -97,16 +100,28 @@ def test_normalize_floors_negative_delay_to_zero():
     assert n.delay_ms == 0
 
 
+def test_normalize_clamps_return_delay_independently_of_delay():
+    """return_delay_ms has the same 0..5000 bounds as delay_ms but is
+    clamped on its own — over-ceiling floors to 5000, negative to 0,
+    without disturbing the (valid) primary delay."""
+    over = HotkeyConfig(delay_ms=100, return_delay_ms=99999).normalized()
+    assert over.delay_ms == 100 and over.return_delay_ms == 5000
+    under = HotkeyConfig(delay_ms=100, return_delay_ms=-50).normalized()
+    assert under.delay_ms == 100 and under.return_delay_ms == 0
+
+
 def test_normalize_preserves_valid_values():
     cfg = HotkeyConfig(
         click_x=100, click_y=200,
         delay_ms=350,
         cue=CUE_SHIFT_LEFT,
         end_sequence=END_TAB,
+        return_delay_ms=450,
     )
     n = cfg.normalized()
     assert n.click_x == 100 and n.click_y == 200
     assert n.delay_ms == 350
+    assert n.return_delay_ms == 450
     assert n.cue == CUE_SHIFT_LEFT
     assert n.end_sequence == END_TAB
 
@@ -309,6 +324,48 @@ def test_send_ticker_return_click_independent_of_primary_position():
     send_ticker("AMD", cfg, pyautogui_module=fake)
     click_calls = [c for c in fake.calls if c[0] == "click"]
     assert click_calls == [("click", 10, 20), ("click", 999, 888)]
+
+
+def test_send_ticker_return_click_uses_its_own_delay(monkeypatch):
+    """The post-end-key pause before the return click is driven by
+    `return_delay_ms`, INDEPENDENT of the click→type `delay_ms`. With a
+    return position set, send_ticker sleeps exactly twice: delay_ms before
+    typing, then return_delay_ms before the return click."""
+    slept: list[float] = []
+    monkeypatch.setattr(hotkey.time, "sleep", lambda s: slept.append(s))
+    fake = FakePyAutoGUI()
+    cfg = HotkeyConfig(
+        click_x=1, click_y=2, delay_ms=100,
+        return_click_x=3, return_click_y=4, return_delay_ms=250,
+    )
+    send_ticker("AAPL", cfg, pyautogui_module=fake)
+    assert slept == pytest.approx([0.100, 0.250])
+
+
+def test_send_ticker_no_return_delay_sleep_without_return_position(monkeypatch):
+    """With no return position, only the primary click→type delay sleeps —
+    the return-delay knob is never consulted."""
+    slept: list[float] = []
+    monkeypatch.setattr(hotkey.time, "sleep", lambda s: slept.append(s))
+    fake = FakePyAutoGUI()
+    cfg = HotkeyConfig(click_x=1, click_y=2, delay_ms=120, return_delay_ms=999)
+    send_ticker("AAPL", cfg, pyautogui_module=fake)
+    assert slept == pytest.approx([0.120])
+
+
+def test_send_ticker_return_delay_zero_skips_sleep_but_still_clicks(monkeypatch):
+    """return_delay_ms=0 means no wait before the return click, but the
+    return click itself must still fire."""
+    slept: list[float] = []
+    monkeypatch.setattr(hotkey.time, "sleep", lambda s: slept.append(s))
+    fake = FakePyAutoGUI()
+    cfg = HotkeyConfig(
+        click_x=1, click_y=2, delay_ms=0,
+        return_click_x=7, return_click_y=8, return_delay_ms=0,
+    )
+    send_ticker("AAPL", cfg, pyautogui_module=fake)
+    assert slept == []  # both delays are zero
+    assert ("click", 7, 8) in fake.calls
 
 
 # ──────────────────────────────────────────────────────────────────────

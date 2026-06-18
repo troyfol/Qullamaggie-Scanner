@@ -81,3 +81,44 @@ def test_context_menu_not_suppressed_for_non_right_click_cues(_qapp, cue):
         assert handled is False
     finally:
         win.close()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Hotkey settings dialog — return-click delay round-trips
+# ──────────────────────────────────────────────────────────────────────
+
+def test_dialog_loads_and_returns_separate_return_delay(_qapp):
+    """The dialog seeds its return-delay spinbox from the config and
+    result_config() round-trips an edited value back independently of the
+    click→type delay."""
+    from trade_scanner_fh.gui.hotkey_dialog import HotkeySettingsDialog
+    cfg = HotkeyConfig(
+        click_x=10, click_y=20, delay_ms=150,
+        return_click_x=30, return_click_y=40, return_delay_ms=450,
+    )
+    dlg = HotkeySettingsDialog(cfg)
+    try:
+        assert dlg.spin_delay.value() == 150
+        assert dlg.spin_return_delay.value() == 450
+        dlg.spin_return_delay.setValue(800)  # user edits return delay only
+        out = dlg.result_config()
+        assert out.delay_ms == 150          # primary delay untouched
+        assert out.return_delay_ms == 800   # return delay carried through
+    finally:
+        dlg.deleteLater()
+
+
+def test_dialog_reset_restores_default_return_delay(_qapp):
+    """Reset to Defaults returns the return-delay spinbox to 200 ms."""
+    from trade_scanner_fh.gui.hotkey_dialog import HotkeySettingsDialog
+    cfg = HotkeyConfig(
+        click_x=1, click_y=2, return_click_x=3, return_click_y=4,
+        return_delay_ms=999,
+    )
+    dlg = HotkeySettingsDialog(cfg)
+    try:
+        assert dlg.spin_return_delay.value() == 999
+        dlg._reset_defaults()
+        assert dlg.spin_return_delay.value() == 200
+    finally:
+        dlg.deleteLater()

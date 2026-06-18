@@ -84,6 +84,11 @@ class HotkeyConfig:
     click fires AFTER the end-sequence keystroke. Use case — bring
     keyboard focus back to the scanner window so arrow-key navigation
     through the results table works seamlessly between sends.
+
+    `delay_ms` is the pause between the primary click and typing the
+    ticker; `return_delay_ms` is the independent pause between the
+    end-sequence keystroke and the return click (defaults to the same
+    200 ms so behavior is unchanged until the user adjusts it).
     """
     click_x: Optional[int] = None
     click_y: Optional[int] = None
@@ -92,6 +97,7 @@ class HotkeyConfig:
     end_sequence: str = END_ENTER
     return_click_x: Optional[int] = None
     return_click_y: Optional[int] = None
+    return_delay_ms: int = 200
 
     @property
     def has_position(self) -> bool:
@@ -109,6 +115,7 @@ class HotkeyConfig:
         cue = self.cue if self.cue in _CUE_IDS else CUE_RIGHT_CLICK
         end = self.end_sequence if self.end_sequence in _END_IDS else END_ENTER
         delay = max(0, min(int(self.delay_ms or 0), 5000))
+        return_delay = max(0, min(int(self.return_delay_ms or 0), 5000))
         return HotkeyConfig(
             click_x=self.click_x,
             click_y=self.click_y,
@@ -117,6 +124,7 @@ class HotkeyConfig:
             end_sequence=end,
             return_click_x=self.return_click_x,
             return_click_y=self.return_click_y,
+            return_delay_ms=return_delay,
         )
 
 
@@ -414,12 +422,13 @@ def send_ticker(
         _diag("after end-key")
         # Optional return click — bring keyboard focus back to the
         # scanner (or wherever the user wants) so arrow-key navigation
-        # in the results table keeps working between sends. Reuses the
-        # same delay knob to give the target app time to process the
-        # end-sequence keystroke before we steal focus away.
+        # in the results table keeps working between sends. Uses its own
+        # `return_delay_ms` knob (independent of the click→type delay) to
+        # give the target app time to process the end-sequence keystroke
+        # before we steal focus away.
         if cfg.has_return_position:
-            if cfg.delay_ms > 0:
-                time.sleep(cfg.delay_ms / 1000.0)
+            if cfg.return_delay_ms > 0:
+                time.sleep(cfg.return_delay_ms / 1000.0)
             pyautogui_module.click(
                 int(cfg.return_click_x), int(cfg.return_click_y),
             )
