@@ -4,8 +4,12 @@ MainWindow's four persisted skip-lists (universal OHLCV blacklist +
 Zacks/Finnhub/finviz per-source lists) all load/save through
 BlacklistManager now. These tests lock the on-disk formats, the
 missing/corrupt-file degradation, the normalization rules, and the
-newline-injection guard — byte-identical to the pre-extraction
-per-method behavior.
+newline-injection guard.
+
+The "lines" format gained TICKER<TAB>ADDED_ON<TAB>REASON metadata in audit
+2026-08-12 (INT-5), so the format assertions read the ticker column rather
+than the whole line; legacy bare-ticker files must still load, which
+test_lines_load_accepts_legacy_bare_format pins.
 
 Pure filesystem tests against tmp_path — no Qt widgets, no network.
 The MainWindow delegate tests bind via ``__new__`` (the established
@@ -14,6 +18,7 @@ pattern in test_zacks_failure_breakdown.py) so __init__ never runs.
 from __future__ import annotations
 
 import logging
+from datetime import date, timedelta
 
 import pytest
 
@@ -77,12 +82,46 @@ def test_csv_save_empty_set_writes_empty_file(tmp_path):
 # ──────────────────────────────────────────────────────────────────────
 
 def test_lines_round_trip(tmp_path):
+    """One entry per line, sorted, trailing newline.
+
+    Since audit 2026-08-12 (INT-5) each line is TICKER<TAB>ADDED_ON<TAB>REASON
+    under a `#` header — the bare-ticker form carried no date, which made a
+    re-validation cadence impossible and turned the lists into a one-way
+    ratchet. `load()` still returns a plain set, so callers are unaffected.
+    """
     path = tmp_path / "zacks_blacklist.txt"
     mgr = BlacklistManager(path, label="Zacks skip list")
     mgr.save({"SPY", "QQQ", "ARKK"})
-    # Exact on-disk format: one ticker per line, sorted, trailing newline
-    assert path.read_text(encoding="utf-8") == "ARKK\nQQQ\nSPY\n"
+    body = [ln for ln in path.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.startswith("#")]
+    assert [ln.split("\t")[0] for ln in body] == ["ARKK", "QQQ", "SPY"]
+    today = date.today().isoformat()
+    assert all(ln.split("\t")[1] == today for ln in body)
     assert BlacklistManager(path).load() == {"ARKK", "QQQ", "SPY"}
+
+
+def test_lines_load_accepts_legacy_bare_format(tmp_path):
+    """A pre-INT-5 file of bare tickers must still load — the upgrade must not
+    silently empty three skip lists totalling ~26k entries."""
+    path = tmp_path / "legacy.txt"
+    path.write_text("ARKK\nQQQ\nSPY\n", encoding="utf-8")
+    assert BlacklistManager(path).load() == {"ARKK", "QQQ", "SPY"}
+    # Legacy entries carry no date, so re-validation treats them as eligible.
+    assert BlacklistManager(path).load_entries()["SPY"] == (None, "")
+    assert BlacklistManager(path).stale_entries(90) == {"ARKK", "QQQ", "SPY"}
+
+
+def test_lines_save_preserves_existing_added_on(tmp_path):
+    """A plain set-based save must not reset the age of entries already on
+    disk — otherwise every save would push the re-check horizon out forever."""
+    path = tmp_path / "skip.txt"
+    old = date.today() - timedelta(days=200)
+    BlacklistManager(path).save_entries({"OLD": (old, "empty")})
+    BlacklistManager(path).save({"OLD", "NEW"})
+    entries = BlacklistManager(path).load_entries()
+    assert entries["OLD"] == (old, "empty")
+    assert entries["NEW"][0] == date.today()
+    assert BlacklistManager(path).stale_entries(90, reasons={"empty"}) == {"OLD"}
 
 
 def test_lines_load_skips_comments_and_splits_commas(tmp_path):
@@ -100,21 +139,28 @@ def test_lines_load_skips_comments_and_splits_commas(tmp_path):
     assert BlacklistManager(path).load() == {"SPY", "QQQ", "ARKK"}
 
 
-def test_lines_save_strips_embedded_newlines_and_blanks(tmp_path):
-    """Newline-injection guard: a crafted symbol with embedded CR/LF
-    can't create phantom entries on the next line; whitespace-only
-    tickers are dropped entirely."""
+def test_lines_save_strips_embedded_newlines_tabs_and_blanks(tmp_path):
+    """Injection guard: a crafted symbol with embedded CR/LF can't create
+    phantom entries on the next line, and — since the INT-5 format is
+    tab-delimited — an embedded TAB can't forge the ADDED_ON / REASON columns.
+    Whitespace-only tickers are dropped entirely."""
     path = tmp_path / "skip.txt"
-    BlacklistManager(path).save({"AB\nCD", "OK\r", "  ", ""})
-    assert path.read_text(encoding="utf-8") == "ABCD\nOK\n"
+    BlacklistManager(path).save({"AB\nCD", "OK\r", "EV\tIL", "  ", ""})
+    body = [ln for ln in path.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.startswith("#")]
+    assert [ln.split("\t")[0] for ln in body] == ["ABCD", "EVIL", "OK"]
+    assert all(len(ln.split("\t")) == 3 for ln in body)
+    assert BlacklistManager(path).load() == {"ABCD", "EVIL", "OK"}
 
 
-def test_lines_save_empty_set_writes_lone_newline(tmp_path):
+def test_lines_save_empty_set_round_trips_empty(tmp_path):
+    """An empty save must not leave anything the loader reads back as an
+    entry — the header lines are comments and carry no ticker."""
     path = tmp_path / "skip.txt"
     mgr = BlacklistManager(path)
     mgr.save(set())
-    assert path.read_text(encoding="utf-8") == "\n"
     assert mgr.load() == set()
+    assert mgr.load_entries() == {}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -190,9 +236,13 @@ def test_delegate_finviz_blacklist_round_trip(tmp_path):
     inst1._FINVIZ_BLACKLIST_FILE = tmp_path / "finviz_blacklist.txt"
     inst1._finviz_blacklist = {"SPY", "QQQ"}
     inst1._save_finviz_blacklist()
-    # line-per-ticker format preserved on disk
-    assert (tmp_path / "finviz_blacklist.txt").read_text(
-        encoding="utf-8") == "QQQ\nSPY\n"
+    # One entry per line, sorted — TICKER<TAB>ADDED_ON<TAB>REASON since INT-5.
+    # Entries with no recorded fill reason are stamped "manual": they came from
+    # the editor dialog, not from an automated skip.
+    body = [ln for ln in (tmp_path / "finviz_blacklist.txt").read_text(
+        encoding="utf-8").splitlines() if ln.strip() and not ln.startswith("#")]
+    assert [ln.split("\t")[0] for ln in body] == ["QQQ", "SPY"]
+    assert all(ln.split("\t")[2] == "manual" for ln in body)
 
     inst2 = _bare_main_window()
     inst2._FINVIZ_BLACKLIST_FILE = tmp_path / "finviz_blacklist.txt"

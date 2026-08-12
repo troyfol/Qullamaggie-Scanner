@@ -195,6 +195,29 @@ def sanitize_eps_artifacts(df: pd.DataFrame) -> pd.DataFrame:
 # Load / save
 # ──────────────────────────────────────────────────────────────────────
 
+# Read-retry budget for the history parquet. Audit 2026-08-12 (INT-1): 2
+# attempts 0.2 s apart could not ride out an antivirus scan of an 8 MB file.
+_READ_ATTEMPTS = 3
+_READ_BACKOFF_SEC = 0.4
+
+# Set by load_earnings_history(): True when the file EXISTS but could not be
+# read. Read via history_read_failed() immediately after a load. Not a lock —
+# every writer already holds HISTORY_WRITE_LOCK across its load+save pair, so
+# the flag cannot be clobbered between the two by another writer.
+_LAST_READ_FAILED = False
+
+
+def history_read_failed() -> bool:
+    """True if the most recent ``load_earnings_history()`` failed to READ an
+    existing file (as opposed to finding no file at all).
+
+    Audit 2026-08-12 (INT-1): guards the flush paths against replacing the whole
+    store with a partial buffer after a transient read error. Mirrors the guard
+    that already existed in ``earnings_cache._merge_and_save``.
+    """
+    return _LAST_READ_FAILED
+
+
 def load_earnings_history() -> Optional[pd.DataFrame]:
     """Read earnings_history.parquet. Returns None if file missing.
     Datetime columns are normalized to tz-naive so consumer code can mix
@@ -207,24 +230,38 @@ def load_earnings_history() -> Optional[pd.DataFrame]:
     path = config.EARNINGS_HISTORY_PARQUET
     if not path.exists():
         return None
-    # Retry once on a read failure: the common cause on Windows is a transient
-    # sharing-violation while another thread's os.replace swaps the file in. A
-    # genuinely corrupt file still falls through to None after the retry — note
-    # callers then treat None as "no history" and can re-queue a bulk fill, so
-    # the retry is what prevents a momentary lock from looking like data loss.
+    # Retry on a read failure: the common cause on Windows is a transient
+    # sharing-violation while another thread's os.replace swaps the file in, or
+    # an antivirus / backup / cloud-sync agent holding the 8 MB file.
+    #
+    # Audit 2026-08-12 (INT-1, CRITICAL): returning None here is ambiguous —
+    # it previously meant BOTH "no store yet" and "store exists but I could not
+    # read it", and the flush helpers treated the latter as the former and
+    # overwrote the whole store with the current flush buffer (measured: 100%
+    # of a 4,003-row store destroyed by one simulated sharing violation).
+    # ``history_read_failed()`` now lets callers tell the two apart, and the
+    # retry budget is wider (3 attempts, growing backoff) because 0.4 s total
+    # was not enough to ride out a real AV scan.
+    global _LAST_READ_FAILED
     df = None
     last_exc = None
-    for attempt in range(2):
+    for attempt in range(_READ_ATTEMPTS):
         try:
             df = pd.read_parquet(path)
             break
-        except Exception as exc:  # noqa: BLE001 - logged after the retry
+        except Exception as exc:  # noqa: BLE001 - logged after the retries
             last_exc = exc
-            if attempt == 0:
-                time.sleep(0.2)
+            if attempt < _READ_ATTEMPTS - 1:
+                time.sleep(_READ_BACKOFF_SEC * (attempt + 1))
     if df is None:
-        log.warning("Failed to read earnings_history.parquet: %s", last_exc)
+        _LAST_READ_FAILED = True
+        log.error(
+            "Failed to read earnings_history.parquet after %d attempts: %s "
+            "(callers MUST NOT treat this as an empty store)",
+            _READ_ATTEMPTS, last_exc,
+        )
         return None
+    _LAST_READ_FAILED = False
 
     for col in ("period_ending", "report_date", "updated_at"):
         if col in df.columns and pd.api.types.is_datetime64_any_dtype(df[col]):
@@ -272,7 +309,30 @@ def save_earnings_history(
             refresh the report-only cross-source disagreement CSV just
             before deduping (see ``report_cross_source_disagreements``).
     """
-    if df is None or df.empty:
+    if df is None:
+        return
+    if df.empty:
+        # Audit 2026-08-12 (INT-17): an empty frame used to be an
+        # unconditional no-op, so a legitimate repair that empties the store
+        # (an integrity auto-fix that drops every row, a prune that removes
+        # the last ticker) could not be PERSISTED — the next load returned the
+        # stale pre-repair file and the fix appeared to have been ignored.
+        # Writing an empty store is only allowed when one already exists;
+        # `None` still means "nothing to do", and a first-ever save of an
+        # empty frame still creates no file.
+        if not config.EARNINGS_HISTORY_PARQUET.exists():
+            return
+        log.warning(
+            "Persisting an EMPTY earnings_history.parquet — every row was "
+            "removed by the caller (repair or prune), not by a read failure"
+        )
+        empty = pd.DataFrame(columns=COLUMNS)
+        with HISTORY_WRITE_LOCK:
+            _rotate_history_backup()
+            config.atomic_write_parquet(
+                empty, config.EARNINGS_HISTORY_PARQUET,
+                engine="pyarrow", index=False,
+            )
         return
     if dedup is None:
         dedup = sort
@@ -287,7 +347,13 @@ def save_earnings_history(
     # cutoff is evaluated once at fetch time, so a row fetched at the
     # boundary lingers as the daily-advancing cutoff overtakes it; re-pruning
     # here keeps the on-disk window a clean trailing EARNINGS_HISTORY_YEARS.
-    if "period_ending" in out.columns and not out.empty:
+    #
+    # Audit 2026-08-12 (EFF-7): now actually gated on `sort`, matching what
+    # this comment always claimed. It previously ran on EVERY per-flush write
+    # too — ~600 extra full-frame date coercions and filters per universe fill,
+    # for a boundary case that only matters on the canonical write. Rows that
+    # age out mid-fill are pruned by the sorted save at _finalize_fill.
+    if sort and "period_ending" in out.columns and not out.empty:
         _cap_cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(
             years=config.EARNINGS_HISTORY_YEARS,
         )
@@ -330,9 +396,65 @@ def save_earnings_history(
     for col in ("source", "report_time"):
         if col in out.columns:
             out[col] = out[col].astype("category")
+    # Audit 2026-08-12 (INT-6): snapshot the current file before a CANONICAL
+    # write. There was no automatic backup anywhere in the project — the .bak_*
+    # files in scanner_data/ were all made by hand — so any write-path defect
+    # was unrecoverable. Canonical (sorted) saves happen a handful of times per
+    # fill, not per flush, so the cost is a few 8 MB copies rather than 600.
+    if sort:
+        _rotate_history_backup()
     config.atomic_write_parquet(
         out, config.EARNINGS_HISTORY_PARQUET, engine="pyarrow", index=False,
     )
+
+
+_BACKUP_SUFFIX = ".autobak"
+
+
+def history_backup_paths() -> list[Path]:
+    """Existing rolling backups, newest first."""
+    d = config.EARNINGS_HISTORY_PARQUET.parent
+    stem = config.EARNINGS_HISTORY_PARQUET.name
+    found = sorted(
+        d.glob(f"{stem}{_BACKUP_SUFFIX}*"),
+        key=lambda p: p.name,
+    )
+    return list(reversed(found))
+
+
+def _rotate_history_backup() -> None:
+    """Copy the live history parquet aside, keeping the newest N snapshots.
+
+    Audit 2026-08-12 (INT-6). Named ``<file>.autobak<N>`` so the rotation is
+    obvious on disk and distinct from the hand-made ``.bak_*`` files. Never
+    raises: a backup failure must not block the save it protects — losing a
+    snapshot is strictly better than refusing to persist new data.
+    """
+    src = config.EARNINGS_HISTORY_PARQUET
+    if not src.exists():
+        return
+    keep = max(1, int(getattr(config, "HISTORY_BACKUP_COUNT", 3)))
+    try:
+        import shutil
+
+        # Shift older snapshots down: autobak2 → autobak3, autobak1 → autobak2.
+        for n in range(keep - 1, 0, -1):
+            older = src.with_name(f"{src.name}{_BACKUP_SUFFIX}{n}")
+            newer = src.with_name(f"{src.name}{_BACKUP_SUFFIX}{n + 1}")
+            if older.exists():
+                if newer.exists():
+                    newer.unlink()
+                older.rename(newer)
+        shutil.copy2(src, src.with_name(f"{src.name}{_BACKUP_SUFFIX}1"))
+        # Drop anything beyond the retention window (e.g. after keep shrank).
+        for p in config.EARNINGS_HISTORY_PARQUET.parent.glob(
+            f"{src.name}{_BACKUP_SUFFIX}*"
+        ):
+            tail = p.name.rsplit(_BACKUP_SUFFIX, 1)[-1]
+            if tail.isdigit() and int(tail) > keep:
+                p.unlink()
+    except Exception as exc:  # noqa: BLE001 — never block the save
+        log.warning("History backup rotation failed (continuing): %s", exc)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -762,10 +884,15 @@ def compute_yoy_columns(history_df: Optional[pd.DataFrame]) -> pd.DataFrame:
 
     def _yoy(cur_v, prior_v, min_base):
         ok = (cur_v.notna() & prior_v.notna() & (prior_v.abs() >= min_base))
-        return pd.Series(
+        out = pd.Series(
             np.where(ok, (cur_v - prior_v) / prior_v.abs() * 100.0, np.nan),
             index=df.index, dtype="float64",
         )
+        # Audit 2026-08-12 (INT-16): the min_base floor bounds the DIVISOR but
+        # not the RATIO — a base just above the floor still produced five-figure
+        # percentages (live max 120,240%). Null anything beyond the sanity bound
+        # rather than persisting a meaningless number that then drives filters.
+        return out.where(out.abs() <= config.YOY_SANITY_MAX_PCT)
 
     df["yoy_eps_pct"] = _yoy(merged["cur_eps"], merged["prior_eps"],
                              config.MIN_YOY_EPS_BASE)
@@ -1035,6 +1162,19 @@ def verify_integrity(
      10. calendar_quarter_overlap - finnhub fiscal row collides with a
                                 fiscal-accurate source's calendar quarter
                                 → report-only (dropped by dedupe_history)
+     11. report_before_period_end - report_date < period_ending
+                                (impossible) → null report_date, set proxy
+     12. future_report_date  - report_date in the future on a row that
+                                already has an actual → null report_date,
+                                set proxy
+     13. absurd_yoy          - |yoy_*_pct| beyond YOY_SANITY_MAX_PCT
+                                → null the offending YoY column(s)
+     14. placeholder_no_actual - past report_date with no reported EPS
+                                → drop the row so the gap fill re-queues it
+
+    Checks 11-14 were added by the 2026-08-12 audit (INT-6 / INT-16): the live
+    store passed all ten original checks while holding 3,500 placeholder rows
+    and 52 chronologically impossible dates.
     """
     findings: list[IntegrityFinding] = []
 
@@ -1270,6 +1410,107 @@ def verify_integrity(
             ),
         ))
 
+    # ── Checks 11-14, added by the 2026-08-12 audit (INT-6 / INT-16) ──────
+    # verify_integrity reported the live 148,218-row store as perfectly clean
+    # while it held 3,500 placeholder rows, 29 chronologically impossible dates,
+    # 23 future report dates and 28 absurd YoY ratios. None of those classes was
+    # checked, so the one tool that could surface drift said "healthy".
+    _rd = (pd.to_datetime(history_df["report_date"], errors="coerce")
+           if "report_date" in history_df.columns else None)
+    _pe = (pd.to_datetime(history_df["period_ending"], errors="coerce")
+           if "period_ending" in history_df.columns else None)
+
+    # 11 — report_date earlier than period_ending (a company cannot report a
+    # quarter before that quarter has ended).
+    if _rd is not None and _pe is not None:
+        impossible = _rd.notna() & _pe.notna() & (_rd < _pe)
+        if impossible.any():
+            findings.append(IntegrityFinding(
+                check="report_before_period_end",
+                severity="error",
+                affected_rows=int(impossible.sum()),
+                sample=_sample_rows(history_df.loc[impossible]),
+                auto_fixable=True,
+                description=(
+                    "report_date precedes period_ending — chronologically "
+                    "impossible, so the announcement date is wrong. Auto-fix "
+                    "nulls report_date and marks the row as a proxy date; "
+                    "period_ending, EPS and revenue are preserved."
+                ),
+            ))
+
+    # 12 — report_date in the future while the row carries an actual.
+    if _rd is not None:
+        today = pd.Timestamp.today().normalize()
+        future = _rd.notna() & (_rd > today)
+        if "reported_eps" in history_df.columns:
+            future &= pd.to_numeric(
+                history_df["reported_eps"], errors="coerce",
+            ).notna()
+        if future.any():
+            findings.append(IntegrityFinding(
+                check="future_report_date",
+                severity="warning",
+                affected_rows=int(future.sum()),
+                sample=_sample_rows(history_df.loc[future]),
+                auto_fixable=True,
+                description=(
+                    "report_date is in the future on a row that already has a "
+                    "reported EPS. Auto-fix nulls report_date and marks the "
+                    "row as a proxy date; the figures are preserved."
+                ),
+            ))
+
+    # 13 — absurd YoY ratios. The MIN_YOY_*_BASE floors bound the DIVISOR but
+    # not the resulting ratio, so a tiny base still yields five-figure
+    # percentages (live max: 120,240%).
+    yoy_cols = [c for c in ("yoy_eps_pct", "yoy_rev_pct")
+                if c in history_df.columns]
+    if yoy_cols:
+        absurd = pd.Series(False, index=history_df.index)
+        for c in yoy_cols:
+            absurd |= (pd.to_numeric(history_df[c], errors="coerce").abs()
+                       > config.YOY_SANITY_MAX_PCT)
+        if absurd.any():
+            findings.append(IntegrityFinding(
+                check="absurd_yoy",
+                severity="warning",
+                affected_rows=int(absurd.sum()),
+                sample=_sample_rows(history_df.loc[absurd]),
+                auto_fixable=True,
+                description=(
+                    f"YoY percentage beyond ±{config.YOY_SANITY_MAX_PCT:,.0f}% "
+                    "— a near-zero prior-year base, not real growth. Auto-fix "
+                    "nulls the offending YoY column(s); the underlying EPS and "
+                    "revenue are preserved."
+                ),
+            ))
+
+    # 14 — placeholder rows: a PAST report_date with no reported EPS. These
+    # occupy their (ticker, period_ending) slot and, before INT-7, suppressed
+    # the gap fill that would have replaced them.
+    if _rd is not None and "reported_eps" in history_df.columns:
+        today = pd.Timestamp.today().normalize()
+        placeholder = (
+            _rd.notna() & (_rd <= today)
+            & pd.to_numeric(history_df["reported_eps"], errors="coerce").isna()
+        )
+        if placeholder.any():
+            findings.append(IntegrityFinding(
+                check="placeholder_no_actual",
+                severity="warning",
+                affected_rows=int(placeholder.sum()),
+                sample=_sample_rows(history_df.loc[placeholder]),
+                auto_fixable=True,
+                description=(
+                    "Row has a past report_date but no reported EPS — a "
+                    "scheduled-quarter placeholder that should have been "
+                    "replaced by an actual. Auto-fix drops these rows so the "
+                    "gap fill re-queues the ticker; the raw audit layer keeps "
+                    "the original response."
+                ),
+            ))
+
     return findings
 
 
@@ -1359,6 +1600,64 @@ def fix_integrity_issues(
                 f"total)"
             )
 
+    # ── Fixers for checks 11-14 (2026-08-12 audit) ────────────────────────
+    # The date repairs null report_date and flag the row as a proxy rather than
+    # dropping it: period_ending, EPS and revenue are still good, and
+    # report_date_proxy is the codebase's existing signal for "this
+    # announcement date is not trustworthy" (the reconciler already excludes
+    # proxy rows from next_earnings).
+    _rd_fix = pd.to_datetime(df["report_date"], errors="coerce") \
+        if "report_date" in df.columns else None
+    _pe_fix = pd.to_datetime(df["period_ending"], errors="coerce") \
+        if "period_ending" in df.columns else None
+
+    if "report_before_period_end" in findings_by_check and _rd_fix is not None:
+        mask = _rd_fix.notna() & _pe_fix.notna() & (_rd_fix < _pe_fix)
+        df.loc[mask, "report_date"] = pd.NaT
+        if "report_date_proxy" in df.columns:
+            df.loc[mask, "report_date_proxy"] = True
+        msgs.append(
+            f"report_before_period_end: nulled report_date on "
+            f"{int(mask.sum())} impossible row(s) and flagged them as proxy"
+        )
+
+    if "future_report_date" in findings_by_check and _rd_fix is not None:
+        today = pd.Timestamp.today().normalize()
+        mask = _rd_fix.notna() & (_rd_fix > today)
+        if "reported_eps" in df.columns:
+            mask &= pd.to_numeric(df["reported_eps"], errors="coerce").notna()
+        df.loc[mask, "report_date"] = pd.NaT
+        if "report_date_proxy" in df.columns:
+            df.loc[mask, "report_date_proxy"] = True
+        msgs.append(
+            f"future_report_date: nulled report_date on {int(mask.sum())} "
+            f"row(s) dated in the future and flagged them as proxy"
+        )
+
+    if "absurd_yoy" in findings_by_check:
+        nulled = 0
+        for c in ("yoy_eps_pct", "yoy_rev_pct"):
+            if c not in df.columns:
+                continue
+            m = (pd.to_numeric(df[c], errors="coerce").abs()
+                 > config.YOY_SANITY_MAX_PCT)
+            nulled += int(m.sum())
+            df.loc[m, c] = float("nan")
+        msgs.append(f"absurd_yoy: nulled {nulled} out-of-range YoY value(s)")
+
+    if "placeholder_no_actual" in findings_by_check and _rd_fix is not None:
+        today = pd.Timestamp.today().normalize()
+        before = len(df)
+        keep = ~(
+            _rd_fix.notna() & (_rd_fix <= today)
+            & pd.to_numeric(df["reported_eps"], errors="coerce").isna()
+        )
+        df = df.loc[keep]
+        msgs.append(
+            f"placeholder_no_actual: dropped {before - len(df)} "
+            f"no-actual row(s); the gap fill will re-queue those tickers"
+        )
+
     # Surface non-fixable findings so the caller can show them in the UI.
     for f in findings:
         if not f.auto_fixable:
@@ -1427,7 +1726,7 @@ def _flush_pending_to_disk(
     *,
     is_final: bool = False,
     source: str = "zacks",
-) -> None:
+) -> bool:
     """Merge `pending` (ticker → list of row dicts) into the on-disk
     earnings_history.parquet — replacing only the **(ticker, source)**
     rows for tickers in `pending`. Phase 2 changed this from "replace
@@ -1448,9 +1747,13 @@ def _flush_pending_to_disk(
         source: "zacks" (default — Zacks fill is the only caller in this
             module). The Finnhub fill in finnhub_fill.py has its own
             flush helper; both honor the (ticker, source) soft-PK.
+
+    Returns True when the merge reached disk (or there was nothing to write),
+    False when it was DEFERRED because the store existed but was unreadable
+    (audit 2026-08-12, INT-1 — callers must not advance the checkpoint).
     """
     if not pending:
-        return
+        return True
 
     # Serialize the load → merge → save cycle across all fill workers
     # (Zacks / Finnhub). Without this, two concurrent flushes
@@ -1468,6 +1771,19 @@ def _flush_pending_to_disk(
         # nano-caps). Catches the $20-$100k band the absolute write-guard
         # misses, at the moment rows arrive.
         new_df = sanitize_eps_artifacts(new_df)
+
+        # Audit 2026-08-12 (INT-1, CRITICAL): never mistake "could not read the
+        # store" for "there is no store". Overwriting on a transient read error
+        # destroyed the entire history in testing. Defer instead — `pending` is
+        # not cleared during a run, so the next flush rewrites everything.
+        if existing is None and history_read_failed():
+            log.error(
+                "earnings_history.parquet unreadable — deferring merge of %d "
+                "row(s) for %d ticker(s) to avoid truncating the store; the "
+                "next flush will retry",
+                len(new_df), len(pending),
+            )
+            return False
 
         if existing is not None and not existing.empty:
             # Drop only the (ticker, source) rows we're replacing. Other-
@@ -1487,6 +1803,7 @@ def _flush_pending_to_disk(
             combined = new_df
 
         save_earnings_history(combined, sort=is_final)
+        return True
 
 
 def _finalize_fill(affected_tickers: list[str]) -> None:
@@ -1524,7 +1841,7 @@ def _fill_via_zacks(
     progress_cb=None,
     stop_flag: Optional[list[bool]] = None,
     delay_sec: float = 1.5,
-    flush_every: int = 25,
+    flush_every: int = config.FILL_FLUSH_EVERY,
     years: Optional[int] = None,
     label: str = "Zacks fill",
     consec_error_limit: int = 5,
@@ -1645,11 +1962,20 @@ def _fill_via_zacks(
                 # based). NaT period_ending is kept here — save_earnings_history
                 # drops it later, and the failure mode for an unparseable date
                 # shouldn't be a silent extra drop in this path.
+                # Audit 2026-08-12 (INT-7): also require a reported EPS, as the
+                # finviz builder already does. A zacks row for a
+                # scheduled-but-unreported quarter otherwise claims its
+                # (ticker, period_ending) slot with reported_eps=NaN and then
+                # suppresses the gap fill that would replace it (the refresh
+                # selector counts any row as coverage). The raw layer keeps the
+                # original response, so nothing is lost for replay.
                 pending[sym] = [
                     h for h in hist_rows
-                    if pd.isna(pd.to_datetime(h.get("period_ending"),
-                                              errors="coerce"))
-                    or pd.to_datetime(h["period_ending"]) >= cutoff
+                    if h.get("reported_eps") is not None
+                    and not pd.isna(h.get("reported_eps"))
+                    and (pd.isna(pd.to_datetime(h.get("period_ending"),
+                                                errors="coerce"))
+                         or pd.to_datetime(h["period_ending"]) >= cutoff)
                 ]
                 # Raw capture: original Zacks row dicts plus ticker (FULL,
                 # uncapped — preserves replay depth). earnings_raw stamps
@@ -1687,14 +2013,25 @@ def _fill_via_zacks(
             if len(pending) >= flush_every:
                 # Audit L8: skip the per-flush sort; one final sorted
                 # save fires in `_finalize_fill` after the loop exits.
-                _flush_pending_to_disk(pending, affected_total)
-                _flush_raw()
-                log.info(
-                    "%s: flushed %d ticker(s) (%d/%d processed, "
-                    "%d filled, %d errors so far)",
-                    label, len(pending), i + 1, total, filled, errors,
-                )
-                pending = {}
+                #
+                # Audit 2026-08-12 (INT-1): only CLEAR `pending` when the flush
+                # actually reached disk. A deferred flush (unreadable store)
+                # followed by `pending = {}` would silently discard the rows —
+                # keeping them means the next flush retries with everything.
+                if _flush_pending_to_disk(pending, affected_total) is not False:
+                    _flush_raw()
+                    log.info(
+                        "%s: flushed %d ticker(s) (%d/%d processed, "
+                        "%d filled, %d errors so far)",
+                        label, len(pending), i + 1, total, filled, errors,
+                    )
+                    pending = {}
+                else:
+                    log.warning(
+                        "%s: retaining %d pending ticker(s) in memory — the "
+                        "history write deferred and will be retried",
+                        label, len(pending),
+                    )
 
             if (i + 1) % 200 == 0:
                 log.info("%s: %d/%d processed (%d filled, %d errors)",
@@ -1756,7 +2093,7 @@ def bulk_fill_zacks(
     progress_cb=None,
     stop_flag: Optional[list[bool]] = None,
     delay_sec: float = 1.5,
-    flush_every: int = 25,
+    flush_every: int = config.FILL_FLUSH_EVERY,
     years: Optional[int] = None,  # None → config.EARNINGS_HISTORY_YEARS at call time
     on_block_callback=None,
     consec_error_limit: int = 5,
@@ -1791,7 +2128,7 @@ def targeted_fill_zacks(
     progress_cb=None,
     stop_flag: Optional[list[bool]] = None,
     delay_sec: float = 1.5,
-    flush_every: int = 25,
+    flush_every: int = config.FILL_FLUSH_EVERY,
     years: Optional[int] = None,  # None → config.EARNINGS_HISTORY_YEARS at call time
     on_block_callback=None,
     consec_error_limit: int = 5,
@@ -1907,13 +2244,26 @@ def find_smart_refresh_candidates(
     have_history: set[str] = set()
     if history_df is not None and not history_df.empty:
         h = history_df
-        have_history = set(h["ticker"].astype(str).unique())
-        rd = pd.to_datetime(h["report_date"], errors="coerce")
-        past = h.loc[rd <= today]
+        # Audit 2026-08-12 (INT-7): coverage means a row with an ACTUAL, not
+        # merely a row. Placeholder rows (reported_eps NaN) previously counted
+        # toward both `have_history` (suppressing Rule A) and `latest_capture`
+        # (making the quarter look captured, suppressing the uncaptured-fresh
+        # retry) — so a placeholder blocked its own repair indefinitely.
+        if "reported_eps" in h.columns:
+            real = h.loc[pd.to_numeric(h["reported_eps"], errors="coerce").notna()]
+        else:
+            real = h
+        have_history = set(real["ticker"].astype(str).unique())
+        rd = pd.to_datetime(real["report_date"], errors="coerce")
+        past = real.loc[rd <= today]
         if not past.empty:
             latest_capture = (
                 past.groupby("ticker")["report_date"].max().to_dict()
             )
+        # The re-poll guard still uses EVERY row's updated_at: we did fetch
+        # those tickers recently, so the guard must keep pacing them even when
+        # the fetch produced only placeholders. Otherwise a ticker that
+        # genuinely has no actuals yet would be re-polled on every pass.
         if "updated_at" in h.columns:
             latest_fetch = (
                 h.groupby("ticker")["updated_at"].max().to_dict()
@@ -2025,7 +2375,7 @@ def migrate_to_gap_fill_dedup(*, force: bool = False) -> tuple[int, int]:
         try:
             config.atomic_write_text(flag_path, "ok\n")
         except OSError as exc:
-            log.debug("migration flag write failed: %s", exc)
+            log.warning("migration flag write failed: %s", exc)
         return (0, 0)
 
     before = len(df)
@@ -2041,7 +2391,7 @@ def migrate_to_gap_fill_dedup(*, force: bool = False) -> tuple[int, int]:
     try:
         config.atomic_write_text(flag_path, "ok\n")
     except OSError as exc:
-        log.debug("migration flag write failed: %s", exc)
+        log.warning("migration flag write failed: %s", exc)
     return (before, after)
 
 
@@ -2088,7 +2438,7 @@ def migrate_calendar_dedup(*, force: bool = False) -> tuple[int, int]:
         try:
             config.atomic_write_text(flag_path, "ok\n")
         except OSError as exc:
-            log.debug("calendar_dedup flag write failed: %s", exc)
+            log.warning("calendar_dedup flag write failed: %s", exc)
         return (0, 0)
 
     before = len(df)
@@ -2107,7 +2457,7 @@ def migrate_calendar_dedup(*, force: bool = False) -> tuple[int, int]:
     try:
         config.atomic_write_text(flag_path, "ok\n")
     except OSError as exc:
-        log.debug("calendar_dedup flag write failed: %s", exc)
+        log.warning("calendar_dedup flag write failed: %s", exc)
     return (before, after)
 
 
@@ -2158,10 +2508,17 @@ def migrate_backfill_finviz_history_from_raw(*, force: bool = False) -> tuple[in
         log.warning("finviz_backfill: raw read failed: %s", exc)
         raw = None
     if raw is None or raw.empty:
-        try:
-            config.atomic_write_text(flag_path, "ok\n")
-        except OSError as exc:
-            log.debug("finviz_backfill flag write failed: %s", exc)
+        # Audit 2026-08-12 (INT-9): do NOT stamp the sentinel here. Stamping on
+        # the no-data path permanently consumed a ONE-SHOT migration whenever it
+        # ran against an empty/unreadable data dir — which already happened: the
+        # source tree carried all four sentinels and no history parquet at all.
+        # Leaving the sentinel unset lets a later launch (with data present, or
+        # with the raw layer repopulated) still do the work. Re-running when
+        # there is genuinely nothing to do costs one cheap read.
+        log.info(
+            "finviz_backfill: no raw finviz captures available — leaving the "
+            "migration unstamped so it can run once data is present"
+        )
         return (before, before)
 
     # Latest fetch wins per (symbol, fiscal_end_date) so a re-fetched
@@ -2213,10 +2570,14 @@ def migrate_backfill_finviz_history_from_raw(*, force: bool = False) -> tuple[in
         rebuilt.append(hd)
 
     if not rebuilt:
+        # Audit 2026-08-12 (INT-9): raw captures existed but none converted, so
+        # there was nothing to recover. Unlike the no-raw case above this IS a
+        # real answer (the converter saw the data and rejected it), so stamping
+        # is legitimate — a re-run would reach the same conclusion.
         try:
             config.atomic_write_text(flag_path, "ok\n")
         except OSError as exc:
-            log.debug("finviz_backfill flag write failed: %s", exc)
+            log.warning("finviz_backfill flag write failed: %s", exc)
         return (before, before)
 
     new_df = pd.DataFrame(rebuilt, columns=COLUMNS)
@@ -2296,10 +2657,13 @@ def migrate_sanitize_absurd_eps(*, force: bool = False) -> tuple[int, int]:
         return (0, 0)
     df = load_earnings_history()
     if df is None or df.empty:
-        try:
-            config.atomic_write_text(flag_path, "ok\n")
-        except OSError as exc:
-            log.debug("eps_sanitize flag write failed: %s", exc)
+        # Audit 2026-08-12 (INT-9): do NOT stamp on the no-data path — that
+        # permanently consumes a one-shot migration against an empty or
+        # unreadable data dir (which has already happened once in this project).
+        log.info(
+            "eps_sanitize: no history to sanitize — leaving the migration "
+            "unstamped so it can run once data is present"
+        )
         return (0, 0)
 
     # Pre-screen candidate tickers (any |reported_eps| above a low bar) so we
@@ -2324,5 +2688,5 @@ def migrate_sanitize_absurd_eps(*, force: bool = False) -> tuple[int, int]:
     try:
         config.atomic_write_text(flag_path, "ok\n")
     except OSError as exc:
-        log.debug("eps_sanitize flag write failed: %s", exc)
+        log.warning("eps_sanitize flag write failed: %s", exc)
     return (n, len(cand_tickers))

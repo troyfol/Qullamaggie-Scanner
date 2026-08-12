@@ -301,11 +301,14 @@ def _flush_pending_to_disk(
     pending: dict[str, list[dict]],
     *,
     is_final: bool = False,
-) -> None:
+) -> bool:
     """Merge ``pending`` (ticker → finviz rows) into
     earnings_history.parquet, replacing only the (ticker, source=finviz)
-    rows for those tickers. Zacks / Finnhub rows are preserved."""
-    fill_framework.flush_pending_to_disk(
+    rows for those tickers. Zacks / Finnhub rows are preserved.
+
+    Returns False if the merge was deferred because the store was unreadable
+    (audit 2026-08-12, INT-1); the caller must not advance the checkpoint."""
+    return fill_framework.flush_pending_to_disk(
         pending, source="finviz", is_final=is_final,
     )
 
@@ -361,7 +364,7 @@ def _fill_via_finviz(
     *,
     progress_cb=None,
     stop_flag: Optional[list[bool]] = None,
-    flush_every: int = 25,
+    flush_every: int = config.FILL_FLUSH_EVERY,
     label: str = "Finviz fill",
     on_block_callback=None,
     on_empty_identified=None,
@@ -488,7 +491,7 @@ def gap_fill_finviz(
     *,
     progress_cb=None,
     stop_flag: Optional[list[bool]] = None,
-    flush_every: int = 25,
+    flush_every: int = config.FILL_FLUSH_EVERY,
     on_block_callback=None,
     on_empty_identified=None,
     failed_cb=None,

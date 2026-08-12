@@ -35,8 +35,9 @@ This README is written to be self-sufficient for any developer (human or LLM) wh
 17. [Storage layout](#storage-layout)
 18. [Testing](#testing)
 19. [Build & deploy](#build--deploy)
-20. [Critical invariants](#critical-invariants)
-21. [Disclaimer](#disclaimer)
+20. [What changed in v5.4.0 (audit remediation, 2026-08-12)](#what-changed-in-v540-audit-remediation-2026-08-12)
+21. [Critical invariants](#critical-invariants)
+22. [Disclaimer](#disclaimer)
 
 
 **Not financial advice.** This software is for informational and educational use only — see the full [Disclaimer](#disclaimer) at the bottom of this README before relying on any output.
@@ -2093,28 +2094,44 @@ Loader (`MainWindow._load_preset`) tolerates missing keys via `.get()` for forwa
 
 | Path | Type | Source | Purpose |
 |------|------|--------|---------|
-| `ohlcv/{TICKER}.parquet` | DataFrame | yfinance (or polygon if added) | Daily OHLCV cache, `OHLCV_HISTORY_YEARS` (default 5, Advanced-configurable) |
+| `ohlcv/{TICKER}.parquet` | DataFrame | yfinance (or polygon if added) | Daily OHLCV cache, `OHLCV_HISTORY_YEARS` (default 5, Advanced-configurable). A split **or a dividend** in an incremental pull re-anchors the full history (v5.4.0) — `auto_adjust=True` back-adjusts for both, so before this every ex-dividend date left a permanent price discontinuity inside the file |
 | `universe.csv` | CSV | NASDAQ FTP + GitHub + SEC | Ticker universe with metadata |
 | `sector_map.parquet` | DataFrame | Finnhub `/stock/profile2` (with FinanceDatabase + yfinance fallback) | ticker → (sector, sector_etf); 56-key SECTOR_ETF_MAP routes Finnhub sub-industries to SPDR ETFs |
-| `earnings_dates.parquet` | DataFrame | Reconcile output (`nasdaq > yahoo > finviz > zacks > finnhub` priority chain) | last/next earnings dates per ticker (1:1 with ticker) |
+| `earnings_dates.parquet` | DataFrame | Reconcile output (`nasdaq > yahoo > finviz > zacks > finnhub` priority chain) | last/next earnings dates per ticker (1:1 with ticker). Carries `last_source` / `next_source` — the IMMUTABLE per-position origins — alongside the compound, rewritten `source` label (v5.4.0) |
 | `earnings_history.parquet` | DataFrame | Finviz scrape + Zacks scraper + Finnhub `/stock/earnings` | Per-quarter EPS / revenue history (`EARNINGS_HISTORY_YEARS`, default 10); per-slot priority dedup (finviz > zacks > finnhub) |
-| `earnings_raw/{source}/<run_id>.parquet` | DataFrame | Each fill's raw response | Append-only audit/replay layer; pruned at startup if older than `RAW_RETENTION_DAYS` (30) |
+| `earnings_raw/{source}/<run_id>.parquet` | DataFrame | Each fill's raw response | Append-only audit/replay layer; pruned at startup per source — 30 d for the bulky finviz/zacks captures, 365 d for the small nasdaq/yahoo/finnhub calendar files (`RAW_RETENTION_DAYS` / `RAW_RETENTION_DAYS_BY_SOURCE`). Four destructive operations cite this layer as their recovery path, which a flat 30 d against a ten-year store did not deliver |
 | `earnings_disagreements.csv` | CSV | `report_cross_source_disagreements` (rewritten at every canonical history save) | Report-only cross-source EPS disagreement findings; always reflects the latest save |
 | `.finviz_bulk_checkpoint.json` / `.finnhub_bulk_checkpoint.json` | JSON | `fill_framework` | Resumable bulk-fill progress; cleared only on natural completion (preserved on stop / block-halt / spike-halt) |
 | `.gap_fill_dedup_v1.done` | sentinel | `migrate_to_gap_fill_dedup` | One-time gap-fill dedup migration marker |
 | `zacks_cookies.txt` | text | Firefox cookie capture | Imperva session tokens (DPAPI-encrypted at rest) |
 | `firefox_zacks_profile/` | Firefox profile | Firefox itself | Persistent profile (login, cookies) |
 | `blacklist.txt` | comma-separated text | User | Tickers to skip during refresh |
-| `zacks_blacklist.txt` | newline-separated text | Auto + user | Zacks-specific skip list (auto-added on FAIL_NOT_FOUND); one ticker per line |
-| `finnhub_blacklist.txt` | newline-separated text | Auto + user | Finnhub-specific skip list (auto-added on empty `/stock/earnings` response — typically ETFs); one ticker per line |
-| `finviz_blacklist.txt` | newline-separated text | Auto + user | Finviz-specific skip list (auto-added on definitive FAIL_EMPTY — uncovered tickers); one ticker per line |
+| `zacks_blacklist.txt` | `TICKER<TAB>ADDED_ON<TAB>REASON` | Auto + user | Zacks-specific skip list (auto-added on FAIL_NOT_FOUND) |
+| `finnhub_blacklist.txt` | `TICKER<TAB>ADDED_ON<TAB>REASON` | Auto + user | Finnhub-specific skip list (auto-added on empty `/stock/earnings` response — typically ETFs) |
+| `finviz_blacklist.txt` | `TICKER<TAB>ADDED_ON<TAB>REASON` | Auto + user | Finviz-specific skip list (auto-added on definitive FAIL_EMPTY — uncovered tickers) |
+
+**Skip-list format (v5.4.0).** The three per-source lists carry `ADDED_ON` and
+`REASON` under a `#` header instead of bare ticker lines. Before this they held
+no metadata at all, which made a re-check cadence impossible to implement — a
+single "empty" response (for finviz, a bare HTTP 404) excluded a ticker
+*forever*, including a brand-new IPO with no earnings yet or a symbol 404-ing
+during a site migration. Data → **Re-check Stale Skips…** now re-offers entries
+auto-added more than `SKIP_RECHECK_DAYS` (90) ago, capped at
+`SKIP_RECHECK_MAX` (500) per list; anything still uncovered is re-added on the
+next fill. Manual entries are never re-checked. The loader reads legacy
+bare-ticker files unchanged, so upgrading loses nothing.
+
+Relatedly, the universal `blacklist.txt` is no longer *unioned into* the finviz
+and finnhub lists. That merge was irreversible — removing a ticker from
+`blacklist.txt` left it skipped by those two sources permanently. It is now
+combined at read time only, matching what `zacks_blacklist.txt` always did.
 | `sec_contact.txt` | text | User (Settings → Set SEC Contact Email…) | Contact email SEC EDGAR requires in the request User-Agent for the universe download. Absent → SEC source skipped. Also settable via the `SEC_CONTACT_EMAIL` env var. |
 | `user_config.json` | JSON | Settings → Advanced… (`config.save_user_config`) | User overrides for `OHLCV_HISTORY_YEARS`, `EARNINGS_HISTORY_YEARS`, `REFERENCE_TICKERS`, `PREFETCH_OHLCV_AT_LAUNCH`. Clamped on load; corrupt file degrades to defaults. Gitignored with the rest of `scanner_data/` |
 | `presets/{name}.json` | JSON | User | Saved indicator + scan-window configs |
 | `scan_history.json` | JSON | `scan_history.py` (written on every scan completion) | F2 watchlist diffing: latest per-(preset-or-adhoc, period) ticker set + bounded rolling run summary (200 entries). Atomic writes; corrupt file degrades to "no prior run" |
 | `schedules.json` | JSON | `gui/scheduler.py` (Scans → Schedule… dialog + per-fire marker updates) | F3 scan scheduler entries ({label, preset, time, days, enabled} + last-fired date). Atomic writes; corrupt file degrades to "no schedules" |
 | `exports/scan_*.xlsx` | XLSX | Quick Export (Scans → Quick Export, or auto after a scheduled scan) | Timestamped no-dialog result snapshots — all periods, current visible columns. Dir created lazily |
-| `logs/*.log` | text | LogPanel | Per-session diagnostic logs (`scan_*`, `ohlcv_*`, `universe_*`, `bridge_*`) |
+| `logs/*.log` | text | LogPanel | Per-session diagnostic logs (`scan_*`, `ohlcv_*`, `universe_*`, `bridge_*`). Rotated at `LOG_MAX_BYTES` (5 MB, 2 backups) and pruned past `LOG_RETENTION_DAYS` (30) at launch — nothing bounded these before v5.4.0 |
 | `failed_tickers.log` | text | `ticker_universe` | Tickers dropped during yfinance universe validation |
 | `ftp_raw/` | text | NASDAQ FTP (when SAVE_FTP_RAW=True) | Raw downloads for debugging |
 
@@ -2134,7 +2151,7 @@ data directory.
 
 ## Testing
 
-Test suite at `trade_scanner_fh/tests/` — **1,238 tests, all passing** as of 2026-06. (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
+Test suite at `trade_scanner_fh/tests/` — **1,356 tests, all passing** as of 2026-08-12 (v5.4.0 added 107 covering the audit remediation). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
 
 ```bash
 cd c:/python/EDA_Project/Trade_Scanner_FH
@@ -2322,6 +2339,95 @@ Rebuilds MUST NOT touch:
 - Anything else under `dist/scanner_data/`
 
 The Firefox profile dir (`firefox_zacks_profile/`) was the one exception in earlier iterations when it accumulated session-restore data; the May 2026 user.js fix made deletion unnecessary (it's now safe to keep across rebuilds).
+
+---
+
+## What changed in v5.4.0 (audit remediation, 2026-08-12)
+
+A full robustness / efficiency / security audit produced 40 findings; all 40 are
+addressed in this release. The changes that alter observable behaviour:
+
+**Data integrity**
+
+- **A transient read failure can no longer destroy a store.** `load_earnings_history()`
+  returned `None` for two opposite conditions — "no store yet" and "store exists
+  but I couldn't read it" — and both flush helpers treated `None` as "no
+  history", writing the flush buffer as the *whole* store. One simulated
+  `OSError(32)` destroyed 4,001 of 4,003 rows. Both flush paths (and
+  `sector_map`, which had the identical bug with *no retry at all*) now defer
+  the merge and retry on the next flush. This ran ~600 times per universe fill.
+- **Dividends re-anchor the OHLCV cache.** `auto_adjust=True` back-adjusts for
+  dividends as well as splits, but only splits triggered a full re-download —
+  so every ex-dividend date left a permanent price discontinuity *inside* a
+  cached file (measured: 19 of 20 payers drifting >0.5%, worst 1.76%). The cache
+  self-heals: the next dividend per payer triggers one re-anchor, so no bulk
+  operation and no data deletion is needed.
+- **Reconcile no longer destroys forward earnings dates.** It read its own
+  inputs by exact `source ==` match out of the same row whose label it then
+  rewrote, so pass #2 NaT'd the finviz forward date — which exists nowhere
+  else. New immutable `last_source` / `next_source` columns make each pass
+  idempotent. *The ~1,500 dates already lost must be re-fetched; no code fix
+  recovers them.*
+- **`verify_integrity` gained four checks** (`report_before_period_end`,
+  `future_report_date`, `absurd_yoy`, `placeholder_no_actual`) and canonical
+  saves now leave rolling `.autobak` backups. There was no automatic backup
+  anywhere in the project before this.
+- **finnhub and zacks reject rows with no reported EPS**, matching finviz.
+  Placeholder rows occupied their quarter slot and suppressed the gap fill that
+  would have replaced them.
+- **Lowering a history-depth setting now asks first**, stating the row count it
+  will drop. Both depths silently deleted data on the next write.
+- **A re-sent OHLCV bar that contradicts the cache by >`PRICE_JUMP_PCT` is
+  rejected** in favour of the cached bar, rather than overwriting it forever.
+
+**Performance**
+
+- **Scans are ~2.8× faster on a cold cache** (measured on the live
+  14,300-ticker cache: 224 s → 81 s) — the per-ticker compute loop now runs on
+  a `SCAN_MAX_WORKERS` (6) thread pool. Output is bit-identical; set the value
+  to 1 to force the old serial path.
+- **The per-scan earnings setup is built once per run**, not once per
+  timeframe. A sequenced run rebuilt a 148k-row parquet up to 30 times.
+- **Cached OHLCV reads are column-projected, tz-naive and float32**
+  (10.4 ms → 1.9 ms per file), and the cache is keyed by symbol so a refresh
+  *replaces* rather than accretes (it previously grew toward a 1.6 GB ceiling).
+- **Fills flush every 200 tickers, not 25** — mainly to shrink the window in
+  which the truncation bug above could fire.
+
+**Security**
+
+- `scanner_data/` is ACL-restricted to the current user + SYSTEM on first run.
+- Ticker symbols are validated against an **allowlist** before reaching a URL
+  or a filesystem path; the old denylist let `AAPL/../../admin` through. The
+  pattern is validated against the live universe and keeps all 404 preferred /
+  rights symbols (`ABR$D`, `AIIA^`).
+- The NASDAQ symbol directory is fetched over **HTTPS**, falling back to the
+  historical anonymous FTP only on failure.
+- `TRADE_SCANNER_FH_DATA_DIR` is gated to non-frozen runs, rejects UNC paths,
+  and warns loudly when ignored.
+- The Finnhub key suffix is gone from the logs, and `token=` is redacted from
+  network-error messages rather than relying on the log level.
+- Cookie capture takes only the Imperva cookies it needs, and a DPAPI failure
+  is now a visible WARNING instead of silently writing plaintext.
+- Exports neutralise CSV/XLSX formula injection.
+- `pywin32` 304 → 312, `psutil` 5.9.5 → 7.2.2.
+
+**Deliberately not done** — recorded so they aren't re-litigated:
+
+- **Exe code signing** needs a certificate this environment cannot supply.
+  `disable_windowed_traceback=True` (the actionable half of that finding) is
+  set; `--onedir` remains a distribution-shape decision.
+- **Re-enabling Firefox updates / the pop-up blocker** on the dedicated Zacks
+  profile. Both prefs exist to keep an unattended Imperva challenge working,
+  and neither change can be validated without a live challenge.
+- **`ticker` as a category dtype.** Categorical groupers change `groupby`
+  semantics (`observed=False` yields a group per unused category) across
+  several call sites — a correctness risk well beyond the memory it saves.
+- **Proxy-based view filtering** in the results table. The existing full-model
+  reset is already heavily optimised (124,608 ms → 363 ms) and the remaining
+  win is structural; the table carries a lot of accumulated colour/re-entrancy
+  correctness. The low-risk half (pre-extracting rows instead of `df.iloc[r]`
+  per row) *is* done.
 
 ---
 

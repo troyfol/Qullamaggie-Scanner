@@ -17,15 +17,16 @@ import logging
 import re
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq_reader
 import yfinance as yf
 
 from . import config
@@ -64,6 +65,17 @@ class ScrapeReport:
 
 _SAFE_TICKER_RE = re.compile(r"[^A-Z0-9.\-]")
 
+# Columns persisted to ohlcv/<TICKER>.parquet. `Dividends` is fetched (so
+# download_one can detect an ex-dividend date and re-anchor the adjustment
+# basis — audit INT-3) but deliberately NOT stored, keeping the on-disk schema
+# identical to every file already in the cache.
+_STORED_COLUMNS = ["Open", "High", "Low", "Close", "Volume", "Stock Splits"]
+
+# Columns the scanner actually reads. Audit 2026-08-12 (EFF-5): `Stock Splits`
+# is never touched at scan time, and projecting it away measured 10.4 ms →
+# 1.9 ms per file (155 s → 28 s across the universe).
+_SCAN_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
+
 
 def _parquet_path(symbol: str) -> Path:
     """Return the canonical parquet path for a ticker symbol.
@@ -80,10 +92,46 @@ def _parquet_path(symbol: str) -> Path:
 
 
 def _last_cached_date(symbol: str) -> Optional[pd.Timestamp]:
-    """Return the most recent date in a ticker's cached parquet, or None."""
+    """Return the most recent date in a ticker's cached parquet, or None.
+
+    Audit 2026-08-12 (EFF-2): this used to `pd.read_parquet` the WHOLE file to
+    read one timestamp. UpdateWorker calls it once per universe symbol at
+    launch, serially — measured at 10.4 ms/file, so ~155 s of I/O and ~650 MB of
+    decompression per launch across 14.9k tickers, purely to compare a max date.
+
+    Parquet footers carry per-column min/max statistics, so the answer is
+    available without touching a single data page. Falls back to the full read
+    when statistics are absent (older writers) so behaviour is unchanged for
+    any file the fast path can't answer. Mirrors the metadata-only pattern
+    already used for row counts in main_window.
+    """
     p = _parquet_path(symbol)
     if not p.exists():
         return None
+    try:
+        md = pq_reader.read_metadata(p)
+    except Exception:
+        md = None
+    if md is not None:
+        try:
+            if md.num_rows == 0:
+                return None
+            # The Date index is written as a column; find it by name.
+            schema = md.schema.to_arrow_schema()
+            idx = schema.get_field_index("Date")
+            if idx >= 0:
+                best = None
+                for rg in range(md.num_row_groups):
+                    st = md.row_group(rg).column(idx).statistics
+                    if st is None or not st.has_min_max:
+                        best = None
+                        break
+                    if best is None or st.max > best:
+                        best = st.max
+                if best is not None:
+                    return pd.Timestamp(best)
+        except Exception:
+            pass   # fall through to the full read
     try:
         df = pd.read_parquet(p)
         if df.empty:
@@ -105,8 +153,14 @@ def _download_raw(symbol: str, start: str, end: str) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # yfinance may return extra columns (Dividends, etc.) — keep OHLCV + Stock Splits
-    keep = ["Open", "High", "Low", "Close", "Volume", "Stock Splits"]
+    # Keep OHLCV + both corporate-action columns.
+    #
+    # Audit 2026-08-12 (INT-3): `Dividends` used to be dropped here, which is
+    # why dividend-driven re-adjustment went undetected for the life of the
+    # cache. It is retained through the download so download_one can spot an
+    # ex-dividend date and re-anchor, and is dropped again before the parquet is
+    # written (see _STORED_COLUMNS) so the on-disk schema is unchanged.
+    keep = ["Open", "High", "Low", "Close", "Volume", "Stock Splits", "Dividends"]
     keep = [c for c in keep if c in df.columns]
     df = df[keep].copy()
 
@@ -172,6 +226,47 @@ def validate_ticker(symbol: str, df: pd.DataFrame) -> list[str]:
     return issues
 
 
+def _reject_conflicting_bars(
+    symbol: str, old_df: pd.DataFrame, new_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Drop incoming bars that contradict an already-cached bar for the same
+    date by more than ``config.PRICE_JUMP_PCT`` (audit 2026-08-12, INT-11).
+
+    Only bars whose date ALREADY exists in the cache are considered — a normal
+    incremental update appends new dates and is untouched. Overlap happens when
+    a provider re-sends the boundary bar, which is exactly where a bad response
+    used to overwrite good data permanently.
+
+    Conservative by construction: a disagreement is resolved in favour of the
+    data already on disk, and anything unexpected (missing Close, empty
+    overlap, a comparison that raises) returns ``new_df`` unchanged so this can
+    never make an update fail.
+    """
+    try:
+        if "Close" not in old_df.columns or "Close" not in new_df.columns:
+            return new_df
+        overlap = new_df.index.intersection(old_df.index)
+        if overlap.empty:
+            return new_df
+        old_close = pd.to_numeric(old_df.loc[overlap, "Close"], errors="coerce")
+        new_close = pd.to_numeric(new_df.loc[overlap, "Close"], errors="coerce")
+        base = old_close.abs()
+        diff_pct = ((new_close - old_close).abs() / base.where(base > 0)) * 100.0
+        conflicting = overlap[diff_pct > config.PRICE_JUMP_PCT]
+        if len(conflicting) == 0:
+            return new_df
+        log.warning(
+            "%s — %d re-sent bar(s) disagree with the cache by >%.0f%%; "
+            "keeping the cached value(s) for %s",
+            symbol, len(conflicting), config.PRICE_JUMP_PCT,
+            ", ".join(str(d.date()) for d in conflicting[:5]),
+        )
+        return new_df.drop(index=conflicting)
+    except Exception as exc:      # never let a guard break an update
+        log.debug("%s — bar-conflict check skipped: %s", symbol, exc)
+        return new_df
+
+
 # ── Single-ticker download ─────────────────────────────────────────────
 
 def download_one(symbol: str) -> ScrapeResult:
@@ -205,22 +300,44 @@ def download_one(symbol: str) -> ScrapeResult:
             log.debug("%s — no data returned", symbol)
             return result
 
-        # If incremental data contains a stock split, the cached
-        # pre-split prices are stale.  Re-download the full history
-        # so yfinance returns properly adjusted prices everywhere.
-        if (
-            last_date is not None
-            and not new_df.empty
-            and "Stock Splits" in new_df.columns
-            and (new_df["Stock Splits"] != 0).any()
-        ):
-            split_dates = new_df.loc[
-                new_df["Stock Splits"] != 0
-            ].index.tolist()
+        # If incremental data contains a stock split OR a dividend, the cached
+        # prices are stale. Re-download the full history so yfinance returns
+        # properly adjusted prices everywhere.
+        #
+        # Audit 2026-08-12 (INT-3): dividends were NOT detected here, and the
+        # `Dividends` column was dropped in _download_raw before it could be
+        # inspected. Because `auto_adjust=True` back-adjusts for dividends as
+        # well as splits, every ex-dividend date left a PERMANENT price
+        # discontinuity inside the cached file: bars written before that update
+        # kept the old adjustment basis while newly-appended bars used the new
+        # one. Measured on 20 dividend payers — 19 drifted >0.5% from a fresh
+        # pull (mean 0.79%, worst VZ at 1.76%), with the seam locatable to an
+        # exact date (e.g. CSCO +0.374% before 2026-07-06, exact after). Any
+        # SMA / ADR% / ATR / RS window spanning a seam mixed two price bases.
+        #
+        # Detecting dividends re-anchors the same way splits already did, and
+        # the existing cache SELF-HEALS: the next dividend for each payer
+        # triggers one full re-download, so within ~a quarter every affected
+        # ticker is corrected with no bulk operation and no data deletion.
+        corp_action = None
+        if last_date is not None and not new_df.empty:
+            if ("Stock Splits" in new_df.columns
+                    and (new_df["Stock Splits"] != 0).any()):
+                corp_action = ("split", new_df.loc[
+                    new_df["Stock Splits"] != 0
+                ].index.tolist())
+            elif ("Dividends" in new_df.columns
+                    and (new_df["Dividends"] != 0).any()):
+                corp_action = ("dividend", new_df.loc[
+                    new_df["Dividends"] != 0
+                ].index.tolist())
+        if corp_action is not None:
+            kind, action_dates = corp_action
             log.info(
-                "%s — split detected on %s, re-downloading full history",
-                symbol,
-                ", ".join(str(d.date()) for d in split_dates),
+                "%s — %s detected on %s, re-downloading full history "
+                "(re-anchors the adjustment basis)",
+                symbol, kind,
+                ", ".join(str(d.date()) for d in action_dates),
             )
             full_start = (
                 datetime.now() - timedelta(days=365 * config.OHLCV_HISTORY_YEARS)
@@ -234,6 +351,17 @@ def download_one(symbol: str) -> ScrapeResult:
         if last_date is not None and pq.exists():
             old_df = pd.read_parquet(pq)
             if not new_df.empty:
+                # Audit 2026-08-12 (INT-11): gate the MERGE, not just the log.
+                # `keep="last"` meant a bad yfinance response silently
+                # overwrote a good cached bar and became load-bearing forever
+                # — OHLCV parquets carry no source or fetch-time column, so a
+                # cemented bad bar can't be identified or re-fetched
+                # afterwards (the persisted CSCO 2026-06-12 anomaly is a live
+                # instance). When a re-sent bar disagrees with the cached one
+                # by more than PRICE_JUMP_PCT, keep the CACHED bar and warn.
+                # Genuine corrections arrive via the split/dividend re-anchor
+                # above, which replaces the whole file rather than one bar.
+                new_df = _reject_conflicting_bars(symbol, old_df, new_df)
                 combined = pd.concat([old_df, new_df])
                 combined = combined[~combined.index.duplicated(keep="last")]
                 combined.sort_index(inplace=True)
@@ -263,6 +391,10 @@ def download_one(symbol: str) -> ScrapeResult:
         if combined.empty:
             result.status = "no_data"
             return result
+
+        # Drop the corporate-action helper column before persisting so the
+        # on-disk schema is exactly what it has always been (audit INT-3).
+        combined = combined[[c for c in _STORED_COLUMNS if c in combined.columns]]
 
         # Validate
         result.anomalies = validate_ticker(symbol, combined)
@@ -420,41 +552,151 @@ def _cache_key(symbol: str) -> tuple[str, int]:
         return (symbol, 0)
 
 
-# Sized above a full US common-stock universe (~12k) plus the 13 reference
+def _read_scan_frame(p: Path) -> pd.DataFrame:
+    """Read one OHLCV parquet in the shape the scanner wants.
+
+    Three audit fixes land here, all in the hottest read path in the app:
+
+    * EFF-5 — project to the five columns the scanner reads. `Stock Splits` is
+      stored but never used at scan time; dropping it measured 10.4 ms → 1.9 ms
+      per file, i.e. ~155 s → ~28 s of pure I/O across 14.9k tickers.
+    * EFF-4 — strip the timezone ONCE, here. Every cached file has a
+      `datetimetz America/New_York` index, so the "defensive" tz branch in
+      scanner._compute_ticker fired on 100% of tickers and full-copied every
+      frame, per timeframe. Handing it a naive index makes that branch dead.
+    * EFF-6 — downcast OHLC to float32. Every consumer takes means, ratios or
+      comparisons; none needs float64, and this halves the cached footprint.
+
+    Volume stays integral (int64 → int32 would risk overflow on high-volume
+    names; float32 would lose exactness on large share counts).
+    """
+    try:
+        df = pd.read_parquet(p, columns=_SCAN_COLUMNS)
+    except Exception:
+        # pyarrow raises rather than projecting when a requested column is
+        # absent, so a file that predates the current writer — or any partial
+        # frame — would be swallowed by the caller's except and reported as
+        # "corrupt", silently dropping that ticker from every scan. Fall back to
+        # the full read and keep whatever OHLCV columns are actually present.
+        # Only odd files pay the double read; the 14.9k well-formed ones don't.
+        df = pd.read_parquet(p)
+        present = [c for c in _SCAN_COLUMNS if c in df.columns]
+        if present:
+            df = df[present]
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_localize(None)
+    for col in ("Open", "High", "Low", "Close"):
+        if col in df.columns and df[col].dtype == "float64":
+            df[col] = df[col].astype("float32")
+    return df
+
+
+# Sized above a full US common-stock universe (~12k) plus the reference
 # benchmarks + sector ETFs, so a single scan over the whole universe doesn't
-# evict entries it will re-read within the same pass (audit: the old 10000 cap
-# under-fit a >10k-ticker universe). Keyed by (symbol, mtime_ns) so a bigger
-# cap can never serve stale data — a fresh download bumps the key.
-@lru_cache(maxsize=24000)
+# evict entries it will re-read within the same pass.
+#
+# Audit 2026-08-12 (EFF-6): keyed by SYMBOL, with the mtime stored alongside the
+# frame. The old design keyed the lru_cache on (symbol, mtime_ns), which
+# guaranteed freshness but meant a re-downloaded ticker ADDED an entry while the
+# stale-mtime entry stayed resident — verified at 4 cached frames for one ticker
+# after 3 refreshes, and a 1.61 GB ceiling at the 24k cap. Keying by symbol makes
+# a refresh REPLACE, so the cap is a true per-ticker bound.
+_OHLCV_CACHE_MAX = 24000
+_ohlcv_cache: "OrderedDict[str, tuple[int, Optional[pd.DataFrame]]]" = OrderedDict()
+_ohlcv_cache_lock = threading.Lock()
+_ohlcv_hits = 0
+_ohlcv_misses = 0
+
+
 def _load_ohlcv_cached(key: tuple[str, int]) -> Optional[pd.DataFrame]:
-    """Cached parquet read. Keyed by (symbol, mtime_ns) so a fresh download
-    automatically bumps the key and triggers a re-read."""
-    symbol, _mtime = key
+    """Cached parquet read, keyed by symbol and validated against mtime.
+
+    Takes the same ``(symbol, mtime_ns)`` tuple the previous lru_cache version
+    did, so existing callers and tests are unaffected.
+    """
+    global _ohlcv_hits, _ohlcv_misses
+    symbol, mtime = key
+    with _ohlcv_cache_lock:
+        hit = _ohlcv_cache.get(symbol)
+        if hit is not None and hit[0] == mtime:
+            _ohlcv_cache.move_to_end(symbol)
+            _ohlcv_hits += 1
+            return hit[1]
     p = _parquet_path(symbol)
     if not p.exists():
-        return None
+        frame = None
+    else:
+        try:
+            frame = _read_scan_frame(p)
+        except Exception:
+            log.warning("Corrupt parquet for %s — returning None", symbol)
+            frame = None
+    with _ohlcv_cache_lock:
+        _ohlcv_misses += 1
+        # Replaces any stale-mtime entry for this symbol instead of adding to it.
+        _ohlcv_cache[symbol] = (mtime, frame)
+        _ohlcv_cache.move_to_end(symbol)
+        while len(_ohlcv_cache) > _OHLCV_CACHE_MAX:
+            _ohlcv_cache.popitem(last=False)
+    return frame
+
+
+class OhlcvCacheInfo(NamedTuple):
+    """Field-for-field replacement for ``functools._CacheInfo``, in the same
+    ORDER as well — callers that unpack positionally must not silently swap
+    maxsize and currsize when the lru_cache went away (audit EFF-6)."""
+    hits: int
+    misses: int
+    maxsize: int
+    currsize: int
+
+
+def ohlcv_cache_info() -> OhlcvCacheInfo:
+    """Cache statistics, drop-in compatible with the old
+    ``_load_ohlcv_cached.cache_info()`` for the diagnostics panel and tests."""
+    with _ohlcv_cache_lock:
+        return OhlcvCacheInfo(
+            _ohlcv_hits, _ohlcv_misses, _OHLCV_CACHE_MAX, len(_ohlcv_cache),
+        )
+
+
+def cached_symbols() -> set[str]:
+    """Every symbol with an OHLCV parquet on disk, from ONE directory listing.
+
+    Audit 2026-08-12 (EFF-8): the launch path called
+    ``(PARQUET_DIR / f"{s}.parquet").exists()`` once per universe symbol —
+    15,948 individual stat calls, repeated a second time in ``_on_update_done``
+    — on the GUI thread. A single glob answers the same question with one
+    directory enumeration.
+    """
     try:
-        return pd.read_parquet(p)
-    except Exception:
-        log.warning("Corrupt parquet for %s — returning None", symbol)
-        return None
+        return {p.stem for p in config.PARQUET_DIR.glob("*.parquet")}
+    except OSError as exc:
+        log.warning("Could not enumerate %s: %s", config.PARQUET_DIR, exc)
+        return set()
 
 
 def load_ohlcv(symbol: str) -> Optional[pd.DataFrame]:
     """Load cached OHLCV parquet for a symbol. Returns None if not found.
 
-    Phase 3 I11: results are LRU-cached across calls keyed by mtime, so
+    Phase 3 I11: results are cached across calls and validated by mtime, so
     multi-scan sessions avoid re-reading the same parquet. Callers MUST
     copy() before mutating the returned DataFrame — mutations leak into
-    the cache otherwise."""
+    the cache otherwise.
+
+    The returned frame is tz-NAIVE and carries only OHLCV (audit EFF-4 / EFF-5).
+    """
     return _load_ohlcv_cached(_cache_key(symbol))
 
 
 def clear_ohlcv_cache() -> None:
-    """Clear the load_ohlcv LRU cache. Call after bulk operations that
-    may rewrite many parquets (not strictly necessary since mtime-keying
-    self-invalidates, but useful for freeing memory)."""
-    _load_ohlcv_cached.cache_clear()
+    """Drop every cached OHLCV frame. Call after bulk operations that rewrite
+    many parquets, or to release memory."""
+    global _ohlcv_hits, _ohlcv_misses
+    with _ohlcv_cache_lock:
+        _ohlcv_cache.clear()
+        _ohlcv_hits = 0
+        _ohlcv_misses = 0
 
 
 def prefetch_ohlcv(
@@ -524,8 +766,12 @@ def stamp_schema_version() -> None:
     to call repeatedly — overwrites with the same value."""
     try:
         config.PARQUET_DIR.mkdir(parents=True, exist_ok=True)
-        config.PARQUET_SCHEMA_FILE.write_text(
-            str(config.PARQUET_SCHEMA_VERSION), encoding="utf-8"
+        # Audit 2026-08-12 (INT-17): atomic, like every other store in the
+        # project. A crash mid-write left a truncated sidecar, which
+        # read_schema_version then reports as a version MISMATCH against a
+        # cache that is actually fine.
+        config.atomic_write_text(
+            config.PARQUET_SCHEMA_FILE, str(config.PARQUET_SCHEMA_VERSION),
         )
     except OSError as exc:
         log.debug("Could not write schema version file: %s", exc)
@@ -584,7 +830,7 @@ def rebuild_ticker(symbol: str) -> ScrapeResult:
             log.warning("Could not move %s aside for rebuild: %s", p, exc)
             bak = None
     # Invalidate LRU entry for this (symbol, mtime) key path
-    _load_ohlcv_cached.cache_clear()
+    clear_ohlcv_cache()
     result = download_one(symbol)
 
     if bak is not None:
@@ -605,7 +851,7 @@ def rebuild_ticker(symbol: str) -> ScrapeResult:
                     "Rebuild of %s did not produce data (status=%s) — restored "
                     "the prior cache", symbol, result.status,
                 )
-                _load_ohlcv_cached.cache_clear()
+                clear_ohlcv_cache()
             except OSError as exc:
                 log.error(
                     "Could not restore %s after a failed rebuild: %s", p, exc,

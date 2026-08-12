@@ -36,6 +36,7 @@ import logging
 import math
 import re
 from typing import Optional
+from urllib.parse import quote
 
 import pandas as pd
 # curl_cffi.requests is API-compatible with `requests` — same Session,
@@ -131,7 +132,19 @@ def _dpapi_protect(plain: str) -> str:
         )
         return _DPAPI_PREFIX + base64.b64encode(blob).decode("ascii")
     except Exception as exc:  # noqa: BLE001 - degrade to plaintext, never fail
-        log.debug("DPAPI protect unavailable (%s) — storing cookies plaintext", exc)
+        # Audit 2026-08-12 (SEC-7): this was a `log.debug`, so a missing or
+        # broken pywin32 silently wrote SESSION TOKENS IN PLAINTEXT under the
+        # SEC-1 ACLs with nothing visible to the user. The spec hidden-imports
+        # win32crypt precisely to prevent this, so reaching here means
+        # something is genuinely wrong and the user needs to know. Still
+        # degrades rather than failing — refusing to persist would break the
+        # Zacks fill outright — but it is now LOUD, and the "scanner.*" logger
+        # routes it to the GUI log panel.
+        log.warning(
+            "DPAPI unavailable (%s) — Zacks cookies will be stored as "
+            "PLAINTEXT in %s. Check the pywin32 install.",
+            exc, _COOKIES_FILENAME,
+        )
         return plain
 
 
@@ -526,7 +539,13 @@ user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
 user_pref("datareporting.policy.dataSubmissionPolicyAcceptedVersion", 2);
 user_pref("datareporting.policy.firstRunURL", "");
-// Update prompts.
+// Update prompts. Audit 2026-08-12 (SEC-7) suggested re-enabling updates for
+// this long-lived profile. NOT DONE, deliberately: an update prompt is a modal
+// that blocks the page, and this profile exists solely to run one Imperva JS
+// challenge unattended — a blocked launch breaks the cookie refresh silently.
+// The residual risk is small because the profile is isolated (dedicated dir,
+// -no-remote, never the user's real profile) and only ever visits zacks.com.
+// Revisit if the profile is ever pointed at general browsing.
 user_pref("app.update.enabled", false);
 user_pref("app.update.auto", false);
 // Tab-close confirmation when Firefox exits.
@@ -537,6 +556,11 @@ user_pref("browser.warnOnQuitShortcut", false);
 // Sign-in-to-sync nag.
 user_pref("identity.fxaccounts.toolbar.enabled", false);
 // Pop-up blocker (Imperva sometimes opens iframes via window.open).
+// Audit 2026-08-12 (SEC-7) suggested dropping this. NOT DONE: the pref was
+// added in response to observed challenge behaviour, and re-enabling the
+// blocker can only be validated against a live Imperva challenge, which this
+// environment cannot exercise. Breaking the Zacks fill to harden a profile
+// that only ever loads zacks.com is the wrong trade.
 user_pref("dom.disable_open_during_load", false);
 // Force a clean launch — ignore saved sessionstore + ignore homepage so
 // the URL we pass on the cmdline is the ONLY page Firefox loads.
@@ -696,11 +720,20 @@ def read_cookies_from_firefox_profile(profile_dir) -> str:
         # that are still valid for the API call).
         now = int(_time.time())
         rows = conn.execute(
+            # Audit 2026-08-12 (SEC-7): take ONLY the cookies the Imperva
+            # challenge actually needs. This used to select every
+            # %zacks.com% cookie and persist all of them — 8,647 bytes for
+            # what should be ~2 — so if the user ever logged into a Zacks
+            # account in this profile, the session/auth cookies were
+            # persisted too. `_REQUIRED_IMPERVA_COOKIES` is the same set the
+            # code already validates against downstream.
             """
             SELECT name, value, host
             FROM moz_cookies
             WHERE host LIKE '%zacks.com%'
               AND (expiry = 0 OR expiry > ?)
+              AND (name = 'reese84' OR name LIKE 'visid_incap%'
+                   OR name LIKE 'incap_ses%' OR name LIKE 'nlbi%')
             """,
             (now,),
         ).fetchall()
@@ -1034,7 +1067,16 @@ class ZacksSession:
             raise RuntimeError(
                 "ZacksSession not entered — wrap calls in `with ZacksSession() as s:`"
             )
-        url = _BASE_URL.format(ticker=symbol.upper())
+        # Audit 2026-08-12 (SEC-3): allowlist before the symbol reaches the
+        # URL PATH, where a traversal segment would resolve server-side and
+        # where requests does no encoding for us. Spot fill passes a hand-typed
+        # symbol straight in, so the universe filter is not sufficient here.
+        safe_symbol = config.url_safe_ticker(symbol)
+        if not safe_symbol:
+            log.warning("[%s] refusing implausible symbol", symbol)
+            self.last_failure_kind = FAIL_HTTP_ERROR
+            return None
+        url = _BASE_URL.format(ticker=quote(safe_symbol, safe=""))
         cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(years=years)
 
         try:

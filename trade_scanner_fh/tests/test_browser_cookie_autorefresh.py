@@ -210,15 +210,42 @@ def test_read_cookies_filters_expired(tmp_data_dir):
 
 def test_read_cookies_keeps_session_cookies(tmp_data_dir):
     """Firefox stores session cookies with expiry=0; we keep them
-    since Imperva sometimes hands out short-lived tokens that way."""
+    since Imperva sometimes hands out short-lived tokens that way.
+
+    Uses an Imperva cookie name because the SELECT is name-scoped since audit
+    2026-08-12 (SEC-7) — the expiry=0 behaviour under test is unchanged.
+    """
     profile = tmp_data_dir / "firefox_zacks_profile"
     future = int(time.time()) + 3600
     _make_cookies_sqlite(profile, [
         ("reese84", "abc", ".zacks.com", future),
-        ("session_token", "live", ".zacks.com", 0),
+        ("incap_ses_99_1", "live", ".zacks.com", 0),
     ])
     cookie_str = zs.read_cookies_from_firefox_profile(profile)
-    assert "session_token=live" in cookie_str
+    assert "incap_ses_99_1=live" in cookie_str
+
+
+def test_read_cookies_only_takes_imperva_cookies(tmp_data_dir):
+    """Audit 2026-08-12 (SEC-7): the SELECT took EVERY %zacks.com% cookie and
+    persisted all of them — 8,647 bytes for what should be ~2. If the user
+    ever logs into a Zacks account in this profile, that swept up the account
+    session cookie too. Only the cookies the Imperva challenge needs are
+    captured now."""
+    profile = tmp_data_dir / "firefox_zacks_profile"
+    future = int(time.time()) + 3600
+    _make_cookies_sqlite(profile, [
+        ("reese84", "needed", ".zacks.com", future),
+        ("visid_incap_12345", "needed", ".zacks.com", future),
+        ("nlbi_12345", "needed", ".zacks.com", future),
+        ("user_session", "SECRET", ".zacks.com", future),
+        ("remember_me_token", "SECRET", ".zacks.com", future),
+    ])
+    cookie_str = zs.read_cookies_from_firefox_profile(profile)
+    assert "reese84=needed" in cookie_str
+    assert "visid_incap_12345=needed" in cookie_str
+    assert "SECRET" not in cookie_str
+    assert "user_session" not in cookie_str
+    assert "remember_me_token" not in cookie_str
 
 
 def test_read_cookies_returns_empty_when_db_missing(tmp_data_dir):

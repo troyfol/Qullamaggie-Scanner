@@ -236,9 +236,6 @@ def read_raw(
     files = sorted(src_dir.glob("*.parquet"))
     if run_id is not None:
         files = [f for f in files if f.stem == run_id]
-    if since is not None:
-        threshold = since.timestamp()
-        files = [f for f in files if f.stat().st_mtime >= threshold]
 
     if not files:
         return pd.DataFrame(columns=_SCHEMA_BY_SOURCE[source])
@@ -251,7 +248,18 @@ def read_raw(
             log.warning("raw[%s] could not read %s: %s", source, f.name, exc)
     if not frames:
         return pd.DataFrame(columns=_SCHEMA_BY_SOURCE[source])
-    return pd.concat(frames, ignore_index=True)
+    out = pd.concat(frames, ignore_index=True)
+
+    # Audit 2026-08-12 (INT-8): filter on the `fetched_at` COLUMN, not on file
+    # mtime. These files are append-only within a run, so appending to a run
+    # file rewrites its mtime and re-ages every row it already held — a
+    # `since` window would then include rows fetched long before it, or (after
+    # a rewrite) exclude none at all. `fetched_at` is stamped per row at
+    # capture time and cannot drift.
+    if since is not None and "fetched_at" in out.columns:
+        stamped = pd.to_datetime(out["fetched_at"], errors="coerce")
+        out = out.loc[stamped >= pd.Timestamp(since)].reset_index(drop=True)
+    return out
 
 
 def list_run_ids(source: str) -> list[str]:
@@ -279,11 +287,19 @@ def prune_old_raw(
     """Delete raw-layer files older than ``retention_days``. Walks
     every source dir; safe to call repeatedly. Returns count deleted.
     """
-    days = retention_days if retention_days is not None else config.RAW_RETENTION_DAYS
-    cut = (now or datetime.now()) - timedelta(days=days)
-    cut_ts = cut.timestamp()
+    ref = now or datetime.now()
     deleted = 0
     for source in config.RAW_SOURCES:
+        # Audit 2026-08-12 (INT-8): per-source retention. An explicit
+        # `retention_days` argument still overrides everything (tests, and the
+        # caller who wants a uniform sweep); otherwise the small calendar
+        # sources keep a year and the bulky scrape sources keep the default.
+        if retention_days is not None:
+            days = retention_days
+        else:
+            days = config.RAW_RETENTION_DAYS_BY_SOURCE.get(
+                source, config.RAW_RETENTION_DAYS)
+        cut_ts = (ref - timedelta(days=days)).timestamp()
         src_dir = _source_dir(source)
         if not src_dir.exists():
             continue
@@ -295,6 +311,6 @@ def prune_old_raw(
             except OSError as exc:
                 log.debug("raw prune: failed to remove %s: %s", f, exc)
     if deleted:
-        log.info("Pruned %d raw earnings file(s) older than %d days",
-                 deleted, days)
+        log.info("Pruned %d raw earnings file(s) past their retention window",
+                 deleted)
     return deleted

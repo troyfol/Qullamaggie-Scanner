@@ -193,13 +193,21 @@ def test_read_raw_filter_by_run_id(tmp_raw):
 
 
 def test_read_raw_filter_by_since(tmp_raw):
+    """`since` filters on the per-row `fetched_at` column.
+
+    Audit 2026-08-12 (INT-8): this used to filter on FILE MTIME. These files
+    are append-only within a run, so appending re-stamps the file and re-ages
+    every row it already held — the window would then admit rows fetched long
+    before it, or admit everything after any rewrite.
+    """
     rid_old = earnings_raw.new_run_id()
     earnings_raw.append_zacks_rows([{"ticker": "OLD"}], rid_old)
 
-    # Backdate the file by 5 days
+    # Backdate the ROW, which is what `since` now reads.
     old_path = tmp_raw / "zacks" / f"{rid_old}.parquet"
-    old_ts = (datetime.now() - timedelta(days=5)).timestamp()
-    os.utime(old_path, (old_ts, old_ts))
+    df_old = pd.read_parquet(old_path)
+    df_old["fetched_at"] = datetime.now() - timedelta(days=5)
+    df_old.to_parquet(old_path, index=False)
 
     rid_new = earnings_raw.new_run_id()
     earnings_raw.append_zacks_rows([{"ticker": "NEW"}], rid_new)
@@ -208,6 +216,25 @@ def test_read_raw_filter_by_since(tmp_raw):
         config.RAW_SOURCE_ZACKS, since=datetime.now() - timedelta(days=1),
     )
     assert set(df["ticker"]) == {"NEW"}
+
+
+def test_read_raw_since_ignores_a_rewritten_file_mtime(tmp_raw):
+    """The bug INT-8 fixed: a genuinely old row stays excluded even after the
+    file it lives in is rewritten (which resets mtime to now)."""
+    rid = earnings_raw.new_run_id()
+    earnings_raw.append_zacks_rows([{"ticker": "OLD"}], rid)
+    path = tmp_raw / "zacks" / f"{rid}.parquet"
+
+    df = pd.read_parquet(path)
+    df["fetched_at"] = datetime.now() - timedelta(days=10)
+    df.to_parquet(path, index=False)          # mtime is now "now"
+    assert path.stat().st_mtime > (
+        datetime.now() - timedelta(minutes=1)).timestamp()
+
+    out = earnings_raw.read_raw(
+        config.RAW_SOURCE_ZACKS, since=datetime.now() - timedelta(days=1),
+    )
+    assert out.empty, "an mtime-fresh file leaked a 10-day-old row"
 
 
 def test_list_run_ids_orders_newest_first(tmp_raw):
@@ -280,8 +307,34 @@ def test_prune_walks_every_source(tmp_raw):
         path = tmp_raw / src / f"{rid}.parquet"
         os.utime(path, (cutoff_ts, cutoff_ts))
 
+    # Audit 2026-08-12 (INT-8): retention is now PER SOURCE. The bulky scrape
+    # sources (zacks, finviz) keep the 30-day default; the small calendar
+    # sources (nasdaq, yahoo, finnhub) keep a year, because four separate
+    # destructive operations cite this layer as their recovery path and a flat
+    # 30 days never delivered that against a ten-year store.
     deleted = earnings_raw.prune_old_raw()
-    assert deleted == len(config.RAW_SOURCES)
+    long_lived = set(config.RAW_RETENTION_DAYS_BY_SOURCE)
+    short_lived = [s for s in config.RAW_SOURCES if s not in long_lived]
+    assert deleted == len(short_lived)
+    for src in long_lived:
+        assert list((tmp_raw / src).glob("*.parquet")), (
+            f"{src} has 365-day retention but its 60-day-old file was pruned"
+        )
+    for src in short_lived:
+        assert not list((tmp_raw / src).glob("*.parquet"))
+
+
+def test_prune_explicit_retention_overrides_per_source(tmp_raw):
+    """An explicit retention_days still applies uniformly — the per-source map
+    is only the default."""
+    rid = earnings_raw.new_run_id()
+    earnings_raw.append_nasdaq_rows(
+        [{"ticker": "X", "calendar_date": pd.Timestamp("2020-01-01")}], rid)
+    path = tmp_raw / "nasdaq" / f"{rid}.parquet"
+    os.utime(path, ((datetime.now() - timedelta(days=60)).timestamp(),) * 2)
+    # 365-day default would keep it; the explicit 30 must not.
+    assert earnings_raw.prune_old_raw(retention_days=30) == 1
+    assert not path.exists()
 
 
 def test_prune_custom_retention(tmp_raw):

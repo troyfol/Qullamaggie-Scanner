@@ -23,6 +23,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from . import config
+
 log = logging.getLogger("scanner.hotkey")
 
 
@@ -256,6 +258,46 @@ def _describe_hwnd(hwnd) -> str:
         return f"hwnd={hwnd}"
 
 
+def _foreground_window_desc() -> tuple[str, str]:
+    """(title, class_name) of the foreground window; ("", "") if unavailable."""
+    try:
+        import win32gui
+        hwnd = win32gui.GetForegroundWindow()
+        if not hwnd:
+            return ("", "")
+        return (win32gui.GetWindowText(hwnd) or "",
+                win32gui.GetClassName(hwnd) or "")
+    except Exception:
+        return ("", "")
+
+
+def target_window_allowed() -> tuple[bool, str]:
+    """Is the current foreground window an acceptable target for a send?
+
+    Audit 2026-08-12 (SEC-10): ``pyautogui`` types blind — whatever holds
+    focus receives the ticker and the confirm key. Returns
+    ``(allowed, description)``.
+
+    FAILS OPEN by design, matching the existing off-screen-coordinate
+    behaviour: no configured hints, no pywin32, or no readable foreground
+    window all return True. Only a positive mismatch against a configured
+    hint refuses, because a false refusal in a trading workflow is worse than
+    the residual risk this guard removes.
+    """
+    hints = [h for h in getattr(config, "HOTKEY_TARGET_WINDOW_HINTS", []) if h]
+    title, cls = _foreground_window_desc()
+    desc = f'"{title[:60]}" [{cls}]'
+    if not hints:
+        return (True, desc)
+    if not title and not cls:
+        log.debug("Hotkey: no readable foreground window — allowing the send")
+        return (True, desc)
+    hay = f"{title}\n{cls}".lower()
+    if any(str(h).lower() in hay for h in hints):
+        return (True, desc)
+    return (False, desc)
+
+
 def _focus_snapshot() -> str:
     """Foreground window + the control holding keyboard focus on the
     foreground thread (GetGUIThreadInfo). The focused control is what a
@@ -403,6 +445,22 @@ def send_ticker(
         # without focusing the command line), the ticker is about to type
         # into the wrong control — this is the line that pins the bug.
         _diag("post-click (focus before typing)")
+        # Audit 2026-08-12 (SEC-10): last checkpoint before typing blind.
+        # Checked HERE — after the click and the settle delay — because that
+        # is the moment whose focus the keystrokes will actually land in.
+        # Always logged so the user can read off a correct value for
+        # HOTKEY_TARGET_WINDOW_HINTS; only refuses when a hint is configured
+        # and nothing matches.
+        allowed, where = target_window_allowed()
+        if not allowed:
+            log.warning(
+                "Hotkey: refusing to type '%s' — foreground window %s does "
+                "not match HOTKEY_TARGET_WINDOW_HINTS %s",
+                ticker, where, config.HOTKEY_TARGET_WINDOW_HINTS,
+            )
+            msg(f"Hotkey: send aborted — wrong window {where}")
+            return False
+        log.info("Hotkey: typing '%s' into %s", ticker, where)
         # Type the ticker in LOWERCASE. pyautogui.typewrite emits each
         # UPPERCASE letter as Shift+<letter> (it holds Shift to capitalize),
         # and some target platforms bind Shift/Ctrl/Alt + letter to order-entry

@@ -170,7 +170,14 @@ exe = EXE(
     upx=False,
     runtime_tmpdir=None,
     console=False,
-    disable_windowed_traceback=False,
+    # Audit 2026-08-12 (SEC-6): with console=False an unhandled exception
+    # otherwise raises a traceback DIALOG. Combined with SEC-5's latent
+    # token-in-URL leak that is a plausible secret-in-traceback path, and the
+    # dialog tells a user nothing actionable anyway — the same traceback is
+    # already written to scanner_data/logs/. Signing and --onedir remain
+    # deferred (a certificate is an external dependency; --onedir changes the
+    # release artifact from one file to a folder).
+    disable_windowed_traceback=True,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,

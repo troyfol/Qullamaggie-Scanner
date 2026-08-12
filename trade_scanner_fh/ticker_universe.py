@@ -50,8 +50,49 @@ _ADR_KEYWORDS = re.compile(
 # Source 1: NASDAQ FTP
 # ============================================================================
 
+def _download_https_symbol_file(filename: str) -> str:
+    """Fetch one NASDAQ symbol-directory file over HTTPS.
+
+    Audit 2026-08-12 (SEC-8): this is the authenticated path. The symbol
+    universe is the integrity root for SEC-3 — it reaches both URL builders
+    and the filesystem path builder — and the FTP alternative is anonymous
+    plaintext with no integrity check whatsoever, so a MITM there controls
+    every ticker the app touches. Size-capped like every other remote body
+    the app fetches (the largest real file is ~1 MB).
+    """
+    url = f"{config.NASDAQ_HTTPS_BASE}/{filename}"
+    log.info("HTTPS: downloading %s ...", filename)
+    resp = requests.get(url, timeout=30, headers=_HTTP_HEADERS)
+    resp.raise_for_status()
+    if len(resp.content) > config.NASDAQ_MAX_RESPONSE_BYTES:
+        raise ValueError(
+            f"{filename}: {len(resp.content)} bytes exceeds the "
+            f"{config.NASDAQ_MAX_RESPONSE_BYTES}-byte cap"
+        )
+    return resp.text
+
+
 def _download_ftp_file(filename: str) -> str:
-    """Download a single file from NASDAQ FTP, return its text content."""
+    """Download a single NASDAQ symbol-directory file, return its text.
+
+    Tries HTTPS first (SEC-8) and falls back to the historical anonymous FTP
+    only if that fails, so a blocked host or a NASDAQ-side change can't break
+    the universe refresh outright. Name kept for its callers and tests.
+    """
+    if config.NASDAQ_PREFER_HTTPS:
+        try:
+            raw = _download_https_symbol_file(filename)
+            if config.SAVE_FTP_RAW:
+                config.FTP_RAW_DIR.mkdir(parents=True, exist_ok=True)
+                (config.FTP_RAW_DIR / filename).write_text(raw, encoding="utf-8")
+            return raw
+        except Exception as exc:
+            log.warning(
+                "HTTPS fetch of %s failed (%s) — falling back to PLAINTEXT "
+                "anonymous FTP; the symbol feed is unauthenticated on this "
+                "path", filename, exc,
+            )
+
     log.info("FTP: downloading %s ...", filename)
     buf = io.BytesIO()
     ftp = ftplib.FTP(config.NASDAQ_FTP_HOST, timeout=30)
@@ -302,10 +343,15 @@ def _filter_symbols(df: pd.DataFrame) -> pd.DataFrame:
     if config.EXCLUDE_WHEN_ISSUED:
         mask &= ~df["symbol"].str.endswith("WI")
 
-    # Also drop symbols with unusual chars that yfinance can't handle
-    mask &= ~df["symbol"].str.contains(r"[+=%#@!]", regex=True)
-    # Drop empty symbols
-    mask &= df["symbol"].str.len() > 0
+    # Audit 2026-08-12 (SEC-3): ALLOWLIST, not a denylist. The old
+    # `[+=%#@!]` denylist blocked query/fragment injection but let path
+    # traversal through — `AAPL/../../admin` survived it and reached the
+    # finviz URL builder verbatim. Symbols come from NASDAQ FTP (plaintext,
+    # anonymous), a third-party GitHub mirror and SEC EDGAR, so a MITM on the
+    # feed controls this column, which flows into both URL builders and into
+    # filesystem paths. The pattern is validated against the live universe and
+    # rejects none of the 405 preferred/rights symbols (ABR$D, AIIA^, …).
+    mask &= df["symbol"].str.match(config.URL_SAFE_TICKER_RE, na=False)
 
     df = df[mask].copy()
     removed = before - len(df)
@@ -455,9 +501,18 @@ def refresh_universe(
     ftp_df = _fetch_nasdaq_ftp()
     ftp_count = 0
     if not ftp_df.empty:
-        # Normalise symbols
-        ftp_df["symbol"] = ftp_df["symbol_raw"].apply(_normalise_symbol)
-        ftp_df["adr"] = ftp_df["name"].apply(_detect_adr)
+        # Normalise symbols. Audit 2026-08-12 (EFF-10): vectorised `.str`
+        # accessors instead of a Python callable per row over ~16k rows.
+        # Same semantics as `_normalise_symbol` / `_detect_adr`, which remain
+        # the scalar reference implementations (and are still unit-tested).
+        ftp_df["symbol"] = (
+            ftp_df["symbol_raw"].astype(str).str.strip().str.upper()
+            .str.replace(".", "-", regex=False)
+        )
+        ftp_df["adr"] = (
+            ftp_df["name"].fillna("").astype(str)
+            .str.contains(_ADR_KEYWORDS, regex=True, na=False)
+        )
         ftp_count = ftp_df["symbol"].nunique()
         log.info("Source 1 (NASDAQ FTP): %d unique symbols", ftp_count)
 

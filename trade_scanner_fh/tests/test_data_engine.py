@@ -436,10 +436,10 @@ def test_prefetch_warms_cache_and_reports_progress(tmp_path, monkeypatch):
     assert progress[-1] == (3, 3)
 
     # Cache is warm: 3 more loads are all hits, zero new misses.
-    info_before = data_engine._load_ohlcv_cached.cache_info()
+    info_before = data_engine.ohlcv_cache_info()
     for s in syms:
         assert load_ohlcv(s) is not None
-    info_after = data_engine._load_ohlcv_cached.cache_info()
+    info_after = data_engine.ohlcv_cache_info()
     assert info_after.hits - info_before.hits == 3
     assert info_after.misses == info_before.misses
 
@@ -500,7 +500,7 @@ def test_prefetch_stop_flag_preset_warms_nothing(tmp_path, monkeypatch):
     stop.set()
     assert data_engine.prefetch_ohlcv(syms, stop_flag=stop) == 0
     assert calls == []
-    assert data_engine._load_ohlcv_cached.cache_info().currsize == 0
+    assert data_engine.ohlcv_cache_info().currsize == 0
 
 
 def test_prefetch_stop_flag_aborts_early(tmp_path, monkeypatch):

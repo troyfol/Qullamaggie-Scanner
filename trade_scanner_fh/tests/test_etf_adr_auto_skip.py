@@ -148,15 +148,26 @@ def test_etf_adr_NOT_persisted_to_per_source_blacklist_files(mw, tmp_path):
             )
 
 
-def test_universe_blacklist_persists_into_per_source_files(mw, tmp_path):
-    """Inverse check: the universe blacklist (user-curated) SHOULD
-    persist into the per-source files on every fill kickoff — this is
-    the existing audit-trail behavior we want to preserve."""
+def test_universe_blacklist_NOT_persisted_into_per_source_files(mw, tmp_path):
+    """The universe blacklist is combined at READ time only — it must not be
+    written into the per-source skip files.
+
+    This test asserted the opposite until audit 2026-08-12 (INT-5). Unioning
+    `blacklist.txt` into `finnhub_blacklist.txt` / `finviz_blacklist.txt` made
+    the merge irreversible: removing a ticker from the universe blacklist left
+    it skipped by those two sources forever, with nothing recording why. The
+    live lists had ratcheted to 10,246 / 6,394 entries against a 15,948-symbol
+    universe. `_zacks_skip_set` always combined without persisting; the other
+    two now match it.
+
+    The universe blacklist is still honored — see
+    test_universe_blacklist_in_all_combined_skip_sets.
+    """
     mw._blacklist = {"USERBANNED"}
     mw._combined_finnhub_skip_set()
     finn_path = tmp_path / "finnhub_blacklist.txt"
-    assert finn_path.exists()
-    assert "USERBANNED" in finn_path.read_text(encoding="utf-8")
+    if finn_path.exists():
+        assert "USERBANNED" not in finn_path.read_text(encoding="utf-8")
 
 
 # ──────────────────────────────────────────────────────────────────────

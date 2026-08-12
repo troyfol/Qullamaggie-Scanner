@@ -28,8 +28,16 @@ financedatabase==2.3.1   # sector-map fallback source
 
 # ── Runtime: OS integration (Windows) ───────────────────────────────
 keyring==25.7.0          # Finnhub API key in Windows Credential Manager
-psutil==5.9.5            # Firefox process detection for cookie refresh
-pywin32==304             # win32gui/win32process — cookie-browser placement
+psutil==7.2.2            # Firefox process detection for cookie refresh
+# pywin32 also provides win32crypt, which DPAPI-wraps zacks_cookies.txt.
+# IMPORTANT after any pywin32 install/upgrade in a conda env: run
+#   python Scripts/pywin32_postinstall.py -install
+# It copies pywintypes3XX.dll / pythoncom3XX.dll next to the interpreter.
+# Without it `import win32crypt` raises "DLL load failed ... procedure could
+# not be found" and cookie storage SILENTLY degraded to plaintext before the
+# 2026-08-12 audit (SEC-7) made that fallback a visible WARNING. Verified on
+# 312: DPAPI round-trip, cookie file round-trip, and win32gui all pass.
+pywin32==312             # win32crypt (DPAPI) + win32gui/win32process
 PyAutoGUI==0.9.54        # TradeStation bridge + per-row HOTKEY sender
 
 # ── Build / test tooling (not needed to run the exe) ────────────────

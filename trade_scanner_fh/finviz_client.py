@@ -39,6 +39,7 @@ import random
 import threading
 import time
 from typing import Optional
+from urllib.parse import quote
 
 from curl_cffi import requests as creq
 
@@ -166,12 +167,20 @@ def fetch_earnings(symbol: str, *, timeout: float = 25.0) -> Optional[list[dict]
     looks like a real finviz quote page, else ``FAIL_BLOCKED`` (a
     challenge / throttle page that happens to return 200).
     """
-    sym = (symbol or "").upper().strip()
+    # Audit 2026-08-12 (SEC-3): allowlist at the builder, not just at ingest.
+    # The symbol is interpolated into the URL, where requests' safe-parameter
+    # encoding does not apply — `AAPL/../../admin` previously survived the
+    # universe denylist and reached finviz verbatim. Defence in depth: spot
+    # fill takes a hand-typed symbol that never passed through the universe
+    # filter at all. quote() then encodes whatever the allowlist permits
+    # (`$` and `^` are legal in a query value but must not be raw).
+    sym = config.url_safe_ticker(symbol)
     if not sym:
+        log.warning("finviz: refusing implausible symbol %r", symbol)
         _set_failure(FAIL_NETWORK)
         return None
 
-    url = _EARNINGS_URL.format(sym=sym)
+    url = _EARNINGS_URL.format(sym=quote(sym, safe=""))
     _limiter.acquire()
     try:
         r = creq.get(url, impersonate="chrome", headers=_HEADERS,

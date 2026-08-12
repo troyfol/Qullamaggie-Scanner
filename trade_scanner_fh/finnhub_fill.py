@@ -113,6 +113,24 @@ def _record_to_history_dict(
     if period_ts < cutoff:
         return None
 
+    # Audit 2026-08-12 (INT-7): require a reported EPS, matching what the finviz
+    # builder already does (`eps_actual is not None`). Finnhub's /stock/earnings
+    # returns scheduled-but-unreported quarters with `actual: null`, and passing
+    # those through created a real row that OCCUPIED its (ticker, period_ending)
+    # slot with reported_eps=NaN. That row then suppressed its own repair: the
+    # smart-refresh selector counts any row as "has history" and takes
+    # max(report_date) with no EPS filter, so the gap fill that would have
+    # replaced it never queued. The live store held 3,500 such rows — all with
+    # PAST report dates, so none was a legitimate forward placeholder — and 89
+    # tickers had one as their newest "captured" quarter.
+    #
+    # Revenue-only rows are intentionally still rejected here: without an EPS the
+    # row cannot satisfy any of the earnings filters, and its presence is
+    # actively harmful to refresh selection. The raw audit layer keeps the
+    # original response either way.
+    if record.get("actual") is None:
+        return None
+
     # Normalize period_ending to day-1 of its month (Zacks convention).
     # Finnhub returns true calendar quarter-end (e.g. 2026-03-31); Zacks
     # uses 2026-03-01. Without this normalization, dedup keyed on
@@ -358,7 +376,7 @@ def _flush_pending_to_disk(
     pending: dict[str, list[dict]],
     *,
     is_final: bool = False,
-) -> None:
+) -> bool:
     """Merge ``pending`` (ticker → list of finnhub-source rows) into
     earnings_history.parquet. Replaces only the (ticker, source=finnhub)
     rows for those tickers — Zacks rows for the same ticker are
@@ -371,8 +389,11 @@ def _flush_pending_to_disk(
     ENB → ENB.TO canonicalization), causing the pending-key form to
     miss the existing-row form and pile duplicates run-over-run. Using
     the row's own ticker is correct regardless of how it was sourced.
+
+    Returns False if the merge was deferred because the store was unreadable
+    (audit 2026-08-12, INT-1); the caller must not advance the checkpoint.
     """
-    fill_framework.flush_pending_to_disk(
+    return fill_framework.flush_pending_to_disk(
         pending, source="finnhub", is_final=is_final,
     )
 
@@ -394,7 +415,7 @@ def _fill_via_finnhub(
     *,
     progress_cb=None,
     stop_flag: Optional[list[bool]] = None,
-    flush_every: int = 25,
+    flush_every: int = config.FILL_FLUSH_EVERY,
     label: str = "Finnhub fill",
     on_block_callback=None,
     on_etf_identified=None,
@@ -534,7 +555,7 @@ def gap_fill_finnhub(
     *,
     progress_cb=None,
     stop_flag: Optional[list[bool]] = None,
-    flush_every: int = 25,
+    flush_every: int = config.FILL_FLUSH_EVERY,
     on_block_callback=None,
     on_etf_identified=None,
     failed_cb=None,

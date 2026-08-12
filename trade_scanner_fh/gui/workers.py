@@ -17,7 +17,7 @@ from .. import config
 from ..data_engine import (
     _last_cached_date, download_many, download_one, prefetch_ohlcv,
 )
-from ..scanner import ScanParams, ScanResult, run_scan
+from ..scanner import ScanParams, ScanResult, build_scan_context, run_scan
 from ..ticker_universe import refresh_universe
 from ..tradestation import BridgeConfig, TradeStationBridge
 
@@ -119,6 +119,21 @@ class ScanWorker(QThread):
         # the earliest period that claimed it.
         working_symbols: list[str] = list(self.symbols)
 
+        # Audit 2026-08-12 (EFF-3): build the run-wide lookups ONCE. run_scan
+        # used to rebuild the whole earnings setup — a 148k-row parquet read,
+        # dedupe, YoY recompute, sort and a ~6,300-group groupby — per
+        # timeframe. A sequenced run can emit 30 chunks, i.e. 30 identical
+        # rebuilds. Flags are OR-ed across params_list inside the builder, so
+        # one context serves every timeframe. A failure here must not abort
+        # the scan: run_scan falls back to building its own.
+        scan_context = None
+        try:
+            scan_context = build_scan_context(
+                [p for _lbl, p in self.params_list])
+        except Exception as exc:
+            log.warning("Scan context build failed (%s) — each timeframe will "
+                        "build its own", exc)
+
         try:
             for idx, (label, params) in enumerate(self.params_list, 1):
                 if self._stop.is_set():
@@ -152,6 +167,7 @@ class ScanWorker(QThread):
                     working_symbols, params,
                     progress_cb=cb,
                     cancel_token=self._stop.is_set,
+                    context=scan_context,
                 )
                 total_elapsed += result.elapsed_sec
                 all_errors.extend(result.errors)
@@ -538,6 +554,21 @@ class SectorFillWorker(QThread):
                 existing = load_sector_map()
                 mapped = set(existing["ticker"]) if existing is not None else set()
                 gaps = [s for s in self.symbols if s not in mapped and s not in self.blacklist]
+                # Audit 2026-08-12 (INT-13): also refresh a BOUNDED batch of
+                # the oldest rows. Filling only gaps meant a mapped ticker was
+                # never revisited, so GICS reclassifications never propagated.
+                # Capped per run so the sweep amortises across sessions rather
+                # than turning one click into a 15k-ticker yfinance run.
+                from ..sector_map import stale_sector_tickers
+                in_universe = set(self.symbols) - self.blacklist
+                stale = [t for t in stale_sector_tickers(existing)
+                         if t in in_universe][:config.SECTOR_STALE_MAX_PER_RUN]
+                if stale:
+                    self.log_msg.emit(
+                        f"Targeted sector fill: refreshing {len(stale)} row(s) "
+                        f"older than {config.SECTOR_STALE_DAYS} days"
+                    )
+                    gaps = gaps + [t for t in stale if t not in set(gaps)]
                 self.log_msg.emit(f"Targeted sector fill: {len(gaps)} gaps to process")
                 filled, errors = targeted_fill_sectors(
                     gaps, self.blacklist,
@@ -650,7 +681,7 @@ class ZacksFillWorker(QThread):
         mode: str = "smart",
         *,
         delay_sec: float = 1.5,
-        flush_every: int = 25,
+        flush_every: int = config.FILL_FLUSH_EVERY,
         # None → config.EARNINGS_HISTORY_YEARS, resolved inside the fill at
         # call time so the Settings → Advanced… depth override applies live.
         # (Was a stale literal 5 that silently pinned GUI Zacks fills to 5y
@@ -933,7 +964,8 @@ class FinnhubFillWorker(QThread):
     finished = pyqtSignal(int, int)              # filled, errors
 
     def __init__(self, symbols: list[str], blacklist: set[str], *,
-                 mode: str = "bulk", flush_every: int = 25):
+                 mode: str = "bulk",
+                 flush_every: int = config.FILL_FLUSH_EVERY):
         """``mode`` ∈ {"bulk", "gap", "targeted"}. "targeted" is the
         smart-refresh path — same iterate-exactly-these-symbols semantics
         as "gap". Spot fills run inline in the main thread — no worker
@@ -1035,7 +1067,8 @@ class FinvizFillWorker(QThread):
     finished = pyqtSignal(int, int)              # filled, errors
 
     def __init__(self, symbols: list[str], blacklist: set[str], *,
-                 mode: str = "bulk", flush_every: int = 25):
+                 mode: str = "bulk",
+                 flush_every: int = config.FILL_FLUSH_EVERY):
         """``mode`` ∈ {"bulk", "gap", "targeted"}. "targeted" is the
         smart-refresh path — same iterate-exactly-these-symbols semantics
         as "gap". Spot fills run inline in the main thread — no worker

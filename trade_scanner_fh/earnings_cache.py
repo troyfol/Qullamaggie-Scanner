@@ -11,7 +11,8 @@ The bulk (Nasdaq) and targeted (yfinance) fill code has moved to
 has been deleted — Finnhub now has its own dedicated deep-history
 module (``finnhub_fill.py``).
 
-Schema (Phase 1 added the ``source`` column):
+Schema (Phase 1 added the ``source`` column; audit 2026-08-12 / INT-4 added
+``last_source`` / ``next_source``):
 
     ticker          string
     last_earnings   datetime64[ns]
@@ -20,6 +21,19 @@ Schema (Phase 1 added the ``source`` column):
     source          string         "zacks_derived" | "finnhub_derived" |
                                    "nasdaq" | "yahoo" | "zacks+yahoo_aug"
                                    etc. — set by writer.
+    last_source     string         RAW origin of last_earnings ("finviz",
+                                   "nasdaq", …). NA on rows written before
+                                   the column existed.
+    next_source     string         RAW origin of next_earnings. NA likewise.
+
+``source`` is a COMPOUND, MUTABLE label the reconciler rewrites on every pass.
+It was also the only provenance the reconciler had to read its own inputs back
+out of, which destroyed data: ``reconcile`` matched ``source == "finviz"``
+exactly, then relabelled that row ``finviz_derived``, so the *second* pass
+found no finviz input and NaT'd the forward date finviz alone supplies. The
+live store showed 1,500 of 1,505 ``_derived`` rows with no ``next_earnings``.
+``last_source`` / ``next_source`` are the immutable per-position origins, so
+each pass is idempotent and nasdaq/yahoo attribution survives relabelling.
 
 Source values stamped by the active fill paths:
 
@@ -42,7 +56,11 @@ log = logging.getLogger("scanner.earnings")
 
 # Canonical column order for earnings_dates.parquet.
 COLUMNS: list[str] = ["ticker", "last_earnings", "next_earnings",
-                      "updated_at", "source"]
+                      "updated_at", "source", "last_source", "next_source"]
+
+# Per-position provenance columns (audit INT-4). Absent on any row written
+# before 2026-08-12; readers must treat NA as "fall back to `source`".
+POSITION_SOURCE_COLUMNS: tuple[str, str] = ("last_source", "next_source")
 
 # Serializes the load→modify→save cycle on earnings_dates.parquet. Mirrors
 # earnings_history.HISTORY_WRITE_LOCK: the launch-time smart refresh runs the
@@ -99,6 +117,12 @@ def load_earnings_cache() -> pd.DataFrame | None:
         df["source"] = "legacy"
     else:
         df["source"] = df["source"].fillna("legacy")
+    # Present-but-null on every pre-INT-4 row. Materialise the columns so
+    # readers can test them uniformly; NA keeps meaning "unknown — fall back
+    # to the compound `source` label", which is what the reconciler does.
+    for col in POSITION_SOURCE_COLUMNS:
+        if col not in df.columns:
+            df[col] = pd.NA
     return df
 
 
@@ -129,6 +153,36 @@ def get_earnings_dates(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _collapse_by_ticker(combined: pd.DataFrame) -> pd.DataFrame:
+    """One row per ticker, newest wins — except that a NULL date never
+    overwrites a known one (audit 2026-08-12, INT-4).
+
+    A plain ``keep="last"`` let a raw fill that learned only ONE position erase
+    the other. ``finviz_fill`` writes ``last_earnings=NaT`` with the forward
+    date, so every finviz fill wiped the ``last_earnings`` a nasdaq sweep had
+    put there — and ``find_smart_refresh_candidates`` keys Rule B on
+    ``last_earnings``, so losing it demoted the ticker to the slower refresh
+    cadence. The selector was degrading itself.
+
+    NaT here means "this fill didn't learn it", never "it was cleared": no code
+    path deliberately clears a date, and the reconciler re-derives the whole
+    row under its own lock rather than going through this helper.
+    """
+    if combined.empty or not combined["ticker"].duplicated().any():
+        return combined.reset_index(drop=True)
+    # Row identity (source, updated_at, …) comes from the newest row; each date
+    # falls back through older rows independently. groupby().last() skips nulls,
+    # and preserves input order within a group, so "last" is the newest
+    # non-null — correct even when a ticker appears three or more times.
+    newest = combined.drop_duplicates(
+        subset=["ticker"], keep="last").set_index("ticker")
+    for col in ("last_earnings", "next_earnings"):
+        if col in combined.columns:
+            newest[col] = combined.groupby("ticker")[col].last().reindex(
+                newest.index)
+    return newest.reset_index()
+
 
 def _merge_and_save(new_rows: list[dict], existing: pd.DataFrame | None):
     """Merge new earnings rows with existing cache and save."""
@@ -165,7 +219,7 @@ def _merge_and_save(new_rows: list[dict], existing: pd.DataFrame | None):
 
         if base is not None and not base.empty:
             combined = pd.concat([base, new_df])
-            combined = combined.drop_duplicates(subset=["ticker"], keep="last")
+            combined = _collapse_by_ticker(combined)
         else:
             combined = new_df
         save_earnings_cache(combined)

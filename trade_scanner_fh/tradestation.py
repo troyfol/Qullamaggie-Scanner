@@ -16,6 +16,8 @@ from typing import Callable, Optional
 
 import pyautogui
 
+from .hotkey import target_window_allowed
+
 log = logging.getLogger("scanner.tradestation")
 
 # Keys the watchlist dialog offers for the per-ticker confirm keystroke. A
@@ -152,6 +154,24 @@ class TradeStationBridge:
             if self.cfg.dry_run:
                 self._log(f"  [{i}/{total}] Would type: {sym}")
             else:
+                # Audit 2026-08-12 (SEC-10): the bridge types a WHOLE
+                # watchlist, so a focus change partway through would spray the
+                # rest of the list into whatever stole it. Re-checked every
+                # iteration rather than once up front for exactly that reason.
+                # Fails open when no hint is configured (see
+                # hotkey.target_window_allowed).
+                allowed, where = target_window_allowed()
+                if not allowed:
+                    self._log(
+                        f"  [{i}/{total}] ABORTED — foreground window {where} "
+                        f"does not match the configured target; "
+                        f"{total - i + 1} ticker(s) not sent."
+                    )
+                    log.warning(
+                        "TradeStation bridge aborted at %d/%d: wrong "
+                        "foreground window %s", i, total, where,
+                    )
+                    break
                 self._log(f"  [{i}/{total}] Typing: {sym}")
                 # Type LOWERCASE: pyautogui capitalizes by holding Shift, and a
                 # Shift+letter lands on platform order-entry hotkeys (e.g.

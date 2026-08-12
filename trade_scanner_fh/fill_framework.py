@@ -42,6 +42,13 @@ import pandas as pd
 from . import config
 from . import earnings_raw
 
+# Module-level logger. Most functions here take a caller-supplied `log`
+# (which shadows this inside those functions, deliberately — each fill worker
+# passes its own channel). `flush_pending_to_disk` does NOT take one, and its
+# INT-1 deferral branch needs to report, so it uses this. Same channel as
+# earnings_history so the message lands in the same file and the GUI panel.
+log = logging.getLogger("scanner.earnings_history")
+
 
 # Failure-kind value every source's client uses for "page fetched but
 # un-parseable" (finviz FAIL_PARSE, finnhub FAIL_PARSE, zacks
@@ -76,18 +83,65 @@ def save_checkpoint(path: Path, cp: Checkpoint, log: logging.Logger) -> None:
         log.warning("Checkpoint write failed: %s", exc)
 
 
+# A checkpoint older than this is ignored. Audit 2026-08-12 (INT-10):
+# `started_at` was parsed and never used, so a checkpoint from a run abandoned
+# months earlier made the next bulk fill a silent no-op for most of the
+# universe — and then deleted the evidence by clearing the checkpoint. A resume
+# is only useful within the same session or the next, so a day is generous.
+CHECKPOINT_MAX_AGE_HOURS = 24
+
+
 def load_checkpoint(path: Path, log: logging.Logger) -> Optional[Checkpoint]:
+    """Load a resume checkpoint, or None if absent / unusable / stale.
+
+    Audit 2026-08-12 (INT-10): hardened three ways —
+      * valid JSON of the wrong TYPE (``[]``, ``null``, ``"x"``) raised an
+        uncaught AttributeError here (the handler caught only OSError/
+        ValueError), which surfaced as an undiagnosable "fill error" from the
+        worker's generic handler. Now shape-checked like the other JSON stores
+        (see scan_history.load_history / scheduler.load_schedules).
+      * a stale checkpoint is now rejected on age.
+      * an unparseable ``started_at`` is treated as stale rather than trusted.
+    """
     if not path.exists():
         return None
     try:
         d = json.loads(path.read_text(encoding="utf-8"))
-        return Checkpoint(
-            run_id=str(d.get("run_id", "")),
-            started_at=str(d.get("started_at", "")),
-            completed=[str(t) for t in (d.get("completed") or []) if t],
-        )
     except (OSError, ValueError) as exc:
         log.warning("Checkpoint read failed: %s", exc)
+        return None
+    if not isinstance(d, dict):
+        log.warning(
+            "Checkpoint at %s is %s, not an object — ignoring it and starting "
+            "a fresh run", path.name, type(d).__name__,
+        )
+        return None
+    started_at = str(d.get("started_at", ""))
+    try:
+        age_h = (datetime.now() - datetime.fromisoformat(started_at)) \
+            .total_seconds() / 3600.0
+    except (TypeError, ValueError):
+        log.warning(
+            "Checkpoint at %s has an unreadable started_at (%r) — ignoring it "
+            "rather than trusting its completed set", path.name, started_at,
+        )
+        return None
+    if age_h > CHECKPOINT_MAX_AGE_HOURS:
+        log.warning(
+            "Checkpoint at %s is %.1f h old (limit %d h) — ignoring it so the "
+            "run does not silently skip its %d recorded ticker(s)",
+            path.name, age_h, CHECKPOINT_MAX_AGE_HOURS,
+            len(d.get("completed") or []),
+        )
+        return None
+    try:
+        return Checkpoint(
+            run_id=str(d.get("run_id", "")),
+            started_at=started_at,
+            completed=[str(t) for t in (d.get("completed") or []) if t],
+        )
+    except (TypeError, ValueError) as exc:
+        log.warning("Checkpoint has an unusable completed list: %s", exc)
         return None
 
 
@@ -107,7 +161,7 @@ def flush_pending_to_disk(
     *,
     source: str,
     is_final: bool = False,
-) -> None:
+) -> bool:
     """Merge ``pending`` (ticker → list of ``source``-tagged rows) into
     earnings_history.parquet, replacing only the (ticker, source) rows
     for those tickers — other sources' rows for the same ticker are
@@ -120,11 +174,15 @@ def flush_pending_to_disk(
     the pending-key form to miss the existing-row form and pile
     duplicates run-over-run. Using the row's own ticker is correct
     regardless of how it was sourced.
+
+    Returns True when the merge reached disk (or there was nothing to write),
+    False when it was DEFERRED because the store was unreadable — callers must
+    not advance the checkpoint on False (audit 2026-08-12, INT-1).
     """
     from . import earnings_history as eh
 
     if not pending:
-        return
+        return True
 
     # Same cross-worker R-M-W race fix as earnings_history's own
     # _flush_pending_to_disk: the on-disk save is atomic, but the
@@ -154,6 +212,21 @@ def flush_pending_to_disk(
                 subset=["ticker", "period_ending"], keep="last",
             ).reset_index(drop=True)
 
+        # Audit 2026-08-12 (INT-1, CRITICAL): refuse to write when the store
+        # EXISTS but could not be read. Without this, one transient sharing
+        # violation (antivirus, backup agent, cloud sync) replaced the entire
+        # 148k-row history with just this flush buffer — measured at 100% loss.
+        # Returning leaves `pending` untouched in the caller, so the next flush
+        # retries; nothing is lost. Mirrors earnings_cache._merge_and_save.
+        if existing is None and eh.history_read_failed():
+            log.error(
+                "earnings_history.parquet unreadable — deferring merge of %d "
+                "row(s) for %d ticker(s) to avoid truncating the store; the "
+                "next flush will retry",
+                len(new_df), len(pending),
+            )
+            return False
+
         if existing is not None and not existing.empty:
             new_tickers = set(new_df["ticker"].dropna().astype(str).unique())
             mask_replace = (
@@ -166,6 +239,7 @@ def flush_pending_to_disk(
             combined = new_df
 
         eh.save_earnings_history(combined, sort=is_final)
+        return True
 
 
 def find_gap_tickers(
@@ -246,7 +320,7 @@ def run_fill_loop(
     fetch_kwargs: dict,
     progress_cb=None,
     stop_flag: Optional[list[bool]] = None,
-    flush_every: int = 25,
+    flush_every: int = config.FILL_FLUSH_EVERY,
     label: str,
     on_block_callback=None,
     on_empty_identified=None,
@@ -357,7 +431,22 @@ def run_fill_loop(
         # `completed` while side data lives only in memory), then the
         # checkpoint (in that order so the checkpoint never claims
         # tickers whose history rows aren't on disk yet).
-        mod._flush_pending_to_disk(pending)
+        #
+        # Audit 2026-08-12 (INT-1): the flush can now DEFER (returning False)
+        # when the store is unreadable. Advancing the checkpoint anyway would
+        # break the very ordering contract described above — the tickers would
+        # be recorded as `completed` while their rows existed only in memory, so
+        # a resume after a crash would skip them permanently. `pending` is never
+        # cleared during a run and each flush rewrites all of it, so holding the
+        # checkpoint back costs nothing: the next flush persists everything.
+        wrote = mod._flush_pending_to_disk(pending)
+        if wrote is False:
+            log.warning(
+                "%s: holding the checkpoint at %d ticker(s) — the history "
+                "write deferred, so the completed set is not yet durable",
+                label, len(completed),
+            )
+            return
         _flush_raw()
         if persist_extra is not None:
             persist_extra()

@@ -223,10 +223,14 @@ def test_send_misses_to_skip_list_dedupes_against_existing(_qapp, tmp_path, monk
     assert "<b>3</b>" in msg, f"expected 3 new, msg = {msg}"
     assert "<b>2</b>" in msg, f"expected 2 already-on-list, msg = {msg}"
 
-    # File written: one ticker per line, sorted
+    # File written: one entry per line, sorted. Since audit 2026-08-12 (INT-5)
+    # each line is TICKER<TAB>ADDED_ON<TAB>REASON under a `#` header, so the
+    # skip lists can support a re-validation cadence; assert on the ticker
+    # column rather than the whole line.
     written = (tmp_path / "zacks_blacklist.txt").read_text(encoding="utf-8")
-    lines = [ln for ln in written.split("\n") if ln.strip()]
-    assert lines == ["AAPL", "GOOGL", "MSFT", "NVDA", "TSLA"]
+    tickers = [ln.split("\t")[0] for ln in written.split("\n")
+               if ln.strip() and not ln.startswith("#")]
+    assert tickers == ["AAPL", "GOOGL", "MSFT", "NVDA", "TSLA"]
 
 
 def test_send_misses_to_skip_list_normalizes_unicode_dashes(_qapp, tmp_path, monkeypatch):

@@ -2571,9 +2571,23 @@ class ResultsTable(QTableView):
             # "user clicked dropdown again during yield" case.
             from PyQt6.QtWidgets import QApplication as _QApp
             _CHUNK = 200
+            # Audit 2026-08-12 (EFF-9): materialise the rows ONCE. `df.iloc[r]`
+            # built an object-dtype Series per row — at 15k × ~100 columns that
+            # is 15k transposed copies before a single cell is written. Dicts
+            # expose the same `.get(key)` the per-cell lookups already use, so
+            # `_populate_row` is unchanged. Falls back to the per-row path if
+            # the conversion ever fails, so a render can't be lost to it.
+            try:
+                records = df.to_dict("records")
+            except Exception as exc:
+                log.warning("row pre-extract failed (%s) — using iloc", exc)
+                records = None
             for r in range(n):
                 try:
-                    self._populate_row(r, df.iloc[r], cols)
+                    self._populate_row(
+                        r, records[r] if records is not None else df.iloc[r],
+                        cols,
+                    )
                 except Exception as exc:
                     # Per-row safety net: a single bad row MUST NOT
                     # crash the table render. Log and continue with the

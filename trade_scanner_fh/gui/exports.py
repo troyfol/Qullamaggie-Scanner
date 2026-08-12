@@ -30,6 +30,7 @@ import csv
 import logging
 import re
 from datetime import datetime
+from functools import lru_cache
 from typing import Optional
 
 import pandas as pd
@@ -44,6 +45,43 @@ from .widgets import _fmt_date, RESULT_COLUMNS
 # Same logger channel as main_window so the extracted log lines keep
 # their historical "scanner.gui" tag in the panel / subsystem files.
 log = logging.getLogger("scanner.gui")
+
+
+# ── CSV / XLSX formula-injection neutralisation (audit 2026-08-12, SEC-12) ──
+#
+# Exports wrote cell values straight through, so a string beginning `= + - @`
+# (or a tab / CR) is interpreted as a FORMULA when the file is opened in Excel
+# or Sheets — the classic `=cmd|' /C calc'!A0` DDE payload. Impact is low today
+# because exported columns are tickers and numerics, but the universe filter
+# was the only thing keeping `+ = @` out and SEC-3 showed that gate was
+# incomplete, so the mitigation was incidental rather than designed.
+_FORMULA_LEAD = ("=", "+", "@", "\t", "\r")
+_NUMERIC_RE = re.compile(r"^-?\d[\d,]*\.?\d*\s*%?$")
+
+
+def _neutralize_formula(value):
+    """Prefix a leading ``'`` when a STRING cell would be read as a formula.
+
+    Numeric values are returned untouched — they arrive as floats and must stay
+    numeric so Excel formats them as numbers. A leading ``-`` is only escaped
+    when the string isn't a plain negative number, so an exported "-3.2%" keeps
+    its exact text while "-1+1+cmd|…" does not.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    if value[0] in _FORMULA_LEAD:
+        return "'" + value
+    if value[0] == "-" and not _NUMERIC_RE.match(value):
+        return "'" + value
+    return value
+
+
+def _neutralize_formulas(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Apply `_neutralize_formula` to every object-dtype column in place."""
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = [_neutralize_formula(v) for v in df[col]]
+    return df
 
 
 class ExportsController:
@@ -130,7 +168,7 @@ class ExportsController:
                 out[display_header] = df[source_key].values
             else:
                 out[display_header] = [""] * n
-        return pd.DataFrame(out)
+        return _neutralize_formulas(pd.DataFrame(out))
 
     @staticmethod
     def _sanitize_sheet_name(label: str, used: set[str]) -> str:
@@ -450,25 +488,27 @@ class ExportsController:
                 out.append((f"News_{header}", None, True))
         return out
 
-    def _is_export_color(self, rgb: tuple[int, int, int]) -> bool:
-        """True iff the (r, g, b) tuple is one of the colors we
-        deliberately apply in the table render (palette match-color,
-        streak green, or display-only fail red). All other colors
-        (including the implicit default foreground) are skipped."""
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _export_color_set() -> frozenset:
+        """The (r, g, b) tuples the table deliberately renders: the curated
+        align palette, streak green, and display-only fail red.
+
+        Audit 2026-08-12 (EFF-10): built once instead of linear-scanning a
+        12-entry palette per exported cell inside a rows × cols loop. Cached
+        on the class because the palette is defined at class-definition time
+        and never changes at runtime."""
         from .widgets import ResultsTable
-        # Curated palette
-        for c in ResultsTable._ALIGN_PALETTE:
-            if (c.red(), c.green(), c.blue()) == rgb:
-                return True
-        # Streak green
-        sg = ResultsTable._STREAK_GREEN
-        if (sg.red(), sg.green(), sg.blue()) == rgb:
-            return True
-        # Fail red
-        fr = ResultsTable._FAIL_RED
-        if (fr.red(), fr.green(), fr.blue()) == rgb:
-            return True
-        return False
+        colors = list(ResultsTable._ALIGN_PALETTE)
+        colors.append(ResultsTable._STREAK_GREEN)
+        colors.append(ResultsTable._FAIL_RED)
+        return frozenset((c.red(), c.green(), c.blue()) for c in colors)
+
+    def _is_export_color(self, rgb: tuple[int, int, int]) -> bool:
+        """True iff `rgb` is one of the colors we deliberately apply in the
+        table render. All other colors (including the implicit default
+        foreground) are skipped."""
+        return rgb in self._export_color_set()
 
     def _write_csv_export(
         self, path: str, periods: list[str], keys: list[str], wants_news: bool,
@@ -547,8 +587,12 @@ class ExportsController:
                     w = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
                     w.writerow(headers)
                     for r in range(rows):
+                        # SEC-12: this path writes DisplayRole strings straight
+                        # out, bypassing _build_export_df's neutralisation.
                         row_data = [
-                            proxy.index(r, c).data(Qt.ItemDataRole.DisplayRole) or ""
+                            _neutralize_formula(
+                                proxy.index(r, c).data(
+                                    Qt.ItemDataRole.DisplayRole) or "")
                             for c in range(cols)
                         ]
                         w.writerow(row_data)

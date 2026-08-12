@@ -15,6 +15,7 @@ import logging
 import math
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Callable, Literal, Optional
@@ -501,8 +502,16 @@ def _compute_ticker(
     if df is None or df.empty:
         return None
 
-    # R10: copy before tz-mutation so we never modify the cached DataFrame
-    if df.index.tz is not None:
+    # R10: copy before tz-mutation so we never modify the cached DataFrame.
+    #
+    # Audit 2026-08-12 (EFF-4): this is now a genuine no-op safety net rather
+    # than the hot path it used to be. `load_ohlcv` strips the timezone once at
+    # read time, so this branch no longer fires. Previously EVERY cached file had
+    # a `datetimetz America/New_York` index, making this a full-frame copy for
+    # every ticker on every timeframe (~840 MB of copy churn per universe scan)
+    # while reading as a rare defensive path. Kept in case a caller ever hands
+    # in a tz-aware frame from somewhere other than the cache.
+    if getattr(df.index, "tz", None) is not None:
         df = df.copy()
         df.index = df.index.tz_localize(None)
 
@@ -1390,11 +1399,27 @@ def _build_filter_stages(params: ScanParams) -> list[tuple[str, Callable]]:
         "yoy_eps_pct", "yoy_rev_pct",
     )
 
+    # Audit 2026-08-12 (EFF-10): memoised per frame identity. Up to three of
+    # the filter lambdas below call this on the SAME frame within one funnel
+    # pass, each recomputing an 8-column `.notna().any(axis=1)` over the whole
+    # result set. Keyed by id() + length, and only the most recent frame is
+    # kept, so a later stage's narrowed frame can never collide with an
+    # earlier one's cached mask.
+    _dpm_cache: dict = {}
+
     def _data_present_mask(df):
+        key = (id(df), len(df))
+        hit = _dpm_cache.get(key)
+        if hit is not None:
+            return hit
         present = [c for c in _DATA_COVERAGE_COLS if c in df.columns]
         if not present:
-            return pd.Series(False, index=df.index)
-        return df[present].notna().any(axis=1)
+            mask = pd.Series(False, index=df.index)
+        else:
+            mask = df[present].notna().any(axis=1)
+        _dpm_cache.clear()
+        _dpm_cache[key] = mask
+        return mask
 
     # #17 Days since last earnings
     if params.days_since_earnings_enabled and not params.days_since_earnings_display_only:
@@ -1553,6 +1578,125 @@ def _build_filter_stages(params: ScanParams) -> list[tuple[str, Callable]]:
 
 
 # ============================================================================
+# Scan context — the per-run setup, hoisted out of the timeframe loop
+# ============================================================================
+
+@dataclass
+class ScanContext:
+    """Read-only lookups shared by every timeframe of one scan run.
+
+    Audit 2026-08-12 (EFF-3): ``ScanWorker.run`` calls ``run_scan`` once per
+    timeframe label, and ``run_scan`` rebuilt ALL of this each time — a full
+    148k-row ``earnings_history.parquet`` read, ``dedupe_history`` (copy +
+    sort + a 6-column groupby-bfill + drop_duplicates), ``compute_yoy_columns``
+    (another copy plus a DateOffset shift and merge), another sort, and a
+    ``groupby("ticker")`` materialising ~6,300 sub-frames. A 5-checkbox scan
+    did that 5×; a SEQUENCED run is far worse — ``chunk_periods`` can emit 30
+    chunks for a 5-year/2-month config, i.e. 30 identical rebuilds.
+
+    None of it depends on the date window, only on which filters are enabled,
+    so it is built once per run and passed in. Everything here is treated as
+    immutable by the compute path — which is also what makes EFF-1's thread
+    pool safe.
+    """
+    sector_lookup: dict[str, str] = field(default_factory=dict)
+    earnings_lookup: dict[str, tuple] = field(default_factory=dict)
+    earnings_history_lookup: dict[str, pd.DataFrame] = field(
+        default_factory=dict)
+
+
+def _needs_sector(params_list: list[ScanParams]) -> bool:
+    return any(p.rs_sector_enabled for p in params_list)
+
+
+def _needs_earnings_dates(params_list: list[ScanParams]) -> bool:
+    # Audit BUG-7: display-only counts too — the per-ticker block is gated on
+    # a non-empty lookup, so without these flags a display-only user gets
+    # empty days_since_er / days_until_er columns.
+    return any(
+        p.days_since_earnings_enabled or p.days_since_earnings_display_only
+        or p.days_until_earnings_enabled or p.days_until_earnings_display_only
+        or p.days_until_max_enabled or p.days_until_max_display_only
+        for p in params_list
+    )
+
+
+def build_scan_context(params_list: list[ScanParams]) -> ScanContext:
+    """Build the shared lookups once for a whole multi-timeframe run.
+
+    Flags are OR-ed across ``params_list`` so a context built for the run
+    satisfies every timeframe in it, not just the first.
+    """
+    ctx = ScanContext()
+
+    # ── Sector map → O(1) ticker → sector-ETF ──
+    if _needs_sector(params_list):
+        from .sector_map import load_sector_map
+        sector_map_df = load_sector_map()
+        if sector_map_df is None or sector_map_df.empty:
+            log.warning("No sector_map.parquet — RS Sector will pass all")
+        else:
+            ctx.sector_lookup = {
+                str(t): str(e)
+                for t, e in zip(
+                    sector_map_df["ticker"],
+                    sector_map_df["sector_etf"].fillna(""),
+                )
+                if e
+            }
+
+    # ── earnings_history → per-ticker frame ──
+    # Audit H2: always load when the parquet exists, not just when a Phase 7
+    # filter is on — per spec §9.2 step 2 the seven single-quarter columns must
+    # surface even on a filterless scan. A missing parquet leaves the lookup
+    # empty (expected on a fresh install), so no warning.
+    from .earnings_history import (
+        load_earnings_history, dedupe_history, compute_yoy_columns,
+    )
+    history_df = load_earnings_history()
+    if history_df is not None and not history_df.empty:
+        # Per-(ticker, period_ending) dedup is a READ-side responsibility — the
+        # on-disk parquet legitimately carries multiple source rows per quarter
+        # (zacks + finnhub). Without this each fiscal quarter appeared twice in
+        # the per-ticker slice, so the most-recent-quarter columns and the Q-i
+        # beats display picked up the wrong source row and shifted by a
+        # quarter. `backfill_estimates=True` inherits the estimate/surprise
+        # fields the winner lacks from the same-slot lower-priority row.
+        history_df = dedupe_history(history_df, backfill_estimates=True)
+        # Recompute YoY on the deduped frame so EPS YoY derives from the
+        # reported_eps actually displayed rather than the pre-dedup value.
+        history_df = compute_yoy_columns(history_df)
+        # Audit M4: report_date DESC so per-ticker slices line up with what
+        # compute_consecutive_beats and the table's Q-i ordering both use.
+        history_df = history_df.sort_values(
+            ["ticker", "report_date"], ascending=[True, False],
+        )
+        for tk, sub in history_df.groupby("ticker", sort=False):
+            ctx.earnings_history_lookup[str(tk)] = sub.reset_index(drop=True)
+        log.info("Loaded earnings_history for %d tickers",
+                 len(ctx.earnings_history_lookup))
+
+    # ── earnings_dates → (last, next) per ticker ──
+    if _needs_earnings_dates(params_list):
+        from .earnings_cache import load_earnings_cache
+        earnings_df = load_earnings_cache()
+        if earnings_df is None or earnings_df.empty:
+            log.warning(
+                "No earnings_dates.parquet — earnings filters will pass all")
+        else:
+            for t, last_e, next_e in zip(
+                earnings_df["ticker"],
+                earnings_df["last_earnings"],
+                earnings_df["next_earnings"],
+            ):
+                le = None if pd.isna(last_e) else pd.Timestamp(last_e)
+                ne = None if pd.isna(next_e) else pd.Timestamp(next_e)
+                ctx.earnings_lookup[str(t)] = (le, ne)
+
+    return ctx
+
+
+# ============================================================================
 # Main scan entry point
 # ============================================================================
 
@@ -1561,6 +1705,7 @@ def run_scan(
     params: ScanParams,
     progress_cb: Optional[Callable[[int, int, str], None]] = None,
     cancel_token: Optional[Callable[[], bool]] = None,
+    context: Optional[ScanContext] = None,
 ) -> ScanResult:
     """
     Run the full scan pipeline:
@@ -1571,6 +1716,10 @@ def run_scan(
     progress_cb(done, total, symbol) is called after each ticker computation.
     cancel_token() is polled in the per-ticker compute loop; returning True
     interrupts the scan mid-flight and returns partial results (Phase 4 R2).
+
+    ``context`` carries the run-wide lookups (EFF-3). Defaults to building one
+    for this ``params`` alone, so every existing caller and test is unaffected;
+    ``ScanWorker`` builds it once and passes it to every timeframe.
     """
     t0 = time.time()
     result = ScanResult(params=params)
@@ -1597,118 +1746,76 @@ def run_scan(
         log.info("Loaded %d/%d benchmark tickers for RS",
                  len(benchmark_data), len(config.REFERENCE_TICKERS))
 
-    # ── Pre-load sector map and earnings cache as O(1) lookup dicts ──
-    # Phase 2 I4: dict lookup replaces per-ticker DataFrame.loc filtering
-    sector_lookup: dict[str, str] = {}
-    if params.rs_sector_enabled:
-        from .sector_map import load_sector_map
-        sector_map_df = load_sector_map()
-        if sector_map_df is None or sector_map_df.empty:
-            log.warning("No sector_map.parquet — RS Sector will pass all")
-        else:
-            sector_lookup = {
-                str(t): str(e)
-                for t, e in zip(
-                    sector_map_df["ticker"],
-                    sector_map_df["sector_etf"].fillna(""),
-                )
-                if e
-            }
-
-    # ── Pre-load earnings_history per-ticker as O(1) lookup ──
-    # Audit H2: always load earnings_history when the parquet exists, not
-    # just when a Phase 7 filter is on. Per spec §9.2 step 2 the seven
-    # single-quarter columns must surface even on a filterless scan.
-    # When the parquet is missing the lookup stays empty and per-quarter
-    # values come back NaN — no log warning since this is the expected
-    # state on a fresh install before the first Zacks fill runs.
-    earnings_history_lookup: dict[str, pd.DataFrame] = {}
-    from .earnings_history import (
-        load_earnings_history, dedupe_history, compute_yoy_columns,
-    )
-    history_df = load_earnings_history()
-    if history_df is not None and not history_df.empty:
-        # Per-(ticker, period_ending) dedup is a READ-side responsibility
-        # — the on-disk parquet legitimately carries multiple source rows
-        # per quarter (zacks + finnhub). Without this, each fiscal quarter
-        # appeared twice in the per-ticker slice, so the most-recent-
-        # quarter columns and the Q-i beats display picked up the wrong
-        # source row and shifted by a quarter. `dedupe_history` collapses
-        # each slot to its highest-priority source; `backfill_estimates=
-        # True` inherits the estimate/surprise fields the winner lacks
-        # from the same-slot lower-priority row (same adjusted basis).
-        history_df = dedupe_history(history_df, backfill_estimates=True)
-        # Recompute YoY on the deduped frame so the EPS YoY is derived
-        # from the reported_eps actually displayed (one winner per slot)
-        # rather than the pre-dedup multi-source value stored on disk.
-        history_df = compute_yoy_columns(history_df)
-        # Audit M4: sort by report_date DESC so per-ticker slices line
-        # up with what `compute_consecutive_beats` and the table's Q-i
-        # column ordering both use.
-        history_df = history_df.sort_values(
-            ["ticker", "report_date"], ascending=[True, False],
-        )
-        for tk, sub in history_df.groupby("ticker", sort=False):
-            earnings_history_lookup[str(tk)] = sub.reset_index(drop=True)
-        log.info("Loaded earnings_history for %d tickers",
-                 len(earnings_history_lookup))
-
-    # Audit BUG-7 fix: load earnings_dates.parquet whenever any of the
-    # three earnings-date filters is on as EITHER an active filter OR
-    # display-only. Without the `_display_only` flags here, a user who
-    # turned on display-only-only mode for these filters would get
-    # empty `days_since_er` / `days_until_er` columns — the per-ticker
-    # block at `_compute_ticker` is gated by `... and earnings_lookup`,
-    # so an empty lookup means the values never compute.
-    earnings_lookup: dict[str, tuple] = {}
-    if (params.days_since_earnings_enabled
-            or params.days_since_earnings_display_only
-            or params.days_until_earnings_enabled
-            or params.days_until_earnings_display_only
-            or params.days_until_max_enabled
-            or params.days_until_max_display_only):
-        from .earnings_cache import load_earnings_cache
-        earnings_df = load_earnings_cache()
-        if earnings_df is None or earnings_df.empty:
-            log.warning("No earnings_dates.parquet — earnings filters will pass all")
-        else:
-            for t, last_e, next_e in zip(
-                earnings_df["ticker"],
-                earnings_df["last_earnings"],
-                earnings_df["next_earnings"],
-            ):
-                le = None if pd.isna(last_e) else pd.Timestamp(last_e)
-                ne = None if pd.isna(next_e) else pd.Timestamp(next_e)
-                earnings_lookup[str(t)] = (le, ne)
+    # ── Run-wide lookups (EFF-3) ──
+    # Built once per RUN, not once per timeframe. `build_scan_context` carries
+    # the full rationale for each lookup.
+    if context is None:
+        context = build_scan_context([params])
+    sector_lookup = context.sector_lookup
+    earnings_lookup = context.earnings_lookup
+    earnings_history_lookup = context.earnings_history_lookup
 
     # ── Phase A: Compute indicators for all tickers ──
-    rows = []
+    #
+    # Audit 2026-08-12 (EFF-1): this loop was strictly single-threaded over the
+    # whole universe, once per timeframe, while a working thread-pool pattern
+    # already existed in the same package (data_engine.prefetch_ohlcv). Parquet
+    # reads and most numpy/pandas kernels release the GIL, so this is the
+    # largest scan-latency lever available.
+    #
+    # Safety: `_compute_ticker` returns a plain dict and never mutates its
+    # inputs — the frames from `load_ohlcv` and every lookup above are treated
+    # as read-only, and no indicator writes to a passed-in frame (verified: no
+    # `inplace=True` and no column assignment on `df`/`window`/`full_to_end`
+    # anywhere in scanner.py or indicators.py). `load_ohlcv`'s cache is under
+    # its own lock. Results are collected in SYMBOL ORDER so output is
+    # bit-identical to the serial version.
+    rows: list[dict] = []
     cancelled_at: Optional[int] = None
-    for i, sym in enumerate(symbols, 1):
-        # Phase 4 R2: check cancel_token every iteration so the GUI Stop
-        # button can interrupt a long scan mid-flight (previously Stop only
-        # worked between timeframes in a multi-timeframe scan).
+    total = len(symbols)
+    workers = max(1, int(config.SCAN_MAX_WORKERS))
+
+    def _compute_one(item: tuple[int, str]):
+        """Runs on a pool thread. Returns (index, row, error) — exceptions are
+        captured rather than raised so one bad ticker can't kill the batch,
+        matching the serial loop's per-ticker try/except."""
+        i, sym = item
         if cancel_token and cancel_token():
-            cancelled_at = i
-            log.info("Scan cancelled after %d/%d tickers", i - 1, len(symbols))
-            break
+            return (i, None, None)
         try:
-            row = _compute_ticker(
+            return (i, _compute_ticker(
                 sym, params, benchmark_data, sector_lookup, earnings_lookup,
                 earnings_history_lookup,
-            )
-            if row is not None:
-                rows.append(row)
+            ), None)
         except Exception as exc:
-            result.errors.append({
+            log.debug("Error computing %s: %s", sym, exc)
+            return (i, None, {
                 "symbol": sym,
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
             })
-            log.debug("Error computing %s: %s", sym, exc)
 
-        if progress_cb and (i % 200 == 0 or i == len(symbols)):
-            progress_cb(i, len(symbols), sym)
+    # Batched so Stop stays responsive (Phase 4 R2 checked the token every
+    # ticker). The in-worker check above short-circuits already-queued items,
+    # so the effective cancel latency is one in-flight ticker per thread.
+    batch = max(workers * 8, 32)
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix="scan") as pool:
+        for start in range(0, total, batch):
+            if cancel_token and cancel_token():
+                cancelled_at = start + 1
+                log.info("Scan cancelled after %d/%d tickers", start, total)
+                break
+            chunk = list(enumerate(symbols[start:start + batch], start + 1))
+            # pool.map yields in INPUT order, which is what keeps `rows`
+            # deterministic and identical to the serial path.
+            for i, row, err in pool.map(_compute_one, chunk):
+                if row is not None:
+                    rows.append(row)
+                elif err is not None:
+                    result.errors.append(err)
+                if progress_cb and (i % 200 == 0 or i == total):
+                    progress_cb(i, total, symbols[i - 1])
 
     if not rows:
         log.warning("No tickers produced computable results.")
@@ -1736,7 +1843,10 @@ def run_scan(
             mask = filter_fn(current)
             # NaN values should fail the filter
             mask = mask.fillna(False)
-            current = current[mask].copy()
+            # Audit 2026-08-12 (EFF-10): no `.copy()` — boolean-mask indexing
+            # already returns a new frame, so the extra copy duplicated the
+            # whole result set once per stage (~15 stages on a full scan).
+            current = current[mask]
         except Exception as exc:
             log.warning("Filter '%s' raised error: %s — skipping", stage_name, exc)
             continue

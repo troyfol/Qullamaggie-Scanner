@@ -16,9 +16,11 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import logging.handlers
 import sys
 from datetime import date, datetime, timedelta
-from typing import Optional
+from types import MappingProxyType
+from typing import Mapping, Optional
 
 import pandas as pd
 import pyarrow.parquet as pq_reader
@@ -35,7 +37,9 @@ from PyQt6.QtWidgets import (
 
 from .. import __version__, config, finnhub_client, scan_history
 from .. import hotkey as hotkey_mod
-from ..data_engine import check_schema_version, load_ohlcv, rebuild_ticker
+from ..data_engine import (
+    cached_symbols, check_schema_version, load_ohlcv, rebuild_ticker,
+)
 from ..hotkey import HotkeyConfig
 from ..scanner import ScanResult, chunk_periods
 from ..ticker_universe import load_universe
@@ -508,6 +512,13 @@ class MainWindow(QMainWindow):
         self._auto_added_zacks_skips: int = 0
         self._auto_added_finnhub_skips: int = 0
         self._auto_added_finviz_skips: int = 0
+        # Audit 2026-08-12 (INT-5): reason codes for entries added during THIS
+        # session, keyed source → {ticker: reason}. Persisted alongside the
+        # added-on date so a re-validation pass can target "empty"/404 entries
+        # (which include new IPOs that will start reporting) rather than
+        # treating every skip as permanent. Entries loaded from disk keep the
+        # reason already recorded there.
+        self._skip_reasons: dict[str, dict[str, str]] = {}
         self._ohlcv_error_tickers: list[str] = []
         self._load_blacklist()
         self._load_zacks_blacklist()
@@ -888,6 +899,29 @@ class MainWindow(QMainWindow):
             self._verify_earnings_history_integrity
         )
         data_menu.addAction(act_integrity)
+
+        act_recheck_skips = QAction("Re-check Stale Skips...", self)
+        act_recheck_skips.setToolTip(
+            "Re-enable per-source skip-list entries that were auto-added "
+            f"because a source returned no data more than "
+            f"{config.SKIP_RECHECK_DAYS} days ago — that also describes an IPO "
+            "which has since started reporting. Removes up to "
+            f"{config.SKIP_RECHECK_MAX} per list so the next Gap Fill tries "
+            "them; anything still uncovered is re-added automatically. "
+            "Manually-added entries are never touched. Fetches nothing."
+        )
+        act_recheck_skips.triggered.connect(self._recheck_stale_skips)
+        data_menu.addAction(act_recheck_skips)
+
+        act_prune_orphans = QAction("Prune Orphaned Data...", self)
+        act_prune_orphans.setToolTip(
+            "List cached OHLCV parquets and earnings rows for tickers that "
+            "are no longer in universe.csv, then delete them on confirmation. "
+            "Never automatic — a ticker absent from today's universe can "
+            "reappear (re-listing, index change, a bad universe refresh)."
+        )
+        act_prune_orphans.triggered.connect(self._prune_orphaned_data)
+        data_menu.addAction(act_prune_orphans)
 
         # Phase 5 of the Finnhub augmentation: the launch-time
         # "Auto-refresh Zacks" toggle has been removed. Zacks is now
@@ -1498,8 +1532,16 @@ class MainWindow(QMainWindow):
             ("scanner.tradestation", f"bridge_{ts}.log"),
         ]:
             try:
-                fh = logging.FileHandler(
-                    config.LOG_DIR / filename, encoding="utf-8"
+                # Audit 2026-08-12 (INT-14): RotatingFileHandler, not a plain
+                # FileHandler. Nothing bounded these — the live logs/ dir held
+                # 493 files / 77 MB across 123 sessions with no reaper. The
+                # per-session filename means rotation only caps a single
+                # runaway session; the age-based prune in ensure_dirs() caps
+                # the population.
+                fh = logging.handlers.RotatingFileHandler(
+                    config.LOG_DIR / filename, encoding="utf-8",
+                    maxBytes=config.LOG_MAX_BYTES,
+                    backupCount=config.LOG_BACKUP_COUNT,
                 )
                 fh.setFormatter(formatter)
                 logging.getLogger(logger_name).addHandler(fh)
@@ -1508,6 +1550,23 @@ class MainWindow(QMainWindow):
                 log.warning("Could not create subsystem log %s: %s", filename, exc)
 
     # ── Shared error-reporting + worker-bringup helpers ───────────────
+
+    def _info_plain(self, title: str, text: str) -> None:
+        """``QMessageBox.information`` with the text format pinned to PlainText.
+
+        Audit 2026-08-12 (SEC-13): ``QMessageBox`` defaults to ``AutoText``,
+        which renders anything that looks like markup as rich text. A handful
+        of messages interpolate a USER-TYPED ticker (spot-fill "on the skip
+        list" notices) and ``_normalize_ticker`` only maps Unicode dashes.
+        Self-inflicted only, so the impact is nil — but pinning the format
+        closes it outright, and every such message is plain prose anyway.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle(title)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(text)
+        box.exec()
 
     def _log_error(self, category: str, msg: str,
                    exc: Exception | None = None) -> None:
@@ -1554,6 +1613,16 @@ class MainWindow(QMainWindow):
 
     def _startup(self):
         """Load universe and kick off OHLCV update. Handles first-run."""
+        # Audit 2026-08-12 (SEC-2): main() logs the rejected data-dir override
+        # before any handler exists, so repeat it in the panel — a user who set
+        # the variable deliberately must see that it did not take effect, not
+        # discover later that a fill wrote to the wrong tree.
+        if config._DATA_DIR_OVERRIDE_IGNORED:
+            self.log_panel.write_line(
+                f"WARNING: TRADE_SCANNER_FH_DATA_DIR ignored "
+                f"({config._DATA_DIR_OVERRIDE_IGNORED}). "
+                f"Using {config.DATA_DIR}"
+            )
         if not config.TICKER_CSV.exists():
             # First run -- download universe first, then update OHLCV
             self.status.showMessage("First run -- downloading ticker universe...")
@@ -1598,11 +1667,11 @@ class MainWindow(QMainWindow):
             self.log_panel.write_line("ERROR: No universe CSV found.")
             return
 
-        # Tickers with existing cached data are immediately scannable
-        self._symbols = [
-            s for s in all_syms
-            if (config.PARQUET_DIR / f"{s}.parquet").exists()
-        ]
+        # Tickers with existing cached data are immediately scannable.
+        # Audit 2026-08-12 (EFF-8): one directory listing instead of 15,948
+        # individual Path.exists() stats on the GUI thread.
+        _cached = cached_symbols()
+        self._symbols = [s for s in all_syms if s in _cached]
         self.status.showMessage(
             f"Universe: {len(universe)} tickers, "
             f"{len(self._symbols)} with cached OHLCV -- checking for updates..."
@@ -1718,10 +1787,10 @@ class MainWindow(QMainWindow):
                 s for s in universe["symbol"].tolist()
                 if isinstance(s, str) and s.strip()
             ]
-            self._symbols = [
-                s for s in all_syms
-                if (config.PARQUET_DIR / f"{s}.parquet").exists()
-            ]
+            # EFF-8: single glob, not one stat per symbol (this is the
+            # SECOND full sweep per launch the audit measured).
+            _cached = cached_symbols()
+            self._symbols = [s for s in all_syms if s in _cached]
         except FileNotFoundError as exc:
             log.debug(
                 "universe reload after OHLCV update skipped "
@@ -2202,8 +2271,11 @@ class MainWindow(QMainWindow):
         API Key... and also auto-shown on first launch when no key is
         stored (see prompt_finnhub_key_if_missing)."""
         existing = finnhub_client.get_api_key()
-        existing_blurb = (f" (currently set, ending …{existing[-4:]})"
-                          if existing else " (not currently set)")
+        # Audit 2026-08-12 (SEC-4): do NOT echo any part of the key. The panel
+        # persists every line to scanner_data/logs/scan_<ts>.log, so a key
+        # fragment here becomes a secret fragment on disk for no benefit.
+        existing_blurb = (" (currently set)" if existing
+                          else " (not currently set)")
         text, ok = QInputDialog.getText(
             self,
             "Set Finnhub API Key",
@@ -2224,7 +2296,7 @@ class MainWindow(QMainWindow):
             return
         if finnhub_client.set_api_key(text):
             self.log_panel.write_line(
-                f"Finnhub API key stored (ends …{text[-4:]}). "
+                "Finnhub API key stored. "
                 "Targeted fills will now try Finnhub first."
             )
         else:
@@ -2373,11 +2445,11 @@ class MainWindow(QMainWindow):
                                 "No universe file found.")
             return
 
-        # Only tickers with NO parquet file at all
+        # Only tickers with NO parquet file at all (EFF-8: one glob)
+        _cached = cached_symbols()
         missing = [
             s for s in all_syms
-            if not (config.PARQUET_DIR / f"{s}.parquet").exists()
-            and s not in self._blacklist
+            if s not in _cached and s not in self._blacklist
         ]
         if not missing:
             self.log_panel.write_line("All tickers already have cached data.")
@@ -2611,18 +2683,51 @@ class MainWindow(QMainWindow):
             self._ZACKS_BLACKLIST_FILE, label="Zacks skip list",
         ).load()
 
+    # Class-level default so the save delegates work on an instance built with
+    # __new__ (the established test idiom — see tests/test_blacklist_manager.py).
+    # Immutable on purpose: __init__ assigns a real per-instance dict, so any
+    # write reaching this shared default is a bug and should raise, not leak
+    # reason codes between windows.
+    _skip_reasons: "Mapping[str, dict[str, str]]" = MappingProxyType({})
+
+    def _save_skip_list_with_reasons(
+        self, path, label: str, tickers: set[str], source_key: str,
+    ) -> None:
+        """Persist a per-source skip list preserving each entry's added-on date
+        and reason (audit 2026-08-12, INT-5).
+
+        Existing on-disk metadata wins; entries added during this session pick up
+        today's date plus whatever reason code the fill recorded. New entries with
+        no recorded reason get ``"manual"`` — they came from the editor dialog.
+        """
+        mgr = BlacklistManager(path, label=label)
+        prior = mgr.load_entries()
+        session_reasons = self._skip_reasons.get(source_key, {})
+        entries: dict[str, tuple] = {}
+        for t in tickers:
+            if not t or not t.strip():
+                continue
+            if t in prior:
+                entries[t] = prior[t]
+            else:
+                entries[t] = (None, session_reasons.get(t, "manual"))
+        mgr.save_entries(entries)
+
     def _save_zacks_blacklist(self):
-        """Atomic write of zacks_blacklist.txt — one ticker per line for
+        """Atomic write of zacks_blacklist.txt — one entry per line for
         easy diffing / inspection.
 
         Defensively strips newlines/carriage-returns/whitespace from
         each ticker before joining so that a crafted upstream symbol
         (or a clipboard-paste mishap in the manual editor dialog)
         can't inject phantom entries on the next line.
+
+        Audit 2026-08-12 (INT-5): now records ADDED_ON and REASON per entry.
         """
-        BlacklistManager(
-            self._ZACKS_BLACKLIST_FILE, label="Zacks skip list",
-        ).save(self._zacks_blacklist)
+        self._save_skip_list_with_reasons(
+            self._ZACKS_BLACKLIST_FILE, "Zacks skip list",
+            self._zacks_blacklist, "zacks",
+        )
 
     # ── Finnhub-only skip list (Phase 2 mirror of the Zacks pattern) ───
     #
@@ -2640,20 +2745,21 @@ class MainWindow(QMainWindow):
         ).load()
 
     def _save_finnhub_blacklist(self):
-        """Atomic write of finnhub_blacklist.txt — one ticker per line.
+        """Atomic write of finnhub_blacklist.txt.
 
         Defensive newline/whitespace strip per the same rationale as
-        _save_zacks_blacklist.
+        _save_zacks_blacklist. Audit 2026-08-12 (INT-5): records ADDED_ON and
+        REASON per entry so re-validation is possible.
         """
-        BlacklistManager(
-            self._FINNHUB_BLACKLIST_FILE, label="Finnhub skip list",
-        ).save(self._finnhub_blacklist)
+        self._save_skip_list_with_reasons(
+            self._FINNHUB_BLACKLIST_FILE, "Finnhub skip list",
+            self._finnhub_blacklist, "finnhub",
+        )
 
     def _combined_finnhub_skip_set(self) -> set[str]:
         """Combined skip set for Finnhub bulk / gap fills:
 
-        - Universe blacklist (`self._blacklist`) — persisted into the
-          Finnhub skip list so it shows up in the editor.
+        - Universe blacklist (`self._blacklist`) — honored but NOT persisted.
         - Finnhub-specific skip list (`self._finnhub_blacklist`).
         - ETF + ADR auto-skip from universe.csv flags — NOT persisted
           (re-derived per fill so universe refreshes flow through; spot
@@ -2661,19 +2767,29 @@ class MainWindow(QMainWindow):
 
         Computed at the start of each Finnhub fill so any tickers added
         to the universe blacklist since the last run are picked up
-        automatically."""
-        before = len(self._finnhub_blacklist)
-        self._finnhub_blacklist |= self._blacklist
-        if len(self._finnhub_blacklist) > before:
-            self._save_finnhub_blacklist()
-        return set(self._finnhub_blacklist) | self._etf_adr_auto_skip_set()
+        automatically.
+
+        Audit 2026-08-12 (INT-5): the universe blacklist used to be UNIONED INTO
+        the persisted Finnhub list, which made the merge irreversible — removing
+        a ticker from blacklist.txt left it skipped by Finnhub forever. It is now
+        combined at read time only, matching what `_zacks_skip_set` already did
+        correctly. Behaviour for a fill is identical; only the persistence
+        side effect is gone.
+        """
+        return (set(self._finnhub_blacklist) | self._blacklist
+                | self._etf_adr_auto_skip_set())
 
     def _on_finnhub_etf_identified(self, sym: str) -> None:
         """Callback wired into FinnhubFillWorker — adds tickers whose
-        /stock/earnings response was [] to the Finnhub skip list."""
+        /stock/earnings response was [] to the Finnhub skip list.
+
+        Audit 2026-08-12 (INT-5): records the reason so re-validation can target
+        these entries (an empty response also covers a brand-new IPO that simply
+        has no earnings yet, which WILL start reporting)."""
         norm = self._normalize_ticker(sym)
         if norm and norm not in self._finnhub_blacklist:
             self._finnhub_blacklist.add(norm)
+            self._skip_reasons.setdefault("finnhub", {})[norm] = "empty"
             self._auto_added_finnhub_skips += 1
 
     def _zacks_skip_set(self) -> set[str]:
@@ -2969,8 +3085,8 @@ class MainWindow(QMainWindow):
         # list). Excludes the ETF/ADR auto-skip — see method docstring.
         user_only_skip = self._blacklist | self._finnhub_blacklist
         if norm in user_only_skip:
-            QMessageBox.information(
-                self, "Skipped",
+            self._info_plain(
+                "Skipped",
                 f"{norm} is on the Finnhub skip list — remove it first "
                 "via Edit Finnhub Skip List...",
             )
@@ -3041,34 +3157,47 @@ class MainWindow(QMainWindow):
         ).load()
 
     def _save_finviz_blacklist(self):
-        """Atomic write of finviz_blacklist.txt — one ticker per line."""
-        BlacklistManager(
-            self._FINVIZ_BLACKLIST_FILE, label="finviz skip list",
-        ).save(self._finviz_blacklist)
+        """Atomic write of finviz_blacklist.txt.
+
+        Audit 2026-08-12 (INT-5): writes TICKER<TAB>ADDED_ON<TAB>REASON, keeping
+        the dates already on disk and stamping this session's reason codes on
+        newly-added entries."""
+        self._save_skip_list_with_reasons(
+            self._FINVIZ_BLACKLIST_FILE, "finviz skip list",
+            self._finviz_blacklist, "finviz",
+        )
 
     def _combined_finviz_skip_set(self) -> set[str]:
         """Combined skip set for finviz bulk / gap fills:
 
-        - Universe blacklist (`self._blacklist`) — persisted into the
-          finviz skip list so it shows up in the editor.
+        - Universe blacklist (`self._blacklist`) — honored but NOT persisted.
         - Finviz-specific skip list (`self._finviz_blacklist`).
         - ETF + ADR auto-skip from universe.csv flags — NOT persisted
           (re-derived per fill; spot fill bypasses).
 
         This is what keeps a finviz bulk from wasting requests on funds /
-        ADRs and from re-fetching tickers the user OHLCV-blacklisted."""
-        before = len(self._finviz_blacklist)
-        self._finviz_blacklist |= self._blacklist
-        if len(self._finviz_blacklist) > before:
-            self._save_finviz_blacklist()
-        return set(self._finviz_blacklist) | self._etf_adr_auto_skip_set()
+        ADRs and from re-fetching tickers the user OHLCV-blacklisted.
+
+        Audit 2026-08-12 (INT-5): no longer unions the universe blacklist INTO
+        the persisted finviz list — that made the merge irreversible. Combined at
+        read time only, matching `_zacks_skip_set`.
+        """
+        return (set(self._finviz_blacklist) | self._blacklist
+                | self._etf_adr_auto_skip_set())
 
     def _on_finviz_empty_identified(self, sym: str) -> None:
         """Callback wired into FinvizFillWorker — adds tickers finviz
-        doesn't cover (no earningsData) to the finviz skip list."""
+        doesn't cover (no earningsData) to the finviz skip list.
+
+        Audit 2026-08-12 (INT-5): records the reason so a later re-validation
+        pass can distinguish a probable-permanent gap from a transient miss.
+        `finviz_client` maps a bare HTTP 404 to the same EMPTY sentinel as a
+        genuine no-coverage page, so these entries are exactly the population
+        that deserves periodic re-checking."""
         norm = self._normalize_ticker(sym)
         if norm and norm not in self._finviz_blacklist:
             self._finviz_blacklist.add(norm)
+            self._skip_reasons.setdefault("finviz", {})[norm] = "empty"
             self._auto_added_finviz_skips += 1
 
     def _show_finviz_skip_list_editor(self):
@@ -3136,6 +3265,211 @@ class MainWindow(QMainWindow):
                     f"Could not save finviz skip list: {exc}",
                 )
 
+    # ── Skip-list re-validation (audit 2026-08-12, INT-5) ──────────────
+
+    #: (source_key, label, skip-file config attr, in-memory set attr, saver)
+    _RECHECKABLE_SKIP_LISTS = (
+        ("finviz", "Finviz", "_FINVIZ_BLACKLIST_FILE",
+         "_finviz_blacklist", "_save_finviz_blacklist"),
+        ("finnhub", "Finnhub", "_FINNHUB_BLACKLIST_FILE",
+         "_finnhub_blacklist", "_save_finnhub_blacklist"),
+        ("zacks", "Zacks", "_ZACKS_BLACKLIST_FILE",
+         "_zacks_blacklist", "_save_zacks_blacklist"),
+    )
+
+    def _stale_skip_candidates(self) -> dict[str, list[str]]:
+        """Per source, the auto-added ``empty`` entries older than
+        ``config.SKIP_RECHECK_DAYS``, oldest first and capped at
+        ``config.SKIP_RECHECK_MAX``.
+
+        Only the ``empty`` reason is eligible: that is the code recorded when a
+        source returned no data (finviz 404 / finnhub ``[]``), which covers a
+        genuinely uncovered ETF *and* a brand-new IPO that will start reporting.
+        Manual entries and legacy entries with a recorded non-empty reason are
+        the user's curation and are left alone.
+
+        Legacy bare-ticker lines carry no date OR reason, so they are excluded
+        here — re-offering ~26k undated entries in one action is exactly the
+        unbounded behaviour this fix exists to avoid. They become eligible
+        naturally as they get rewritten with real metadata.
+        """
+        out: dict[str, list[str]] = {}
+        for key, _label, path_attr, set_attr, _saver in (
+                self._RECHECKABLE_SKIP_LISTS):
+            mgr = BlacklistManager(getattr(self, path_attr), label=key)
+            entries = mgr.load_entries()
+            cutoff = date.today() - timedelta(days=config.SKIP_RECHECK_DAYS)
+            live = getattr(self, set_attr)
+            stale = [
+                (added, tk) for tk, (added, reason) in entries.items()
+                if reason == "empty" and added is not None and added <= cutoff
+                and tk in live
+            ]
+            stale.sort()
+            out[key] = [tk for _added, tk in stale[:config.SKIP_RECHECK_MAX]]
+        return out
+
+    def _recheck_stale_skips(self):
+        """Menu: re-offer long-standing auto-skipped tickers to their source.
+
+        Removes up to ``config.SKIP_RECHECK_MAX`` stale ``empty`` entries per
+        list so the next gap fill picks them up. If a ticker really is
+        uncovered, the fill re-adds it with a fresh date and it drops out of
+        scope for another ``SKIP_RECHECK_DAYS`` — a self-correcting cycle
+        rather than the permanent exclusion this list used to be.
+
+        Deliberately manual: an automatic sweep of 10,246 finnhub skips at
+        ~4 s/ticker would be ~11 hours of unrequested traffic.
+        """
+        candidates = self._stale_skip_candidates()
+        total = sum(len(v) for v in candidates.values())
+        if not total:
+            QMessageBox.information(
+                self, "Re-check Stale Skips",
+                f"No skip-list entries are eligible.\n\n"
+                f"Eligible entries were auto-added because a source returned "
+                f"no data, and are older than {config.SKIP_RECHECK_DAYS} days. "
+                f"Manually-added entries are never re-checked.",
+            )
+            return
+        breakdown = "\n".join(
+            f"  {label}: {len(candidates[key])}"
+            for key, label, _p, _s, _v in self._RECHECKABLE_SKIP_LISTS
+            if candidates[key]
+        )
+        if QMessageBox.question(
+            self, "Re-check Stale Skips",
+            f"Remove {total} ticker(s) from the per-source skip lists so the "
+            f"next gap fill tries them again?\n\n"
+            f"{breakdown}\n\n"
+            f"These were auto-added because the source returned no data more "
+            f"than {config.SKIP_RECHECK_DAYS} days ago — which also describes "
+            f"an IPO that has since started reporting, or a ticker that was "
+            f"mid-rename that day.\n\n"
+            f"Capped at {config.SKIP_RECHECK_MAX} per list. Anything still "
+            f"uncovered goes back on the list on the next fill.\n\n"
+            f"Nothing is fetched now — run the relevant Gap Fill afterwards.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        for key, label, _path_attr, set_attr, saver in (
+                self._RECHECKABLE_SKIP_LISTS):
+            syms = candidates[key]
+            if not syms:
+                continue
+            getattr(self, set_attr).difference_update(syms)
+            try:
+                getattr(self, saver)()
+            except Exception as exc:
+                self._log_error(
+                    "skip-recheck",
+                    f"Could not save {label} skip list: {exc}", exc,
+                )
+                continue
+            self.log_panel.write_line(
+                f"{label} skip list: re-enabled {len(syms)} stale entries "
+                f"(auto-skipped >{config.SKIP_RECHECK_DAYS}d ago)."
+            )
+        QMessageBox.information(
+            self, "Re-check Stale Skips",
+            f"{total} ticker(s) re-enabled.\n\n"
+            f"Run Gap Fill for each source to attempt them.",
+        )
+
+    # ── Orphaned-data pruning (audit 2026-08-12, INT-14) ───────────────
+
+    def _find_orphaned_data(self) -> tuple[list, list]:
+        """(orphan OHLCV paths, orphan history tickers) — cached data whose
+        ticker is no longer in universe.csv. Pure read."""
+        universe = set(self._get_universe_symbols() or [])
+        if not universe:
+            return ([], [])
+        orphan_parquets = [
+            p for p in config.PARQUET_DIR.glob("*.parquet")
+            if p.stem not in universe
+        ]
+        orphan_tickers: list[str] = []
+        try:
+            from .. import earnings_history as eh
+            df = eh.load_earnings_history()
+            if df is not None and not df.empty:
+                have = set(df["ticker"].astype(str).unique())
+                orphan_tickers = sorted(have - universe)
+        except Exception as exc:
+            log.warning("Could not scan earnings history for orphans: %s", exc)
+        return (sorted(orphan_parquets), orphan_tickers)
+
+    def _prune_orphaned_data(self):
+        """Menu: delete cached data for tickers no longer in the universe.
+
+        Strictly opt-in with an itemised confirmation. A ticker absent from
+        today's universe.csv is NOT necessarily gone — it can be re-listed,
+        or a single bad universe refresh can drop it — so this must never run
+        automatically. The live tree carried 593 orphan parquets (~25 MB) and
+        236 orphan history tickers at audit time.
+        """
+        parquets, tickers = self._find_orphaned_data()
+        if not parquets and not tickers:
+            self._info_plain(
+                "Prune Orphaned Data",
+                "Nothing to prune — every cached ticker is still in "
+                "universe.csv.",
+            )
+            return
+        mb = sum(p.stat().st_size for p in parquets) / (1024 * 1024) if parquets else 0.0
+        sample = ", ".join(p.stem for p in parquets[:8])
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Prune Orphaned Data?")
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(
+            f"These tickers are cached but are NOT in universe.csv:\n\n"
+            f"• {len(parquets)} OHLCV parquet file(s) — {mb:.1f} MB\n"
+            f"• {len(tickers)} ticker(s) with earnings history rows\n\n"
+            f"{('e.g. ' + sample) if sample else ''}\n\n"
+            f"A ticker can be absent because it was delisted — or because it "
+            f"was re-listed under a new symbol, or because one universe "
+            f"refresh came back short. Deleting is not reversible; the data "
+            f"would have to be re-downloaded.\n\nDelete them?"
+        )
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        removed = 0
+        for p in parquets:
+            try:
+                p.unlink()
+                removed += 1
+            except OSError as exc:
+                log.warning("Could not delete %s: %s", p.name, exc)
+        rows_dropped = 0
+        if tickers:
+            try:
+                from .. import earnings_history as eh
+                with eh.HISTORY_WRITE_LOCK:
+                    df = eh.load_earnings_history()
+                    if df is not None and not df.empty:
+                        mask = df["ticker"].astype(str).isin(set(tickers))
+                        rows_dropped = int(mask.sum())
+                        if rows_dropped:
+                            eh.save_earnings_history(
+                                df.loc[~mask].reset_index(drop=True), sort=True)
+            except Exception as exc:
+                self._log_error("prune", f"Could not prune history rows: {exc}", exc)
+        from ..data_engine import clear_ohlcv_cache
+        clear_ohlcv_cache()
+        self.log_panel.write_line(
+            f"Pruned {removed} orphan parquet(s) and {rows_dropped} orphan "
+            f"earnings row(s)."
+        )
+        self._info_plain(
+            "Prune Orphaned Data",
+            f"Deleted {removed} parquet file(s) and {rows_dropped} earnings "
+            f"row(s).",
+        )
+
     def _bulk_fill_finviz(self):
         """Menu: full-universe finviz pull (overnight)."""
         if self._finviz_worker and self._finviz_worker.isRunning():
@@ -3198,8 +3532,8 @@ class MainWindow(QMainWindow):
         norm = self._normalize_ticker(sym)
         user_only_skip = self._blacklist | self._finviz_blacklist
         if norm in user_only_skip:
-            QMessageBox.information(
-                self, "Skipped",
+            self._info_plain(
+                "Skipped",
                 f"{norm} is on the finviz skip list — remove it first "
                 "via Edit Finviz Skip List...",
             )
@@ -3432,8 +3766,8 @@ class MainWindow(QMainWindow):
             return
         norm = self._normalize_ticker(sym)
         if norm in self._blacklist:
-            QMessageBox.information(
-                self, "Skipped",
+            self._info_plain(
+                "Skipped",
                 f"{norm} is on the universal blacklist — remove it first.",
             )
             return
@@ -4987,6 +5321,16 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # Audit 2026-08-12 (INT-12): both depth settings silently DELETE data
+        # when lowered. The earnings cap is re-evaluated against today on every
+        # canonical save, so dropping 10 → 5 irreversibly discards five years
+        # of history on the next fill — no prompt, no backup, and past the raw
+        # retention window (INT-8) it cannot be re-fetched. OHLCV behaves the
+        # same on any full re-pull. Confirm, with the real row/file count.
+        if not self._confirm_history_depth_decrease(
+                spin_ohlcv.value(), spin_earn.value()):
+            return
+
         if not config.save_user_config({
             "OHLCV_HISTORY_YEARS": spin_ohlcv.value(),
             "EARNINGS_HISTORY_YEARS": spin_earn.value(),
@@ -5008,6 +5352,66 @@ class MainWindow(QMainWindow):
             "OHLCV depth applies to new downloads only; the prefetch "
             "toggle takes effect at the next launch."
         )
+
+    def _confirm_history_depth_decrease(
+        self, new_ohlcv_years: int, new_earnings_years: int,
+    ) -> bool:
+        """Confirm before a retention DECREASE deletes history (INT-12).
+
+        Returns True to proceed. Only a decrease prompts; raising a depth or
+        leaving it alone saves silently as before. The earnings row count is
+        computed from the store so the warning states what will actually be
+        lost rather than an abstraction.
+        """
+        warnings: list[str] = []
+
+        if new_earnings_years < int(config.EARNINGS_HISTORY_YEARS):
+            rows = None
+            try:
+                from .. import earnings_history as eh
+                df = eh.load_earnings_history()
+                if df is not None and not df.empty:
+                    cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(
+                        years=new_earnings_years)
+                    pe = pd.to_datetime(df["period_ending"], errors="coerce")
+                    rows = int((pe < cutoff).sum())
+            except Exception as exc:
+                log.warning("Could not size the earnings truncation: %s", exc)
+            detail = (f"{rows:,} row(s) will be dropped"
+                      if rows is not None
+                      else "the affected rows will be dropped")
+            warnings.append(
+                f"• Earnings depth {config.EARNINGS_HISTORY_YEARS}y → "
+                f"{new_earnings_years}y: {detail} from "
+                f"earnings_history.parquet on the next fill."
+            )
+
+        if new_ohlcv_years < int(config.OHLCV_HISTORY_YEARS):
+            warnings.append(
+                f"• OHLCV depth {config.OHLCV_HISTORY_YEARS}y → "
+                f"{new_ohlcv_years}y: each ticker loses the extra years the "
+                f"next time it takes a FULL re-pull (a split, a dividend, or "
+                f"a manual rebuild)."
+            )
+
+        if not warnings:
+            return True
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Reduce History Depth?")
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(
+            "Lowering a history depth DELETES data — it is not a display "
+            "filter.\n\n" + "\n\n".join(warnings) +
+            "\n\nThis is not reversible from within the app: re-raising the "
+            "setting does not bring the rows back, and re-fetching them "
+            "depends on how far each source still serves.\n\nContinue?"
+        )
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return box.exec() == QMessageBox.StandardButton.Yes
 
     def _load_menu_toggles_pref(self) -> None:
         """Read persisted menu-toggle values from QSettings into the
@@ -5080,11 +5484,9 @@ class MainWindow(QMainWindow):
             if isinstance(s, str) and s.strip()
         )
 
-        # OHLCV gaps: no parquet file at all
-        ohlcv_missing = [
-            s for s in all_syms
-            if not (config.PARQUET_DIR / f"{s}.parquet").exists()
-        ]
+        # OHLCV gaps: no parquet file at all (EFF-8: one glob)
+        _cached = cached_symbols()
+        ohlcv_missing = [s for s in all_syms if s not in _cached]
 
         # Sector gaps
         sector_df = load_sector_map()
@@ -7235,7 +7637,8 @@ def prompt_finnhub_key_if_missing(parent=None) -> None:
         return
     text = (text or "").strip()
     if text and finnhub_client.set_api_key(text):
-        log.info("Finnhub API key stored (ends …%s)", text[-4:])
+        # Audit 2026-08-12 (SEC-4): no key fragment in the log.
+        log.info("Finnhub API key stored.")
 
 
 def main():
@@ -7247,6 +7650,46 @@ def main():
     # (config.py no longer does this at import time).
     config.ensure_dirs()
     PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+
+    import logging as _startup_logging
+    _startup_log = _startup_logging.getLogger("scanner.startup")
+
+    # Audit 2026-08-12 (SEC-2): a rejected TRADE_SCANNER_FH_DATA_DIR must be
+    # LOUD. Silently ignoring it would send the user's fills into the default
+    # tree while they believe they're writing to the one they pointed at.
+    if config._DATA_DIR_OVERRIDE_IGNORED:
+        _startup_log.warning(
+            "TRADE_SCANNER_FH_DATA_DIR=%r ignored: %s — using %s",
+            config._DATA_DIR_OVERRIDE,
+            config._DATA_DIR_OVERRIDE_IGNORED,
+            config.DATA_DIR,
+        )
+
+    # Audit 2026-08-12 (SEC-1): DATA_DIR sits beside the application, so it
+    # inherits "Authenticated Users: Modify" on every file the app trusts
+    # implicitly. Restrict it to the current user + SYSTEM. Sentinel-gated
+    # (walks 14k+ files), never raises.
+    try:
+        _acl_changed, _acl_detail = config.harden_data_dir_acl()
+        if _acl_changed:
+            _startup_log.info("scanner_data ACL hardened: %s", _acl_detail)
+        else:
+            _startup_log.debug("scanner_data ACL unchanged: %s", _acl_detail)
+    except Exception as exc:          # defence in depth — must never block launch
+        _startup_log.warning("ACL hardening skipped: %s", exc)
+
+    # Audit 2026-08-12 (INT-13): re-derive sector_etf for rows whose sector is
+    # now covered by SECTOR_ETF_MAP. `sector_etf == ""` was indistinguishable
+    # from "not yet mapped" and was never revisited, so those tickers silently
+    # lost sector-relative strength. Network-free (one parquet read + a dict
+    # lookup) and self-suppressing once there is nothing left to fix.
+    try:
+        from .. import sector_map as _sector_map
+        _remapped = _sector_map.remap_missing_sector_etfs()
+        if _remapped:
+            _startup_log.info("Re-mapped sector_etf for %d ticker(s)", _remapped)
+    except Exception as exc:
+        _startup_log.warning("sector_etf re-map skipped: %s", exc)
 
     # Phase 4 R18: stamp / verify the parquet cache schema version. Logs a
     # warning if a future build inherits an older or newer cache.

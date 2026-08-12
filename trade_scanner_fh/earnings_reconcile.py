@@ -116,7 +116,21 @@ def _extract_dates_lookup(
     source. ``source="yahoo"`` ALSO collects rows whose source is
     "legacy" / "unknown" / any prior reconciler output that isn't
     "nasdaq" — pre-Phase-3 fills lacked precise source tags but were
-    overwhelmingly Yahoo-derived in practice."""
+    overwhelmingly Yahoo-derived in practice.
+
+    **Audit 2026-08-12 (INT-4).** Each position is now matched on its own
+    immutable origin column (``last_source`` / ``next_source``) when the row
+    carries one. The old exact ``source ==`` match read the same mutable label
+    the reconciler had just rewritten: ``finviz_fill`` writes the forward date
+    as ``source="finviz"``, pass #1 relabelled that row ``finviz_derived``, and
+    pass #2 — finding no ``source == "finviz"`` row — NaT'd a date that exists
+    nowhere else (finviz history holds only past quarters). Matching per
+    position makes every pass idempotent, and stops a ``nasdaq+yahoo_aug`` row
+    from laundering nasdaq's date into the yahoo bucket on the next sweep.
+
+    Rows predating the columns (NA) keep the legacy whole-row semantics, so
+    nothing already on disk changes meaning.
+    """
     out: dict[str, tuple[pd.Timestamp, pd.Timestamp]] = {}
     if dates_df is None or dates_df.empty:
         return out
@@ -135,15 +149,28 @@ def _extract_dates_lookup(
         # other sources and must re-derive through their own chain step
         # rather than being laundered through the yahoo step.
         src_str = dates_df["source"].fillna("legacy").astype(str).str.lower()
-        mask = (
+        label_match = (
             (src_str == "yahoo")
             | (src_str == "legacy")
             | (src_str == "unknown")
             | src_str.str.contains("yahoo", na=False)
         )
-        sub = dates_df.loc[mask]
     else:
-        sub = dates_df.loc[dates_df["source"] == source]
+        label_match = dates_df["source"] == source
+
+    # A row also qualifies when either position explicitly names this source,
+    # even though the compound label no longer does — that is the whole point
+    # of INT-4. Selected here, then applied per position below.
+    has_positions = all(
+        c in dates_df.columns for c in ("last_source", "next_source")
+    )
+    if has_positions:
+        last_owned = dates_df["last_source"].astype("string") == source
+        next_owned = dates_df["next_source"].astype("string") == source
+        sub = dates_df.loc[label_match | last_owned.fillna(False)
+                           | next_owned.fillna(False)]
+    else:
+        sub = dates_df.loc[label_match]
 
     if sub.empty:
         return out
@@ -153,10 +180,22 @@ def _extract_dates_lookup(
         sub = sub.sort_values("updated_at", ascending=False)
     sub = sub.drop_duplicates(subset=["ticker"], keep="first")
 
-    for _, row in sub.iterrows():
+    label_of = label_match.reindex(sub.index, fill_value=False)
+    for idx, row in sub.iterrows():
         t = str(row["ticker"])
         last = row.get("last_earnings")
         nxt = row.get("next_earnings")
+        if has_positions:
+            # An explicit origin decides the position outright. A NULL origin
+            # is a pre-INT-4 row, which keeps the old whole-row semantics: the
+            # value counts only if the compound label matched.
+            by_label = bool(label_of.loc[idx])
+            last_src = row.get("last_source")
+            nxt_src = row.get("next_source")
+            last = (last if str(last_src) == source else pd.NaT) \
+                if pd.notna(last_src) else (last if by_label else pd.NaT)
+            nxt = (nxt if str(nxt_src) == source else pd.NaT) \
+                if pd.notna(nxt_src) else (nxt if by_label else pd.NaT)
         out[t] = (last, nxt)
     return out
 
@@ -349,6 +388,11 @@ def reconcile_earnings_dates(
             "next_earnings": next_ts if next_ts is not None else pd.NaT,
             "updated_at": now,
             "source": _source_label(last_src, next_src),
+            # Audit INT-4: the immutable per-position origins. `source` above
+            # is a compound label this function rewrites every pass; these are
+            # what the NEXT pass reads its own inputs back out of.
+            "last_source": last_src if last_src else pd.NA,
+            "next_source": next_src if next_src else pd.NA,
         })
 
         kind = _classify(last_src, next_src)

@@ -42,8 +42,12 @@ def price_above_sma(df: pd.DataFrame, *, period: int = 200) -> dict:
     """
     if len(df) < period:
         return {"close": np.nan, "sma_value": np.nan}
-    sma = df["Close"].rolling(period).mean()
-    return {"close": df["Close"].iloc[-1], "sma_value": sma.iloc[-1]}
+    close = df["Close"]
+    # Audit 2026-08-12 (EFF-10): only the LAST window is used, so compute just
+    # that instead of a rolling mean over the full 5-year history and throwing
+    # away every value but one. Called twice per ticker per timeframe.
+    return {"close": close.iloc[-1],
+            "sma_value": close.iloc[-period:].mean()}
 
 
 def stockbee_trend_intensity(
@@ -276,14 +280,25 @@ def surge_ignition(
         return base
 
     # Resolve the rally bounds back to integer indices in df.
+    #
+    # Audit 2026-08-12 (EFF-10): this built a ~1,250-element Python list of
+    # dates per ticker and then linear-scanned it twice. `index.get_loc` is a
+    # hash lookup on the existing index. `normalize()` matches what the old
+    # `d.date()` conversion did — the bounds are date-granular.
     try:
-        idx_dates = [
-            (d.date() if hasattr(d, "date") else d) for d in df.index
-        ]
-        start_idx = idx_dates.index(base_start)
-        end_idx = idx_dates.index(base_end)
-    except ValueError:
+        idx = df.index
+        if isinstance(idx, pd.DatetimeIndex):
+            idx = idx.normalize()
+        start_idx = idx.get_loc(pd.Timestamp(base_start))
+        end_idx = idx.get_loc(pd.Timestamp(base_end))
+    except (KeyError, ValueError, TypeError):
         return base  # date not in index — defensive, shouldn't happen
+    # get_loc can return a slice/array for a non-unique index; the cache is
+    # de-duplicated, but take the first position defensively either way.
+    if not isinstance(start_idx, int):
+        start_idx = int(np.atleast_1d(np.arange(len(idx))[start_idx])[0])
+    if not isinstance(end_idx, int):
+        end_idx = int(np.atleast_1d(np.arange(len(idx))[end_idx])[0])
 
     if end_idx <= start_idx:
         return base
@@ -584,8 +599,11 @@ def bollinger_band_width(
     if len(df) < period:
         return np.nan
     close = df["Close"]
-    middle = close.rolling(period).mean().iloc[-1]
-    std = close.rolling(period).std().iloc[-1]
+    # EFF-10: last window only — see price_above_sma. `.std()` keeps pandas'
+    # ddof=1 default, matching what `rolling(period).std()` produced.
+    window = close.iloc[-period:]
+    middle = window.mean()
+    std = window.std()
     if middle == 0 or np.isnan(std):
         return np.nan
     upper = middle + num_std * std

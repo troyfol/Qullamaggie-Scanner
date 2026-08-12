@@ -37,9 +37,45 @@ else:
 # SCANNER_DATA_DIR) risks colliding with an unrelated variable already in the
 # user's environment, which would silently redirect even the FROZEN exe's
 # data directory. Keep this prefixed so only an explicit opt-in takes effect.
+#
+# Audit 2026-08-12 (SEC-2): the override is a DEV convenience, so it is now
+# gated on `not sys.frozen`. Without that gate a user-writable environment
+# variable (HKCU\Environment needs no admin) could redirect the packaged exe's
+# reads AND writes — including the DPAPI-wrapped cookie write — to an
+# attacker-chosen directory, or to a UNC path, turning launch into outbound SMB
+# authentication. UNC and non-absolute targets are rejected outright.
 _DATA_DIR_OVERRIDE = os.environ.get("TRADE_SCANNER_FH_DATA_DIR", "").strip()
-if _DATA_DIR_OVERRIDE:
-    DATA_DIR = Path(_DATA_DIR_OVERRIDE).expanduser().resolve()
+_DATA_DIR_OVERRIDE_IGNORED = ""   # non-empty → reason, surfaced at startup
+
+
+def _validate_data_dir_override(raw: str) -> tuple[Optional[Path], str]:
+    """Return (path, "") if `raw` is an acceptable override, else (None, reason).
+
+    Rejects UNC paths (\\\\host\\share and \\\\?\\ forms) because resolving one
+    makes every launch authenticate outbound to an arbitrary host.
+    """
+    if not raw:
+        return (None, "")
+    if getattr(sys, "frozen", False):
+        return (None, "ignored in a packaged build (dev-only override)")
+    # Catch UNC before resolve() — resolve() happily accepts \\host\share.
+    if raw.startswith("\\\\") or raw.startswith("//"):
+        return (None, "UNC paths are not permitted")
+    try:
+        p = Path(raw).expanduser().resolve()
+    except (OSError, ValueError, RuntimeError) as exc:
+        return (None, f"unusable path ({exc})")
+    # A resolved drive-less path on Windows, or a UNC that slipped through.
+    if os.name == "nt" and (p.drive.startswith("\\\\") or not p.drive):
+        return (None, "must be a local absolute path")
+    return (p, "")
+
+
+_override_path, _DATA_DIR_OVERRIDE_IGNORED = _validate_data_dir_override(
+    _DATA_DIR_OVERRIDE
+)
+if _override_path is not None:
+    DATA_DIR = _override_path
 else:
     DATA_DIR = APP_ROOT / "scanner_data"
 PARQUET_DIR = DATA_DIR / "ohlcv"          # one .parquet per ticker
@@ -66,7 +102,119 @@ RAW_SOURCES = (
     RAW_SOURCE_FINVIZ,
 )
 # Files older than this many days get pruned at app startup.
+#
+# Audit 2026-08-12 (INT-8): FOUR separate destructive operations justify
+# themselves by pointing at this layer as the recovery path —
+# migrate_to_gap_fill_dedup ("Dropped rows are NOT gone forever"),
+# migrate_calendar_dedup, migrate_sanitize_absurd_eps, and
+# migrate_backfill_finviz_history_from_raw, which actually depends on it. A
+# flat 30 days against a TEN-YEAR store does not deliver that guarantee: at
+# audit time the oldest surviving file was 4 weeks old, earnings_raw/yahoo/
+# was empty and finnhub/ held one file.
+#
+# The bulky sources keep the short window; the small ones (a nasdaq or yahoo
+# calendar sweep is a few KB) get a year, which costs almost nothing and makes
+# the recovery claim real for them.
 RAW_RETENTION_DAYS = 30
+RAW_RETENTION_DAYS_BY_SOURCE: dict = {
+    "nasdaq": 365,
+    "yahoo": 365,
+    "finnhub": 365,   # one calendar file per sweep — tiny
+}
+
+
+_ACL_SENTINEL_NAME = ".acl_hardened_v1.done"
+
+
+def harden_data_dir_acl() -> tuple[bool, str]:
+    """Restrict DATA_DIR to the current user + SYSTEM (Windows only).
+
+    Audit 2026-08-12 (SEC-1): because DATA_DIR sits beside the application
+    rather than under the user profile, it inherits permissive ACEs — the live
+    tree granted ``NT AUTHORITY\\Authenticated Users: Modify`` on every file the
+    app trusts implicitly (the parquets, universe.csv, user_config.json,
+    presets, the skip lists) AND on the DPAPI-wrapped cookie blob and
+    sec_contact.txt. Any local user could rewrite the scanner's inputs or read
+    the contact email.
+
+    Uses ``icacls`` to remove inherited ACEs and grant only the current user and
+    SYSTEM. Runs once, gated by a sentinel, because it walks the whole tree
+    (14k+ files) and re-running is pure cost. Returns ``(changed, detail)``;
+    never raises — a hardening failure must not stop the app from starting.
+    """
+    if os.name != "nt":
+        return (False, "not Windows — no ACL change needed")
+    sentinel = DATA_DIR / _ACL_SENTINEL_NAME
+    if sentinel.exists():
+        return (False, "already hardened")
+    if not DATA_DIR.exists():
+        return (False, "DATA_DIR does not exist yet")
+    import subprocess
+
+    user = os.environ.get("USERNAME", "")
+    if not user:
+        return (False, "USERNAME not set — cannot scope the grant")
+    try:
+        # /inheritance:r drops inherited ACEs (which is where Authenticated
+        # Users: Modify comes from); /T applies to the existing tree; /C keeps
+        # going past individual failures (a file locked by a running instance).
+        # No shell=True — fixed argv list.
+        proc = subprocess.run(
+            [
+                "icacls", str(DATA_DIR),
+                "/inheritance:r",
+                "/grant", f"{user}:(OI)(CI)F",
+                "/grant", "SYSTEM:(OI)(CI)F",
+                "/T", "/C", "/Q",
+            ],
+            capture_output=True, text=True, timeout=300,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (False, f"icacls failed: {exc}")
+    if proc.returncode != 0:
+        return (False, f"icacls returned {proc.returncode}: "
+                       f"{(proc.stderr or proc.stdout or '').strip()[:200]}")
+    try:
+        atomic_write_text(sentinel, "ok\n")
+    except OSError:
+        pass   # hardening succeeded; only the sentinel write failed
+    return (True, f"restricted to {user} + SYSTEM")
+
+
+# -- Log retention (audit 2026-08-12, INT-14) -----------------------------
+# Logging used a plain FileHandler with no RotatingFileHandler anywhere in the
+# package and no reaper: the live logs/ dir held 493 files / 77 MB across 123
+# sessions, many of them 0-byte bridge_*.log from sessions that never used the
+# TradeStation bridge. Rotation caps one runaway session; the age prune caps
+# the population.
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 2
+LOG_RETENTION_DAYS = 30
+
+
+def prune_old_logs(retention_days: Optional[int] = None) -> int:
+    """Delete log files older than ``retention_days``. Returns count removed.
+
+    Called from ``ensure_dirs`` so it runs once per launch. Never raises — a
+    log-housekeeping failure must not stop the app from starting.
+    """
+    days = retention_days if retention_days is not None else LOG_RETENTION_DAYS
+    if not LOG_DIR.exists():
+        return 0
+    cutoff = (datetime.now() - timedelta(days=days)).timestamp()
+    removed = 0
+    try:
+        for f in LOG_DIR.glob("*.log*"):
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except OSError:
+                continue      # in use by this or another session
+    except OSError:
+        return removed
+    return removed
 
 
 def ensure_dirs() -> None:
@@ -79,6 +227,9 @@ def ensure_dirs() -> None:
         d.mkdir(parents=True, exist_ok=True)
     for src in RAW_SOURCES:
         (RAW_EARNINGS_DIR / src).mkdir(parents=True, exist_ok=True)
+    # Audit 2026-08-12 (INT-14): bound the log population. Cheap (an mtime
+    # walk) and self-suppressing once the directory is inside the window.
+    prune_old_logs()
 
 
 # -- Atomic file helpers ----------------------------------------------------
@@ -97,11 +248,29 @@ def _unique_tmp_path(path: Path) -> Path:
 
 def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
     """Write text via a temp file + os.replace so a crash mid-write cannot
-    corrupt the target file."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    corrupt the target file.
+
+    Audit 2026-08-12 (INT-15 / SEC-11): this used a PREDICTABLE sibling name
+    (``<name>.tmp``) and left residue when ``replace()`` failed, unlike its
+    parquet/CSV siblings. It is the writer for every JSON/txt store — the skip
+    lists, the migration sentinels, user_config.json, presets, schedules,
+    sec_contact.txt and the DPAPI-wrapped zacks_cookies.txt — so a predictable
+    temp name in a user-writable directory was both a corruption risk (two
+    writers interleaving into one temp, then promoting a half-written file) and
+    a plant/symlink target. Now uses the same unique name + cleanup contract as
+    ``atomic_write_parquet``.
+    """
+    tmp = _unique_tmp_path(path)
     tmp.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(content, encoding=encoding)
-    tmp.replace(path)
+    try:
+        tmp.write_text(content, encoding=encoding)
+        tmp.replace(path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def atomic_write_parquet(df, path: Path, **kwargs) -> None:
@@ -210,10 +379,24 @@ def most_recent_trading_day(reference: date) -> date:
     return d  # defensive fallback; should not be reached
 
 
-# -- NASDAQ FTP (Source 1) --------------------------------------------------
+# -- NASDAQ symbol directory (Source 1) -------------------------------------
 NASDAQ_FTP_HOST = "ftp.nasdaqtrader.com"
 NASDAQ_FTP_DIR = "SymbolDirectory"
 NASDAQ_FTP_FILES = ["nasdaqtraded.txt", "nasdaqlisted.txt", "otherlisted.txt"]
+
+# Audit 2026-08-12 (SEC-8): prefer HTTPS. The FTP fetch is ANONYMOUS AND
+# PLAINTEXT with no integrity check, and it is the integrity root for SEC-3 —
+# a MITM on this feed controls the ticker universe, which flows into both URL
+# builders and into filesystem paths. NASDAQ serves the identical files over
+# TLS from the same origin (verified: same pipe-delimited headers, 13,137 /
+# 5,590 / 7,549 lines). FTP remains as a fallback so a corporate proxy that
+# blocks this host can't break the universe refresh outright.
+NASDAQ_HTTPS_BASE = "https://www.nasdaqtrader.com/dynamic/SymDir"
+NASDAQ_PREFER_HTTPS = True
+# Same response-size discipline the other remote fetches use. The largest real
+# file (nasdaqtraded.txt) is ~1 MB, so 25 MB never trips on real data but caps
+# the memory + parse cost of a hostile or MITM'd body.
+NASDAQ_MAX_RESPONSE_BYTES = 25 * 1024 * 1024
 
 # -- GitHub rreichel3 (Source 2) --------------------------------------------
 GITHUB_TICKERS_URL = (
@@ -393,6 +576,20 @@ EPS_PRICE_IMPLAUSIBLE_MULT = 10.0
 # NaN instead of a meaningless blow-up. EPS in $/share; revenue in $millions.
 MIN_YOY_EPS_BASE = 0.05
 MIN_YOY_REV_BASE = 1.0
+# Upper sanity bound on a YoY percentage. Audit 2026-08-12 (INT-16): the floors
+# above bound the DIVISOR but not the resulting ratio, so a base that clears the
+# floor by a hair still yields five-figure percentages (the live store held 28
+# rows beyond ±10,000%, topping out at 120,240%). A quarter that genuinely grew
+# 50x year-over-year is +5,000%, so 10,000% is far above any real move while
+# still catching the artifacts. Used by verify_integrity check #13 and by
+# compute_yoy_columns, which nulls anything beyond it at computation time.
+YOY_SANITY_MAX_PCT = 10_000.0
+# Rolling automatic backups of earnings_history.parquet, taken before each
+# CANONICAL (sorted) save. Audit 2026-08-12 (INT-6): the project had no
+# automatic backup at all, so any write-path defect was unrecoverable. Three
+# snapshots of an ~8 MB file costs ~25 MB and covers the realistic window
+# (notice a problem within a few fills).
+HISTORY_BACKUP_COUNT = 3
 # Cross-source EPS disagreement flagging (report-only diagnostics).
 # When two sources both carry a row for the same (ticker, period_ending)
 # slot, dedupe_history silently keeps the priority winner
@@ -480,6 +677,83 @@ FINVIZ_BULK_CHECKPOINT = DATA_DIR / ".finviz_bulk_checkpoint.json"
 FINVIZ_BLACKLIST_FILE = DATA_DIR / "finviz_blacklist.txt"
 # Hard cap on the scraped page size to defend against a runaway response.
 FINVIZ_MAX_RESPONSE_BYTES = 20 * 1024 * 1024
+
+# -- Hotkey target-window guard (audit 2026-08-12, SEC-10) ----------------
+# `pyautogui` types BLIND: whatever holds focus at t+delay_ms receives the
+# ticker and the confirm key. The existing mitigations are strong (no global
+# OS hotkey — the cue is an in-app Qt event filter; waits for physical
+# button/modifier release; lowercase typing so a capital can't fire a Trade
+# Bar order hotkey; off-screen refusal; confirm-key allowlist), but nothing
+# checks WHICH window is about to be typed into.
+#
+# Each entry is a case-insensitive substring matched against the foreground
+# window's title AND class name; a send proceeds if ANY matches. EMPTY = the
+# guard is off, which is the default because the correct value depends on the
+# user's target application (TradeStation, TitanX, …) and a wrong hint would
+# silently break a working trading workflow. The destination window is logged
+# on every send regardless, which is what lets a user fill this in accurately.
+#
+# The guard FAILS OPEN: if the check itself cannot run (no pywin32, no
+# foreground handle) the send proceeds, matching the existing off-screen
+# behaviour. Only a positive mismatch against a configured hint aborts.
+HOTKEY_TARGET_WINDOW_HINTS: list = []
+
+# Sanity ceiling on the financedatabase equities dataset (audit SEC-8). The
+# real dataset is ~150k rows; anything far beyond that is a library change or
+# a bad/hostile upstream response, not data worth iterating over.
+FINANCEDATABASE_MAX_ROWS = 1_000_000
+
+# -- Sector map staleness (audit 2026-08-12, INT-13) ----------------------
+# Nothing ever read sector_map's `updated_at`, and targeted_fill_sectors only
+# filled GAPS — so once a ticker had a sector row it was never revisited and a
+# GICS reclassification never propagated. The live map was last written 99 days
+# before the audit. Rows older than this are re-offered to the targeted fill.
+SECTOR_STALE_DAYS = 180
+# Ceiling on how many stale rows one targeted fill refreshes, so the sweep
+# stays amortised across sessions instead of turning one menu click into a
+# 15k-ticker yfinance run.
+SECTOR_STALE_MAX_PER_RUN = 500
+
+# -- Fill flush cadence (audit 2026-08-12, EFF-7) -------------------------
+# How many successfully-pulled tickers accumulate before a fill rewrites
+# earnings_history.parquet. Each flush is a full read of ~148k rows → mask →
+# concat → sanitize → guard → column reorder → category coercion → atomic
+# write, so at the old cadence of 25 a 15k-ticker fill did ~600 of them.
+#
+# The reason to raise it is not speed — the deliberate network pacing dwarfs
+# the I/O (finviz is 4.0 s/ticker, so a universe fill is ~17 h regardless) —
+# it is INT-1: every one of those cycles was an opportunity for the truncation
+# bug to fire. Fewer, larger flushes shrink that exposure window ~8x.
+#
+# The checkpoint makes progress durable, so the cost of a hard kill is bounded
+# by this many tickers of re-fetching rather than by the whole run.
+FILL_FLUSH_EVERY = 200
+
+# -- Scan compute parallelism (audit 2026-08-12, EFF-1) -------------------
+# The per-ticker compute loop was strictly single-threaded over the whole
+# universe, once per timeframe. Parquet reads and most numpy/pandas kernels
+# release the GIL, so a small pool is the largest scan-latency lever here.
+# 6 mirrors the OHLCV downloader's width. Set to 1 to force the serial path
+# (useful when diffing scan output against an older build).
+SCAN_MAX_WORKERS = 6
+
+# -- Skip-list re-validation (audit 2026-08-12, INT-5) --------------------
+# The per-source skip lists were a one-way ratchet: a single "empty" response
+# — which for finviz includes a bare HTTP 404, and for finnhub an empty
+# earnings array — excluded a ticker permanently. That correctly captures an
+# ETF or a warrant, but it also captures a brand-new IPO with no earnings yet,
+# a ticker mid-rename, and anything 404-ing during a site migration. The lists
+# had reached 10,246 / 10,048 / 6,394 entries against a 15,948-symbol universe
+# and could only grow.
+#
+# Entries now carry an ADDED_ON date, so an entry auto-added for an "empty"
+# response can be re-offered to its source after this many days. Manual entries
+# and any other reason code are never re-checked — the user curated those.
+SKIP_RECHECK_DAYS = 90
+# Ceiling on one re-check batch. Re-including 10k tickers would queue an ~11h
+# finviz fill from a single menu click; a bounded batch keeps the follow-up
+# gap fill something the user can reason about, and the action can be repeated.
+SKIP_RECHECK_MAX = 500
 # Same defense for the other attacker-controllable upstreams (Imperva-fronted
 # Zacks; Finnhub). A legitimate page/response is tens of KB, so a 25 MB ceiling
 # never trips on real data but caps the memory + parse cost of a hostile or
@@ -718,6 +992,34 @@ USER_CONFIG_INT_RANGES: dict = {
 # trailing newline can't sneak past .match(). Public — the Advanced dialog
 # uses it to name the offending entry in its warning.
 PLAUSIBLE_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}\Z")
+
+# Audit 2026-08-12 (SEC-3): the ALLOWLIST applied to any symbol that reaches a
+# URL path or a filesystem path. Symbols arrive from NASDAQ FTP (plaintext,
+# anonymous — the realistic MITM vector), a third-party GitHub mirror and SEC
+# EDGAR, and two builders interpolate them straight into the URL path/query,
+# where requests' safe-parameter encoding does not apply:
+#     https://www.zacks.com/stock/research/{ticker}/earnings-calendar
+#     https://finviz.com/quote.ashx?t={sym}&ty=ea
+# The only prior gate was a DENYLIST (`[+=%#@!]`), which blocks `AAPL?x=1` and
+# `AAPL#frag` but NOT `AAPL/../../admin` — verified reaching the finviz URL.
+#
+# DELIBERATELY WIDER than PLAUSIBLE_TICKER_RE above, which is for the
+# REFERENCE_TICKERS benchmark list. Reusing that stricter pattern here would
+# silently drop 405 legitimate symbols currently in universe.csv — preferred
+# shares and rights like ABR$D, AIIA^, AXIA$C — turning a security fix into a
+# data-integrity bug. Validated against the live 15,948-symbol file: this
+# pattern rejects zero real symbols (longest live symbol is 7 chars).
+URL_SAFE_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-$^]{0,11}\Z")
+
+
+def url_safe_ticker(symbol) -> Optional[str]:
+    """Normalise ``symbol`` and return it only if it is safe to interpolate
+    into a URL path. Returns None for anything else — callers must treat that
+    as "skip this ticker", never as "pass it through unvalidated"."""
+    if not isinstance(symbol, str):
+        return None
+    sym = symbol.strip().upper()
+    return sym if URL_SAFE_TICKER_RE.match(sym) else None
 
 
 def user_config_path() -> Path:

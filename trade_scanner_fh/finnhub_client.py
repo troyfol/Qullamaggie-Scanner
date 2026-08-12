@@ -31,6 +31,7 @@ under "Generic Credentials".
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from datetime import date, timedelta
@@ -148,6 +149,18 @@ _limiter = _RateLimiter(_MIN_INTERVAL_SEC)
 # Low-level REST helper
 # ──────────────────────────────────────────────────────────────────────
 
+_TOKEN_RE = re.compile(r"(token=)[^&\s'\"]+", re.IGNORECASE)
+
+
+def _redact(value) -> str:
+    """Strip any ``token=...`` value out of text before it reaches a log.
+
+    Audit 2026-08-12 (SEC-5). Applied to exception text, which embeds the full
+    request URL — including the API key — on connection errors.
+    """
+    return _TOKEN_RE.sub(r"\1<redacted>", str(value))
+
+
 def _request(endpoint: str, params: dict, *, timeout: float = 15.0):
     """GET endpoint with the stored API key. Returns parsed JSON.
     Sets ``last_failure_kind`` to a FAIL_* sentinel on any failure
@@ -174,7 +187,13 @@ def _request(endpoint: str, params: dict, *, timeout: float = 15.0):
             allow_redirects=False,
         )
     except requests.exceptions.RequestException as exc:
-        log.debug("Finnhub %s network error: %s", endpoint, exc)
+        # Audit 2026-08-12 (SEC-5): requests stringifies connection errors with
+        # the full URL, and the token rides in the query string — so the raw
+        # exception text contains the live API key. This was previously safe
+        # only because the "scanner" logger sits at INFO; one setLevel(DEBUG)
+        # while troubleshooting would have written the key to
+        # scanner_data/logs/. Redact rather than rely on the level.
+        log.debug("Finnhub %s network error: %s", endpoint, _redact(exc))
         _set_failure(FAIL_NETWORK)
         return None
 

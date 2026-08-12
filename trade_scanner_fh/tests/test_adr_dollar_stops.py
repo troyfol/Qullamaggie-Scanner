@@ -361,9 +361,13 @@ def test_compute_ticker_adr_dollar_and_stop_when_enabled(tmp_path, monkeypatch):
 
     row = scanner._compute_ticker("TEST", p)
     assert row is not None
-    assert row["adr_dollar"] == pytest.approx(3.0)
+    # rel=1e-5: cached OHLC is float32 since audit 2026-08-12 (EFF-6), so a
+    # 3.0000 ADR$ lands at 2.9999969. That is ~1e-6 relative on a value
+    # displayed to two decimals — below pytest.approx's 1e-6 default, hence the
+    # explicit tolerance rather than a changed expectation.
+    assert row["adr_dollar"] == pytest.approx(3.0, rel=1e-5)
     # Default adr_stop_multiplier = 1.0 → stop = 100 − 1.0×3.0 = 97.0.
-    assert row["adr_stop"] == pytest.approx(97.0)
+    assert row["adr_stop"] == pytest.approx(97.0, rel=1e-5)
     assert row["adr_stop"] == pytest.approx(
         row["close"] - scanner.ADR_STOP_MULTIPLIER * row["adr_dollar"]
     )
@@ -405,9 +409,10 @@ def test_compute_ticker_adr_dollar_display_only_computes_value(tmp_path, monkeyp
 
     row = scanner._compute_ticker("TEST", p)
     assert row is not None
-    assert row["adr_dollar"] == pytest.approx(3.0)
+    # rel=1e-5 — float32 cache, see the note in the enabled-path test above.
+    assert row["adr_dollar"] == pytest.approx(3.0, rel=1e-5)
     # ADR Stop present in display-only mode too (parent-computed gate).
-    assert row["adr_stop"] == pytest.approx(97.0)
+    assert row["adr_stop"] == pytest.approx(97.0, rel=1e-5)
     # Display-only red-on-fail marking is stashed for the widget.
     assert row.get("_display_only_fails", {}).get("adr_dollar") is True
 
