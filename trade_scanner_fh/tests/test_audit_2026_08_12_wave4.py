@@ -303,3 +303,68 @@ def test_cached_symbols_lists_exactly_the_parquets(tmp_path, monkeypatch):
 def test_cached_symbols_tolerates_a_missing_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "PARQUET_DIR", tmp_path / "gone")
     assert data_engine.cached_symbols() == set()
+
+
+# ── INT-7: "placeholder" must not mean "has revenue" ───────────────────
+
+def _hist(**over):
+    row = {"ticker": "AAA", "period_ending": pd.Timestamp("2026-03-31"),
+           "report_date": pd.Timestamp("2026-04-15"), "reported_eps": 1.0,
+           "reported_rev": 100.0, "source": "finviz"}
+    row.update(over)
+    return row
+
+
+def test_a_revenue_bearing_row_is_not_a_placeholder():
+    """3,142 of the 3,500 EPS-null rows on the live store carry REAL revenue.
+    Keying the check on EPS alone made its "auto-fix" a 3,142-row data-loss
+    event — the audit's own sketch called for excluding revenue-only rows."""
+    from trade_scanner_fh import earnings_history as eh
+    df = pd.DataFrame([
+        _hist(ticker="EMPTY", reported_eps=None, reported_rev=None),
+        _hist(ticker="REVONLY", reported_eps=None, reported_rev=250.0),
+        _hist(ticker="FULL"),
+    ])
+    found = {f.check: f for f in eh.verify_integrity(df)}
+    assert "placeholder_no_actual" in found
+    assert found["placeholder_no_actual"].affected_rows == 1, \
+        "a row with revenue was counted as a placeholder"
+
+
+def test_the_fixer_drops_only_the_truly_empty_rows():
+    from trade_scanner_fh import earnings_history as eh
+    df = pd.DataFrame([
+        _hist(ticker="EMPTY", reported_eps=None, reported_rev=None),
+        _hist(ticker="REVONLY", reported_eps=None, reported_rev=250.0),
+        _hist(ticker="FULL"),
+    ])
+    findings = eh.verify_integrity(df)
+    fixed, msgs = eh.fix_integrity_issues(df, findings)
+
+    assert set(fixed["ticker"]) == {"REVONLY", "FULL"}
+    assert any("placeholder_no_actual: dropped 1" in m for m in msgs)
+
+
+def test_check_and_fixer_never_disagree():
+    """The reported count and the deleted count come from one shared mask."""
+    from trade_scanner_fh import earnings_history as eh
+    df = pd.DataFrame([
+        _hist(ticker=f"T{i}", reported_eps=None,
+              reported_rev=None if i % 2 else 10.0) for i in range(10)
+    ])
+    findings = eh.verify_integrity(df)
+    reported = next(f.affected_rows for f in findings
+                    if f.check == "placeholder_no_actual")
+    fixed, _ = eh.fix_integrity_issues(df, findings)
+    assert len(df) - len(fixed) == reported
+
+
+def test_a_future_scheduled_quarter_is_never_a_placeholder():
+    """A genuinely scheduled future quarter with no actual yet is expected."""
+    from trade_scanner_fh import earnings_history as eh
+    df = pd.DataFrame([_hist(
+        ticker="SCHED", reported_eps=None, reported_rev=None,
+        period_ending=pd.Timestamp.today().normalize() + pd.Timedelta(days=30),
+        report_date=pd.Timestamp.today().normalize() + pd.Timedelta(days=45))])
+    checks = {f.check for f in eh.verify_integrity(df)}
+    assert "placeholder_no_actual" not in checks

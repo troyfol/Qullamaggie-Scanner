@@ -1486,15 +1486,20 @@ def verify_integrity(
                 ),
             ))
 
-    # 14 — placeholder rows: a PAST report_date with no reported EPS. These
+    # 14 — placeholder rows: a PAST report_date carrying NO data at all. These
     # occupy their (ticker, period_ending) slot and, before INT-7, suppressed
     # the gap fill that would have replaced them.
+    #
+    # A row with revenue but no EPS is NOT a placeholder — it is a partially
+    # captured quarter holding genuine data, and dropping it would destroy that
+    # revenue history. On the live store 3,142 of the 3,500 EPS-null rows carry
+    # real revenue, so keying this on EPS alone made the "auto-fix" a 3,142-row
+    # data-loss event. The audit's own fix sketch called for this exclusion
+    # ("revenue-only rows … should be excluded from the sweep"); requiring BOTH
+    # to be null is what makes the auto-fix safe to offer.
     if _rd is not None and "reported_eps" in history_df.columns:
         today = pd.Timestamp.today().normalize()
-        placeholder = (
-            _rd.notna() & (_rd <= today)
-            & pd.to_numeric(history_df["reported_eps"], errors="coerce").isna()
-        )
+        placeholder = _placeholder_mask(history_df, _rd, today)
         if placeholder.any():
             findings.append(IntegrityFinding(
                 check="placeholder_no_actual",
@@ -1503,15 +1508,33 @@ def verify_integrity(
                 sample=_sample_rows(history_df.loc[placeholder]),
                 auto_fixable=True,
                 description=(
-                    "Row has a past report_date but no reported EPS — a "
-                    "scheduled-quarter placeholder that should have been "
-                    "replaced by an actual. Auto-fix drops these rows so the "
-                    "gap fill re-queues the ticker; the raw audit layer keeps "
-                    "the original response."
+                    "Row has a past report_date but NO reported EPS and NO "
+                    "reported revenue — a scheduled-quarter placeholder that "
+                    "should have been replaced by an actual. Auto-fix drops "
+                    "these rows so the gap fill re-queues the ticker; the raw "
+                    "audit layer keeps the original response. Rows carrying "
+                    "revenue are left alone, EPS-null or not."
                 ),
             ))
 
     return findings
+
+
+def _placeholder_mask(
+    df: pd.DataFrame, report_dates: pd.Series, today: pd.Timestamp,
+) -> pd.Series:
+    """Rows with a past report_date and no usable data in EITHER metric.
+
+    Single source of truth shared by ``verify_integrity`` check 14 and its
+    fixer, so the rows reported can never diverge from the rows deleted.
+    """
+    mask = (
+        report_dates.notna() & (report_dates <= today)
+        & pd.to_numeric(df["reported_eps"], errors="coerce").isna()
+    )
+    if "reported_rev" in df.columns:
+        mask &= pd.to_numeric(df["reported_rev"], errors="coerce").isna()
+    return mask
 
 
 def fix_integrity_issues(
@@ -1648,14 +1671,19 @@ def fix_integrity_issues(
     if "placeholder_no_actual" in findings_by_check and _rd_fix is not None:
         today = pd.Timestamp.today().normalize()
         before = len(df)
-        keep = ~(
-            _rd_fix.notna() & (_rd_fix <= today)
-            & pd.to_numeric(df["reported_eps"], errors="coerce").isna()
-        )
-        df = df.loc[keep]
+        # Same mask the check used — a row with revenue is NOT a placeholder
+        # and must survive. Keying this on EPS alone would have dropped 3,142
+        # rows of real revenue history on the live store.
+        #
+        # `_rd_fix` is deliberately the PRE-FIX snapshot of report_date, taken
+        # before the two nullers above ran. verify_integrity counted against
+        # those same original dates, so using them here is what guarantees the
+        # number reported equals the number deleted — the property the user is
+        # consenting to when they accept the fix.
+        df = df.loc[~_placeholder_mask(df, _rd_fix, today)]
         msgs.append(
             f"placeholder_no_actual: dropped {before - len(df)} "
-            f"no-actual row(s); the gap fill will re-queue those tickers"
+            f"no-data row(s); the gap fill will re-queue those tickers"
         )
 
     # Surface non-fixable findings so the caller can show them in the UI.
