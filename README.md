@@ -2363,12 +2363,38 @@ Excluded from any release archive:
 A fresh unzip should therefore contain exactly `Trade_Scanner_FH.exe` and
 `_internal/`.
 
-### `scanner_data/` preservation
+### `scanner_data/` preservation — READ THIS BEFORE REBUILDING
 
-`scanner_data/` is **never** touched by a rebuild. PyInstaller writes only
-`Trade_Scanner_FH.exe` and `_internal/`. A rebuild may safely delete `build/`,
-`__pycache__/` directories, and the previous `_internal/`; it must not touch
-anything under `scanner_data/`.
+Under `--onedir` this is no longer automatic, and the failure mode is total
+data loss.
+
+`PyInstaller --noconfirm` **deletes the entire output directory** before
+building — and since v5.5.0 `scanner_data/` lives *inside* that directory.
+A naive rebuild destroys the whole store (43,869 files at the time of
+writing: every OHLCV parquet, the earnings history, cookies, the SEC contact
+email, and every saved preset).
+
+Move it out first, and move it back after:
+
+```bash
+# 1. Park the data OUTSIDE the build output path (same-volume rename; instant)
+mv dist/Trade_Scanner_FH/scanner_data dist/_scanner_data_SAFE
+
+# 2. Build (see above)
+
+# 3. Restore
+mv dist/_scanner_data_SAFE dist/Trade_Scanner_FH/scanner_data
+
+# 4. Verify the file count matches what you parked
+find dist/Trade_Scanner_FH/scanner_data -type f | wc -l
+```
+
+Step 2 is also the right moment to cut a release archive — the bundle at that
+point is provably just `Trade_Scanner_FH.exe` + `_internal/`, with no user
+data anywhere near it.
+
+Beyond that, a rebuild may freely delete `build/`, `__pycache__/`
+directories, and the previous `_internal/`.
 
 ---
 
@@ -2600,7 +2626,7 @@ These are properties the codebase depends on. Breaking any one is a regression w
 
 ### Build / deploy
 
-42. **`scanner_data/` survives rebuilds.** Verified by checking ohlcv parquet count + presets dir + cookies file before and after. A rebuild writes only `Trade_Scanner_FH.exe` and `_internal/`.
+42. **`scanner_data/` must be moved OUT of the build output path before a rebuild, and back after.** Under `--onedir` it lives inside `dist/Trade_Scanner_FH/`, and `PyInstaller --noconfirm` deletes that directory wholesale — this is now the single most destructive thing a routine rebuild can do. Always verify the file count matches before and after. See [Build & deploy](#build--deploy).
 43. **`__pycache__/` MUST be cleared before any rebuild.** Stale bytecode can mask source edits — burned us once with the multi-column-drag and Display-Only regressions.
 44. **SEC contact email never lives in source.** `SEC_CONTACT_DEFAULT` in `config.py` is a non-functional placeholder; the SEC universe source stays dormant until a real contact email is supplied via the gitignored `scanner_data/sec_contact.txt` (Settings → Set SEC Contact Email…) or the `SEC_CONTACT_EMAIL` env var. The dev copy and the frozen bundle each need their own `sec_contact.txt` (under `trade_scanner_fh/scanner_data/` and `dist/Trade_Scanner_FH/scanner_data/` respectively). It must never appear in a release archive.
 
