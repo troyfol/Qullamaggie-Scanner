@@ -123,7 +123,10 @@ RAW_RETENTION_DAYS_BY_SOURCE: dict = {
 }
 
 
-_ACL_SENTINEL_NAME = ".acl_hardened_v1.done"
+# v1 left every pre-existing FILE with an empty DACL — see harden_data_dir_acl.
+# The bump makes the corrected routine run once more on installs that already
+# ran v1, which repairs them (the `/reset` pass restores inheritance).
+_ACL_SENTINEL_NAME = ".acl_hardened_v2.done"
 
 
 def harden_data_dir_acl() -> tuple[bool, str]:
@@ -141,6 +144,11 @@ def harden_data_dir_acl() -> tuple[bool, str]:
     SYSTEM. Runs once, gated by a sentinel, because it walks the whole tree
     (14k+ files) and re-running is pure cost. Returns ``(changed, detail)``;
     never raises — a hardening failure must not stop the app from starting.
+
+    2026-08-13: the original single-command form left every pre-existing file
+    with an empty DACL and therefore unreadable. It is now two passes — see the
+    comment at the call site below — and the sentinel was bumped to v2 so an
+    install that ran the broken version repairs itself on next launch.
     """
     if os.name != "nt":
         return (False, "not Windows — no ACL change needed")
@@ -154,18 +162,33 @@ def harden_data_dir_acl() -> tuple[bool, str]:
     user = os.environ.get("USERNAME", "")
     if not user:
         return (False, "USERNAME not set — cannot scope the grant")
+    # Two passes, and the split is load-bearing.
+    #
+    # v1 ran ONE command: `/inheritance:r /grant user:(OI)(CI)F ... /T`. With
+    # /T, icacls applies `/inheritance:r` to every file too — but (OI) and (CI)
+    # are *container* inheritance flags that yield no valid ACE on a file
+    # object. So each pre-existing file had its inherited ACEs stripped and
+    # received nothing in return, ending with an EMPTY DACL, which denies
+    # everyone. Files written AFTER the run were fine (a new file inherits from
+    # the already-correct parent), which is why the damage looked arbitrary:
+    # on the live tree it hit exactly the 4 files not rewritten since —
+    # sec_contact.txt and the three saved presets, which the app then reported
+    # as unreadable/corrupt.
+    #
+    # Pass 1 hardens the directory itself (no /T) so the permissive
+    # Authenticated Users ACE is gone and the (OI)(CI) grants become the
+    # inheritable source of truth. Pass 2 resets the children, which drops
+    # their explicit ACEs and re-enables inheritance, so every file picks up
+    # user + SYSTEM from the parent. Pass 2 also REPAIRS anything v1 broke.
+    argv_base = ["icacls", str(DATA_DIR)]
     try:
-        # /inheritance:r drops inherited ACEs (which is where Authenticated
-        # Users: Modify comes from); /T applies to the existing tree; /C keeps
-        # going past individual failures (a file locked by a running instance).
-        # No shell=True — fixed argv list.
+        # No shell=True — fixed argv lists.
         proc = subprocess.run(
-            [
-                "icacls", str(DATA_DIR),
+            argv_base + [
                 "/inheritance:r",
                 "/grant", f"{user}:(OI)(CI)F",
                 "/grant", "SYSTEM:(OI)(CI)F",
-                "/T", "/C", "/Q",
+                "/Q",
             ],
             capture_output=True, text=True, timeout=300,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -174,6 +197,19 @@ def harden_data_dir_acl() -> tuple[bool, str]:
         return (False, f"icacls failed: {exc}")
     if proc.returncode != 0:
         return (False, f"icacls returned {proc.returncode}: "
+                       f"{(proc.stderr or proc.stdout or '').strip()[:200]}")
+    try:
+        # /C keeps going past individual failures (a file locked by a running
+        # instance); /T walks the existing tree.
+        proc = subprocess.run(
+            argv_base + ["/reset", "/T", "/C", "/Q"],
+            capture_output=True, text=True, timeout=300,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (False, f"icacls child reset failed: {exc}")
+    if proc.returncode != 0:
+        return (False, f"icacls /reset returned {proc.returncode}: "
                        f"{(proc.stderr or proc.stdout or '').strip()[:200]}")
     try:
         atomic_write_text(sentinel, "ok\n")
@@ -518,6 +554,26 @@ PARQUET_SCHEMA_FILE = PARQUET_DIR / "_schema_version.txt"
 # -- Data Validation -------------------------------------------------------
 PRICE_JUMP_PCT = 50.0            # flag if single-day % change exceeds this
 MAX_MISSING_DAYS_FLAG = 5        # flag if > N trading days missing in a row
+
+# Relative tolerance (% of the bar's own price level) before an OHLC bound
+# violation — High below Open/Low/Close, or Low above Open/Close — is treated
+# as real rather than provider rounding. The upstream's split/dividend-adjusted
+# prices are rounded, which routinely leaves Close a few 1e-6 above High.
+# A full-store sweep (2026-08-13, 11,854 parquets) found 98.7% of raw breaches
+# sat under 0.01% of the bar's price level while every genuine artifact
+# exceeded 1%, so 0.1% separates the two populations with room on both sides.
+OHLC_INVARIANT_TOL_PCT = 0.1
+
+# Calendar days of ALREADY-CACHED history an incremental OHLCV update
+# re-requests alongside the genuinely new bars. The provider's most recent
+# daily bar stays provisional for hours after the close: a 2026-08-13 sample of
+# 60 tickers against the bars captured by the 2026-08-12 17:21-19:10 refill
+# found Volume wrong on 60/60 (median 1.2% short, p90 22.6%, worst 99%) and
+# High/Low wrong on ~half. Re-fetching the tail lets the finalized figures
+# replace the provisional ones. 0 still re-requests the last cached day itself
+# (the one that matters most); there is no setting that restores the old
+# never-look-back behaviour, which was the bug.
+OHLCV_REFETCH_OVERLAP_DAYS = 5
 
 # -- Universe staleness (days) ---------------------------------------------
 UNIVERSE_STALE_DAYS = 7

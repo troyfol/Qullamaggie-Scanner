@@ -1,46 +1,269 @@
-﻿# Trading Scanner — Finnhub Fork (`trade_scanner_fh`)
+# Trading Scanner — Finnhub Fork (`trade_scanner_fh`)
 
-A standalone PyQt6 desktop application for scanning the entire US equity universe against configurable technical, momentum, volatility, volume, relative-strength, and earnings indicators. Packaged as a single-file Windows executable via PyInstaller.
+![Trading Scanner — full scan view](scan8.png)
 
-Forked from `trading_scanner_zacks` and built around **three independent per-quarter earnings-history sources**, all on the **adjusted / non-GAAP** basis: **Finviz** (top priority — scraped `epsActual`/`salesActual` from the finviz earnings tab; matches Zacks ~98% with finer revenue precision and real announcement dates+times), **Zacks** (adjusted EPS, real announcement dates), and **Finnhub** (deep-history fallback). Coverage uses a **gap-fill source policy** — per `(ticker, period_ending)`, the highest-priority source wins (`finviz > zacks > finnhub`), but each ticker can carry rows from multiple sources covering different fiscal-quarter slots. Plus per-source raw audit layers, daily Nasdaq calendar auto-refresh, Yahoo gap-fill, integrity diagnostics, and a multi-source priority chain reconciler for `last_earnings`/`next_earnings` dates (`nasdaq > yahoo > finviz > zacks > finnhub`).
+A PyQt6 desktop application that screens the entire US equity universe
+(~12,800 symbols) against configurable technical, momentum, volatility,
+volume, relative-strength, and earnings criteria. Every filter is a
+three-state control — **off**, **filter**, or **display-only** (compute and
+show the value, colour it red where it would have failed, but don't drop the
+row) — so a scan can be tightened or explored without re-running it.
 
-> **Source history.** A SEC EDGAR (GAAP) earnings source existed through 2026-05-31 but was removed — GAAP figures aren't useful for this scanner's trading use case, and every remaining EPS source is single-basis (adjusted). The separate SEC `company_tickers.json` download is retained purely as a **universe-building** ticker source (not earnings). Finviz replaced EDGAR's priority slot the same day.
+Earnings coverage is the part that took the most work. Three independent
+per-quarter sources (**Finviz**, **Zacks**, **Finnhub**), all on the adjusted
+/ non-GAAP basis, are merged per fiscal-quarter slot under a fixed priority,
+with two more sources (**Nasdaq**, **Yahoo**) supplying last/next report
+dates. Every fill writes a raw audit capture first, so any merge decision can
+be replayed without re-hitting an upstream.
 
-This README is written to be self-sufficient for any developer (human or LLM) who needs to extend the system — adding a new data feed, modifying a filter's mathematical definition, adding a new indicator, or rewiring the GUI. It documents not just what the system does but **how the pieces compose**, what **invariants must not break**, and exactly **where to plug new code in**.
+**Not financial advice.** Informational and educational use only — read the
+full [Disclaimer](#disclaimer) before relying on any output, and read the
+[hotkey safety warning](#disclaimer) before pointing the automated-input
+features at a live order-entry platform.
 
-> **Security & robustness audit (2026-06-09).** A multi-vector audit (efficiency, security, robustness, GUI usability) was run and remediated. Findings live in [`AUDIT_2026-06-09.md`](AUDIT_2026-06-09.md); the remediation log (what was fixed / deferred / how verified) is in [`AUDIT_FIXES_2026-06-09.md`](AUDIT_FIXES_2026-06-09.md). Highlights now in the codebase: per-writer unique temp names + `HISTORY_WRITE_LOCK`/`DATES_WRITE_LOCK` serialization on the parquet caches (no concurrent lost-updates/corruption), download-then-swap `rebuild_ticker`, vectorized `compute_yoy_columns`, DPAPI-encrypted Zacks cookies (backward-compatible), response-size caps on the Imperva-fronted scrapers, `pyautogui` failsafe/coordinate guards, and the NYSE holiday table extended through 2032. Suite at the time of that audit: 933 tests (since grown — see [Testing](#testing)).
+---
 
-> **2026-06 refactor + feature waves.** Three follow-up waves landed in June 2026: **(1)** observability + version stamping (window title + Windows VERSIONINFO resource mirror `trade_scanner_fh.__version__`) + the **Settings → Advanced…** user-config (`scanner_data/user_config.json`); **(2)** a MainWindow decomposition (`gui/earnings_coordinator.py`, `gui/blacklists.py`, `gui/exports.py`, `gui/columns.py`), the shared `fill_framework.py` fill orchestrator, and scraper resilience (drift-tolerant fallback parsers + a parse-failure spike alarm); **(3)** new scan features — RVOL filter, ATR Stop column, watchlist diffing (`Chg` column), single-level undo delete, Quick Export, an in-app scan scheduler (`gui/scheduler.py`), a report-only cross-source EPS disagreement CSV, and an opt-in launch-time OHLCV prefetch. A follow-up (2026-06) reworked the **ADR% formula** (classic ratio form `mean(100 × (High/Low − 1))`, default lookback 14 → 20) and added the **$ADR filter + ADR Stop column + per-scan stop multipliers** for both stop columns. A bug-fix wave **(4, v5.2.0, 2026-06-17)** followed: the **hotkey/TradeStation order-misfire fix** (type tickers lowercase so `pyautogui`'s Shift-for-capitals can't trigger Trade Bar order hotkeys — see HOTKEY mode § Safety), **Finnhub 403 handling** (route out-of-plan symbols to the skip list without counting them toward the block-backoff streak), **non-sequenced preset date re-anchoring** (End → most recent trading day, Start preserves the saved span; sequenced runs keep exact dates), and a dev-only `TRADE_SCANNER_FH_DATA_DIR` override. Each is documented in its section below. Suite: **1,243 tests pass**.
+## Highlights
+
+- **23 indicators** across trend, momentum, volatility, volume/liquidity and
+  earnings, each with an independent threshold and three-state mode.
+- **Four surge-detection algorithms**, including an *ignition* mode that
+  re-anchors a rally's start to the catalyst bar (first day with both a
+  gain and a volume expansion).
+- **Multi-source earnings** with per-slot priority dedup, gap-fill across
+  sources, locally-derived YoY columns, and a report-only cross-source
+  disagreement CSV.
+- **Match-colour anchoring** — when an indicator date lands on an earnings
+  date (±N days, tunable), the whole related cell group is tinted a stable
+  per-(ticker, date) colour.
+- **Multi-timeframe and sequenced runs**, with optional within-run and
+  across-session de-duplication so each ticker surfaces in its earliest
+  qualifying window.
+- **Watchlist diffing**, an in-app scan scheduler, Quick Export, and a
+  TradeStation bridge plus a per-row HOTKEY sender.
+- **Local-first**: everything lives in `scanner_data/` beside the executable.
+  No account, no telemetry, no cloud dependency.
 
 ---
 
 ## Table of contents
 
-1. [Architecture at a glance](#architecture-at-a-glance)
-2. [Module-by-module map](#module-by-module-map)
-3. [End-to-end data flow](#end-to-end-data-flow)
-4. [Key data structures](#key-data-structures)
-5. [Filter / indicator semantics — the three-state model](#filter--indicator-semantics--the-three-state-model)
-6. [Display-only mode & red-on-fail coloring](#display-only-mode--red-on-fail-coloring)
-7. [Match-color anchoring system](#match-color-anchoring-system)
-8. [Adding a new indicator](#adding-a-new-indicator)
-9. [Adding or modifying a filter](#adding-or-modifying-a-filter)
-10. [Adding a new OHLCV data source (e.g. Polygon)](#adding-a-new-ohlcv-data-source-eg-polygon)
-11. [Adding a new earnings data source](#adding-a-new-earnings-data-source)
-12. [Editing mathematical assumptions of existing filters](#editing-mathematical-assumptions-of-existing-filters)
-13. [The Zacks scraper subsystem](#the-zacks-scraper-subsystem)
-14. [EDGAR scrape and conversion (REMOVED — forking reference only)](#edgar-scrape-and-conversion-removed--forking-reference-only)
-15. [Cookie acquisition flow (Firefox + mid-flight capture)](#cookie-acquisition-flow-firefox--mid-flight-capture)
-16. [GUI subsystem](#gui-subsystem)
-17. [Storage layout](#storage-layout)
-18. [Testing](#testing)
-19. [Build & deploy](#build--deploy)
-20. [What changed in v5.4.0 (audit remediation, 2026-08-12)](#what-changed-in-v540-audit-remediation-2026-08-12)
-21. [Critical invariants](#critical-invariants)
-22. [Disclaimer](#disclaimer)
+### Using it
 
+- [Getting started](#getting-started)
+- [Credentials](#credentials)
+- [Filling the data stores](#filling-the-data-stores)
+- [Running a scan](#running-a-scan)
+- [Troubleshooting](#troubleshooting)
 
-**Not financial advice.** This software is for informational and educational use only — see the full [Disclaimer](#disclaimer) at the bottom of this README before relying on any output.
+### How it works
+
+- [Architecture at a glance](#architecture-at-a-glance)
+- [Module-by-module map](#module-by-module-map)
+- [End-to-end data flow](#end-to-end-data-flow)
+- [Key data structures](#key-data-structures)
+- [Filter / indicator semantics — the three-state model](#filter--indicator-semantics--the-three-state-model)
+- [Display-only mode & red-on-fail coloring](#display-only-mode--red-on-fail-coloring)
+- [Match-color anchoring system](#match-color-anchoring-system)
+
+### Extending it
+
+- [Adding a new indicator](#adding-a-new-indicator)
+- [Adding or modifying a filter](#adding-or-modifying-a-filter)
+- [Adding a new OHLCV data source](#adding-a-new-ohlcv-data-source-eg-polygon)
+- [Adding a new earnings data source](#adding-a-new-earnings-data-source)
+- [Editing mathematical assumptions of existing filters](#editing-mathematical-assumptions-of-existing-filters)
+
+### Subsystems
+
+- [The Zacks scraper subsystem](#the-zacks-scraper-subsystem)
+- [The Finviz earnings scraper](#the-finviz-earnings-scraper-top-priority-source)
+- [Cookie acquisition flow](#cookie-acquisition-flow-firefox--mid-flight-capture)
+- [GUI subsystem](#gui-subsystem)
+
+### Reference
+
+- [Storage layout](#storage-layout)
+- [Testing](#testing)
+- [Build & deploy](#build--deploy)
+- [Changelog](#changelog)
+- [Critical invariants](#critical-invariants)
+- [Disclaimer](#disclaimer)
+
+---
+
+## Getting started
+
+### Install
+
+Download the release archive, unzip it anywhere you can write to, and run
+`Trade_Scanner_FH.exe` from inside the extracted folder.
+
+> **Keep the folder together.** The build is PyInstaller `--onedir`: the exe
+> loads its dependencies from the `_internal/` folder beside it, and it
+> creates and reads `scanner_data/` in that same folder. Moving the exe out
+> on its own will not work.
+
+Running from source instead:
+
+```bash
+git clone https://github.com/troyfol/Qullamaggie-Scanner.git
+cd Qullamaggie-Scanner
+pip install -r requirements.txt
+python launch_scanner.py
+```
+
+### Order of operations
+
+| # | Step | Where | Needed for |
+|---|------|-------|-----------|
+| 1 | Launch; answer or skip the two credential prompts | First-launch dialogs | Finnhub + Zacks features |
+| 2 | Let the **universe** and **OHLCV** downloads finish | Automatic, background | Any scan at all |
+| 3 | *(Optional)* Set the **SEC contact email**, then Force Universe Refresh | Settings → Data menu | SEC EDGAR universe source |
+| 4 | **Bulk Fill Sector Map** | Data menu | Relative-strength / sector-ETF filters |
+| 5 | Fill **earnings dates** and **earnings history** | Data menu | Any earnings filter |
+| 6 | Configure the indicator panel and **Run Scan** | Main window | Results |
+
+Steps 3–5 are optional and depend on which filters you use. A price /
+technical scan needs only steps 1–2.
+
+### First launch
+
+Two **optional** credential prompts appear before the main window. Both can
+be skipped and set later.
+
+Once the window opens, two things start automatically in the background:
+
+- **Universe download** — the full US equity ticker list (NASDAQ FTP +
+  GitHub; SEC EDGAR only if a contact email is configured). Written to
+  `scanner_data/universe.csv`. Later launches re-run this only if the
+  snapshot is older than 7 days.
+- **OHLCV download** — up to 5 years of daily bars per ticker from yfinance
+  into `scanner_data/ohlcv/`. **This is by far the longest first-run step**
+  — thousands of rate-limited downloads. The toolbar's OHLCV status label
+  turns green when it completes.
+
+You can scan against whatever has cached so far, but full universe coverage
+needs this download to finish.
+
+---
+
+## Credentials
+
+Three independent credentials. None is required to launch; each unlocks one
+subsystem.
+
+| Credential | Set via | Stored in | Unlocks |
+|-----------|---------|-----------|---------|
+| **Finnhub API key** | First-launch prompt, or `Data → Set Finnhub API Key…` | Windows Credential Manager (keyring) | Finnhub earnings history fills, best-quality sector map |
+| **Zacks cookies** | First-launch prompt, or `Data → Set Zacks Cookies…` / `Refresh Zacks Cookies (Open Browser)…` | `scanner_data/zacks_cookies.txt`, DPAPI-encrypted | Zacks per-quarter earnings history |
+| **SEC contact email** | `Settings → Set SEC Contact Email…` | `scanner_data/sec_contact.txt` or the `SEC_CONTACT_EMAIL` env var | SEC EDGAR ticker-universe source |
+
+**Getting Zacks cookies.** Open <https://zacks.com> in a logged-in browser →
+DevTools → Application → Cookies → copy the full `key=value; key=value; …`
+header string → paste it into the dialog. When Zacks' Imperva layer later
+starts blocking, use `Data → Refresh Zacks Cookies (Open Browser)…`: it
+launches a managed Firefox profile, you solve any challenge, and fresh
+cookies are captured automatically, even mid-session.
+
+**SEC contact email.** SEC EDGAR's fair-access policy requires a real contact
+email in the request User-Agent. Without one the scanner simply skips the SEC
+source and builds the universe from NASDAQ FTP + GitHub, which is already
+comprehensive — so this is genuinely optional. To include it: set the email,
+then `Data → Force Universe Refresh`. Set `SEC_CONTACT_EMAIL` in the
+environment before first launch to have it active from the very first
+universe download. The email is read file-first, then env var, then a
+non-functional placeholder, and is never committed to source.
+
+---
+
+## Filling the data stores
+
+### Sector map
+
+`Data → Bulk Fill Sector Map` maps each ticker to its sector and the
+corresponding SPDR sector ETF (used by the relative-strength filters). It
+pulls from Finnhub `/stock/profile2` when a key is set, falling back to
+FinanceDatabase and yfinance. Output: `scanner_data/sector_map.parquet`.
+`Targeted Fill Sector Map` afterwards fills only what's still missing.
+
+### Earnings dates (last / next report date)
+
+| Action | Source | Notes |
+|--------|--------|-------|
+| `Data → Bulk Fill Earnings Dates (Nasdaq)` | Nasdaq calendar | Fast; ±90-day window. Best first step. |
+| `Data → Targeted Fill Earnings Dates (Yahoo)` | yfinance | Gap-fills tickers Nasdaq missed. |
+
+A once-per-day Nasdaq sweep also auto-fires at launch (toggle: `Data →
+Auto-refresh Nasdaq calendar daily`), and the launch sequence chains an
+earnings smart refresh after it so newly-reported quarters land in the same
+session.
+
+### Earnings history (per-quarter EPS / revenue)
+
+| Action | Source | Notes |
+|--------|--------|-------|
+| `Data → Bulk Fill Earnings (Finviz)` | Finviz scraper | **Top-priority source** — adjusted EPS + revenue with real report dates. Paced slow; run the full universe overnight. |
+| `Data → Gap / Spot Fill Earnings (Finviz)` | Finviz scraper | Gap = only tickers with no Finviz rows yet; Spot = one ticker on demand. |
+| `Data → Bulk Fill Earnings (Zacks)` | Zacks scraper | ~6.5 h for the full universe; needs Zacks cookies. |
+| `Data → Targeted Fill Earnings (Zacks)` | Zacks scraper | Only tickers with no rows yet — much faster than a bulk run. |
+| `Data → Bulk / Gap / Spot Fill Earnings (Finnhub)` | Finnhub | Needs a Finnhub key. Resumable. |
+
+All three history sources report the same adjusted (non-GAAP) figures, and
+one ticker can carry rows from several sources covering different quarters.
+Dedup is per fiscal-quarter slot: for each `(ticker, period_ending)` the
+highest-priority source wins, **Finviz > Zacks > Finnhub**. Each fill
+auto-reconciles the tickers it touched.
+
+### Checking coverage
+
+`Data → Diagnostics → Earnings Coverage Report` shows per-source coverage
+(overlapping sets, since gap-fill lets one ticker carry rows from several
+sources), the tickers with no coverage at all, and the most-recent reported
+quarter per source. `Verify earnings_history Integrity` runs 14 schema /
+policy checks with one-click auto-fix.
+
+---
+
+## Running a scan
+
+1. In the **indicator panel** (left), enable filters. Each row is a
+   three-state control:
+   - **Off** — not computed, no column.
+   - **Filter** — computed; rows below the threshold are dropped.
+   - **Display Only** — computed and shown but *not* filtered; cells render
+     **red** where the value would have failed.
+
+   The threshold input stays editable in both modes.
+2. Pick a **Timeframe** in the toolbar, or set a custom range / sequenced run.
+3. Click **Run Scan**.
+4. Use the **view-only checkboxes** beside the Timeframe dropdown (Earnings
+   Dates / Earnings Data / Color Match Only) to filter what is *displayed*
+   without re-scanning.
+
+Once you have results: **Columns ▾** reorders and hides columns (layout saves
+into presets); right-click rows or headers to delete, cut, or paste;
+**Excel** exports the active or all periods to XLSX/CSV with optional cell
+colouring; **Save Preset** stores the full filter + window + column layout to
+`scanner_data/presets/{name}.json`.
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| Scan returns few or no rows | OHLCV download unfinished — wait for the toolbar status to go green, or `Data → Download Missing Tickers Only`. |
+| Universe missing SEC tickers | No SEC contact email — see [Credentials](#credentials). |
+| Earnings filters all blank | Earnings parquets not filled — see [Filling the data stores](#filling-the-data-stores). |
+| Zacks fill keeps pausing | Imperva is blocking — `Data → Refresh Zacks Cookies (Open Browser)…`. |
+| Prices look wrong (e.g. post-split) | `Data → Rebuild Tickers…` for the affected symbols. |
+| A saved preset reports as unreadable | Check the file's ACL, not its contents — see the v5.5.0 note in the [Changelog](#changelog). |
+| Need to re-pull the universe now | `Data → Force Universe Refresh` (ignores the 7-day staleness guard). |
+
+Per-session logs land in `scanner_data/logs/` (`scan_*`, `ohlcv_*`,
+`universe_*`, `bridge_*`) — check those first.
+
 ---
 
 ## Architecture at a glance
@@ -270,7 +493,7 @@ pin the parity + the no-leak-to-persisted-files guardrail.
 per-source coverage counts (finviz / zacks / finnhub) — sets overlap
 under gap-fill — plus the canonical "no coverage at all" gap and the
 most-recent reported quarter per source. `Data → Diagnostics → Verify
-earnings_history Integrity` runs ten soft-PK / schema / policy checks
+earnings_history Integrity` runs 14 soft-PK / schema / policy checks
 (duplicate keys, orphan rows, null sources, dtype drift, period predates
 the `EARNINGS_HISTORY_YEARS` cap, same-slot cross-source overlap,
 calendar-vs-fiscal phantom duplicates, etc.) with one-click auto-fix
@@ -305,9 +528,9 @@ log line when non-empty, silent when clean. Tests in
 
 ## Module-by-module map
 
-Line counts and entry points as of 2026-06 (post the Phase 1–3 waves).
-The package is **101 Python files** including tests (23 top-level
-modules, 12 `gui/` modules, 1 `tools/` helper, 65 files under `tests/`).
+Line counts and entry points as of 2026-08-13 (v5.5.0).
+The package is **110 Python files** including tests (23 top-level
+modules, 12 `gui/` modules, 1 `tools/` helper, 74 files under `tests/`).
 
 ### Top-level package
 | File | Lines | Role | Key entry points |
@@ -315,43 +538,44 @@ modules, 12 `gui/` modules, 1 `tools/` helper, 65 files under `tests/`).
 | `__main__.py` | 4 | `python -m trade_scanner_fh` shim | calls `gui.main()` |
 | `launch_scanner.py` | 4 | PyInstaller entry — sole script in the spec | calls `gui.main()` |
 | `__init__.py` | 13 | Package init + version | `__version__` |
-| `config.py` | 865 | All paths, constants, tunables + the user-config override layer | `DATA_DIR`, `EARNINGS_HISTORY_PARQUET`, `REFERENCE_TICKERS`, `SECTOR_ETF_MAP`, `atomic_write_parquet` / `atomic_write_text` / `atomic_write_csv`, `most_recent_trading_day`, `get_sec_user_agent` / `get_sec_contact_email` / `set_sec_contact_email` / `sec_contact_is_configured`, `load_user_config` / `save_user_config` / `user_config_path` |
-| `data_engine.py` | 613 | OHLCV download & cache | `download_one`, `download_many`, `load_ohlcv`, `validate_ticker`, `rebuild_ticker`, `prefetch_ohlcv` |
-| `ticker_universe.py` | 603 | Universe download (3 sources) | `refresh_universe`, `load_universe` |
-| `indicators.py` | 706 | 23 pure indicator functions | One function per indicator (see §[Adding a new indicator](#adding-a-new-indicator)) |
-| `scanner.py` | 1776 | The funnel pipeline | `ScanParams`, `_compute_ticker`, `_compute_display_only_fails`, `_build_filter_stages`, `run_scan`, `ScanResult`, `ATR_STOP_MULTIPLIER`, `ADR_STOP_MULTIPLIER` |
+| `config.py` | 1238 | All paths, constants, tunables + the user-config override layer | `DATA_DIR`, `EARNINGS_HISTORY_PARQUET`, `REFERENCE_TICKERS`, `SECTOR_ETF_MAP`, `atomic_write_parquet` / `atomic_write_text` / `atomic_write_csv`, `most_recent_trading_day`, `get_sec_user_agent` / `get_sec_contact_email` / `set_sec_contact_email` / `sec_contact_is_configured`, `load_user_config` / `save_user_config` / `user_config_path` |
+| `data_engine.py` | 943 | OHLCV download & cache | `download_one`, `download_many`, `load_ohlcv`, `validate_ticker`, `rebuild_ticker`, `prefetch_ohlcv` |
+| `ticker_universe.py` | 658 | Universe download (3 sources) | `refresh_universe`, `load_universe` |
+| `indicators.py` | 724 | 23 pure indicator functions | One function per indicator (see §[Adding a new indicator](#adding-a-new-indicator)) |
+| `scanner.py` | 1886 | The funnel pipeline | `ScanParams`, `_compute_ticker`, `_compute_display_only_fails`, `_build_filter_stages`, `run_scan`, `ScanResult`, `ATR_STOP_MULTIPLIER`, `ADR_STOP_MULTIPLIER` |
 | `scan_history.py` | 304 | GUI-free watchlist-diff persistence (`scan_history.json`) | `diff_and_record`, `record_scan_results`, `load_history`, `save_history`, `prune_latest`, `ScanDiff` |
-| `sector_map.py` | 288 | Sector mapping persistence | `bulk_fill_sectors`, `targeted_fill_sectors`, `load_sector_map` |
-| `earnings_cache.py` | 180 | Schema/IO for earnings_dates.parquet (bulk + targeted fills now live in nasdaq_fill / yahoo_fill) | `load_earnings_cache`, `save_earnings_cache`, `get_earnings_dates`, `_merge_and_save`, `COLUMNS` |
-| `earnings_history.py` | 2322 | Schema/IO for earnings_history.parquet + Zacks bulk/targeted fills + write-side per-slot priority dedup (finviz > zacks > finnhub) + one-time migration + YoY columns + integrity diagnostics + disagreement report | `bulk_fill_zacks`, `targeted_fill_zacks`, `find_gap_tickers`, `find_smart_refresh_candidates`, `compute_consecutive_beats`, `compute_yoy_columns`, `dedupe_history`, `get_ticker_history`, `load_earnings_history`, `save_earnings_history`, `migrate_to_gap_fill_dedup`, `verify_integrity`, `fix_integrity_issues`, `coverage_report`, `find_cross_source_disagreements`, `report_cross_source_disagreements` |
-| `fill_framework.py` | 547 | Shared checkpoint/flush/finalize/backoff-rewind orchestrator for the finviz/finnhub fill pair (hooks resolved through the calling module at call time so test monkeypatching of private names keeps working) | `run_fill_loop`, `FillSpec`, `Checkpoint`, `save_checkpoint` / `load_checkpoint` / `clear_checkpoint`, `flush_pending_to_disk`, `find_gap_tickers`, `finalize_fill` |
-| `finviz_client.py` | 254 | Finviz earnings scrape — fetch `quote.ashx?t=SYM&ty=ea`, extract the `earningsData` JSON array (curl_cffi Chrome impersonation, slow jittered rate limiter, failure-kind sentinels, two-marker block-vs-empty classification) | `fetch_earnings`, `_extract_earnings_data`, `is_configured`, `last_failure_kind` |
-| `finviz_fill.py` | 578 | Bulk / gap / spot finviz fills (top-priority adjusted source) — adjusted-field mapping, forward-row skip, history-years cap, checkpoint resume, block backoff (loop delegated to `fill_framework.run_fill_loop`) | `bulk_fill_finviz`, `gap_fill_finviz`, `spot_fill_finviz`, `find_finviz_gap_tickers` |
-| `earnings_reconcile.py` | 418 | Multi-source priority chain unifier (`nasdaq > yahoo > finviz > zacks > finnhub`) | `reconcile_earnings_dates` |
-| `earnings_raw.py` | 300 | Append-only raw audit/replay layer (one parquet per fill run per source) | `new_run_id`, `append_zacks_rows`, `append_finnhub_rows`, `append_finviz_rows`, `append_nasdaq_rows`, `append_yahoo_rows`, `read_raw`, `prune_old_raw` |
+| `sector_map.py` | 463 | Sector mapping persistence | `bulk_fill_sectors`, `targeted_fill_sectors`, `load_sector_map` |
+| `earnings_cache.py` | 234 | Schema/IO for earnings_dates.parquet (bulk + targeted fills now live in nasdaq_fill / yahoo_fill) | `load_earnings_cache`, `save_earnings_cache`, `get_earnings_dates`, `_merge_and_save`, `COLUMNS` |
+| `earnings_history.py` | 2720 | Schema/IO for earnings_history.parquet + Zacks bulk/targeted fills + write-side per-slot priority dedup (finviz > zacks > finnhub) + one-time migration + YoY columns + integrity diagnostics + disagreement report | `bulk_fill_zacks`, `targeted_fill_zacks`, `find_gap_tickers`, `find_smart_refresh_candidates`, `compute_consecutive_beats`, `compute_yoy_columns`, `dedupe_history`, `get_ticker_history`, `load_earnings_history`, `save_earnings_history`, `migrate_to_gap_fill_dedup`, `verify_integrity`, `fix_integrity_issues`, `coverage_report`, `find_cross_source_disagreements`, `report_cross_source_disagreements` |
+| `fill_framework.py` | 666 | Shared checkpoint/flush/finalize/backoff-rewind orchestrator for the finviz/finnhub fill pair (hooks resolved through the calling module at call time so test monkeypatching of private names keeps working) | `run_fill_loop`, `FillSpec`, `Checkpoint`, `save_checkpoint` / `load_checkpoint` / `clear_checkpoint`, `flush_pending_to_disk`, `find_gap_tickers`, `finalize_fill` |
+| `finviz_client.py` | 263 | Finviz earnings scrape — fetch `quote.ashx?t=SYM&ty=ea`, extract the `earningsData` JSON array (curl_cffi Chrome impersonation, slow jittered rate limiter, failure-kind sentinels, two-marker block-vs-empty classification) | `fetch_earnings`, `_extract_earnings_data`, `is_configured`, `last_failure_kind` |
+| `finviz_fill.py` | 581 | Bulk / gap / spot finviz fills (top-priority adjusted source) — adjusted-field mapping, forward-row skip, history-years cap, checkpoint resume, block backoff (loop delegated to `fill_framework.run_fill_loop`) | `bulk_fill_finviz`, `gap_fill_finviz`, `spot_fill_finviz`, `find_finviz_gap_tickers` |
+| `earnings_reconcile.py` | 462 | Multi-source priority chain unifier (`nasdaq > yahoo > finviz > zacks > finnhub`) | `reconcile_earnings_dates` |
+| `earnings_raw.py` | 316 | Append-only raw audit/replay layer (one parquet per fill run per source) | `new_run_id`, `append_zacks_rows`, `append_finnhub_rows`, `append_finviz_rows`, `append_nasdaq_rows`, `append_yahoo_rows`, `read_raw`, `prune_old_raw` |
 | `nasdaq_fill.py` | 141 | Nasdaq finance-calendars bulk fill (writes earnings_dates only) | `bulk_fill_nasdaq` |
 | `yahoo_fill.py` | 216 | yfinance gap + spot fills (writes earnings_dates only) | `targeted_fill_yahoo`, `spot_fill_yahoo` |
-| `finnhub_fill.py` | 618 | Finnhub deep-history bulk/gap/spot with step-back-on-block + resumable checkpoint + period_ending day-1 normalization + fiscal-year multi-record dedup (loop delegated to `fill_framework.run_fill_loop`) | `bulk_fill_finnhub`, `gap_fill_finnhub`, `spot_fill_finnhub`, `find_finnhub_gap_tickers` |
-| `zacks_scraper.py` | 1136 | HTTP scraper + Firefox cookie path (strict + drift-tolerant fallback `obj_data` parsers) | `ZacksSession`, `fetch_earnings_history`, `launch_firefox_for_zacks_cookies`, `read_cookies_from_firefox_profile`, `set_zacks_cookies` |
-| `finnhub_client.py` | 390 | Finnhub REST primitives (rate limiter, key storage, /stock/earnings, /calendar/earnings, /stock/profile2, failure-kind sentinels) | `fetch_earnings_history`, `fetch_calendar_earnings_window`, `fetch_earnings_dates`, `fetch_company_profile`, `fetch_sector`, `verify_api_key`, `get_api_key`, `set_api_key`, `last_failure_kind` |
-| `hotkey.py` | 326 | Qt-free per-row HOTKEY ticker sender (testable headless) | `HotkeyConfig`, `send_ticker` |
-| `tradestation.py` | 212 | TradeStation watchlist bridge | `TradeStationBridge` |
+| `finnhub_fill.py` | 644 | Finnhub deep-history bulk/gap/spot with step-back-on-block + resumable checkpoint + period_ending day-1 normalization + fiscal-year multi-record dedup (loop delegated to `fill_framework.run_fill_loop`) | `bulk_fill_finnhub`, `gap_fill_finnhub`, `spot_fill_finnhub`, `find_finnhub_gap_tickers` |
+| `zacks_scraper.py` | 1178 | HTTP scraper + Firefox cookie path (strict + drift-tolerant fallback `obj_data` parsers) | `ZacksSession`, `fetch_earnings_history`, `launch_firefox_for_zacks_cookies`, `read_cookies_from_firefox_profile`, `set_zacks_cookies` |
+| `finnhub_client.py` | 409 | Finnhub REST primitives (rate limiter, key storage, /stock/earnings, /calendar/earnings, /stock/profile2, failure-kind sentinels) | `fetch_earnings_history`, `fetch_calendar_earnings_window`, `fetch_earnings_dates`, `fetch_company_profile`, `fetch_sector`, `verify_api_key`, `get_api_key`, `set_api_key`, `last_failure_kind` |
+| `hotkey.py` | 522 | Qt-free per-row HOTKEY ticker sender (testable headless) | `HotkeyConfig`, `send_ticker` |
+| `tradestation.py` | 237 | TradeStation watchlist bridge | `TradeStationBridge` |
 | `tools/set_zacks_cookies.py` | 136 | One-shot CLI cookie-injection helper | `main`, `_live_test`, `_read_interactive` |
+| `tools/hotkey_probe.py` | 198 | Standalone staged TradeStation hotkey bisection probe (**SIM-mode only**) | `--list-config`, `--stage click-only\|type\|full` |
 
 ### GUI package (`gui/`)
 | File | Lines | Role | Key entry points |
 |------|------:|------|------------------|
 | `__init__.py` | 15 | Re-exports `main` | `main()` |
-| `main_window.py` | 7302 | `MainWindow` — window, menus, slot wiring (decomposed 2026-06: earnings coordination, blacklists, exports, and column state moved to the four helper modules below; every historical method name survives on `MainWindow` as a thin delegate) | `MainWindow`, `PRESET_SCHEMA_VERSION` |
+| `main_window.py` | 7797 | `MainWindow` — window, menus, slot wiring (decomposed 2026-06: earnings coordination, blacklists, exports, and column state moved to the four helper modules below; every historical method name survives on `MainWindow` as a thin delegate) | `MainWindow`, `PRESET_SCHEMA_VERSION` |
 | `earnings_coordinator.py` | 841 | Earnings-refresh orchestration extracted from MainWindow: launch-time smart-refresh chaining, daily Nasdaq cadence, per-source worker bringup, the 3-bar earnings progress panel | `EarningsRefreshCoordinator` |
-| `blacklists.py` | 116 | Per-source skip-list load/save/normalize plumbing | `BlacklistManager`, `normalize_ticker` |
-| `exports.py` | 558 | XLSX/CSV export pipeline + Quick Export | `ExportsController` (incl. `quick_export`) |
+| `blacklists.py` | 229 | Per-source skip-list load/save/normalize plumbing | `BlacklistManager`, `normalize_ticker` |
+| `exports.py` | 602 | XLSX/CSV export pipeline + Quick Export | `ExportsController` (incl. `quick_export`) |
 | `columns.py` | 281 | Manual column order + hidden-set state and the cross-scan reconcile rules | `ColumnManager` |
 | `scheduler.py` | 762 | In-app scan scheduler (F3): persistence, due-entry math, manager dialog, tray-icon toasts | `ScanScheduler`, `ScheduleEntry`, `ScheduleDialog`, `ScheduleEntryDialog`, `load_schedules` / `save_schedules`, `entry_is_due` |
-| `widgets.py` | 2922 | Reusable widgets | `IndicatorRow`, `IndicatorPanel`, `ResultsTable`, `ReorderableHeader`, `LogPanel`, `RESULT_COLUMNS`, `_ALIGN_PALETTE`, `_safe_streak`, `_anchor_date_value`, `restore_rows_at_positions` |
-| `workers.py` | 1360 | All QThread workers | `ScanWorker`, `ZacksFillWorker`, `FinnhubFillWorker`, `FinvizFillWorker`, `FirefoxCookieWaitWorker`, `UpdateWorker`, `PrefetchWorker`, `UniverseWorker`, `UniverseRefreshWorker`, `SectorFillWorker`, `EarningsFillWorker`, `BridgeWorker` |
+| `widgets.py` | 2936 | Reusable widgets | `IndicatorRow`, `IndicatorPanel`, `ResultsTable`, `ReorderableHeader`, `LogPanel`, `RESULT_COLUMNS`, `_ALIGN_PALETTE`, `_safe_streak`, `_anchor_date_value`, `restore_rows_at_positions` |
+| `workers.py` | 1393 | All QThread workers | `ScanWorker`, `ZacksFillWorker`, `FinnhubFillWorker`, `FinvizFillWorker`, `FirefoxCookieWaitWorker`, `UpdateWorker`, `PrefetchWorker`, `UniverseWorker`, `UniverseRefreshWorker`, `SectorFillWorker`, `EarningsFillWorker`, `BridgeWorker` |
 | `dialogs.py` | 770 | Modal dialogs | `WatchlistDialog`, `ExcelExportDialog`, `SequencedRunDialog`, `ColumnsManagerDialog` |
-| `hotkey_dialog.py` | 544 | Per-row HOTKEY settings UI | `HotkeySettingsDialog`, `PositionCaptureCountdown` |
+| `hotkey_dialog.py` | 568 | Per-row HOTKEY settings UI | `HotkeySettingsDialog`, `PositionCaptureCountdown` |
 | `theme.py` | 52 | Dark stylesheet | `DARK_STYLESHEET` |
 
 The top-level `hotkey.py` module (sibling of `tradestation.py`) holds the
@@ -1328,256 +1552,6 @@ cost a request.
 
 ---
 
-## EDGAR scrape and conversion (REMOVED — forking reference only)
-
-> **⚠️ Removed from this app 2026-05-31.** SEC EDGAR was a GAAP earnings
-> source; GAAP figures aren't useful for this scanner's trading use case,
-> and every remaining EPS source is single-basis (adjusted). The
-> `edgar_client.py` / `edgar_fill.py` modules and all `source=edgar`
-> parquet rows were deleted, and **Finviz** took EDGAR's top-priority
-> slot. This section is retained purely as a **forking reference** for
-> porting the XBRL extraction algorithm into another project; none of the
-> code below exists in the current tree. (The separate SEC
-> `company_tickers.json` download survives as a *universe-building*
-> ticker source — that's unrelated to the earnings algorithm here.)
-
-The EDGAR algorithm was designed to be self-contained and forkable —
-`edgar_client.py` carried the parsing primitives, `edgar_fill.py`
-wrapped the loop, and zero dependencies on the rest of the scanner were
-required to lift the algorithm into another project.
-
-### Two endpoints
-
-| Endpoint        | URL                                                                                | What it returns                                                                                                                                                       | Size       |
-| --------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| **Submissions** | `https://data.sec.gov/submissions/CIK{padded}.json`                                | Last ~1000 filings: parallel arrays `form[] filingDate[] accessionNumber[] reportDate[]`.                                                                             | ~50-500 KB |
-| **Companyfacts**| `https://data.sec.gov/api/xbrl/companyfacts/CIK{padded}.json`                      | Every us-gaap XBRL fact the issuer has ever reported, nested as `facts.us-gaap.{Tag}.units.{Unit}` → list of `{accn, start, end, val, fy, fp, form, filed}` dicts.    | ~1-10 MB   |
-
-Both keyed by zero-padded CIK (10 digits — AAPL = `0000320193`).
-
-No API key. SEC fair-access requires a `User-Agent` with a real contact
-email. Resolved at request time by `config.get_sec_user_agent()` via
-`scanner_data/sec_contact.txt` → `SEC_CONTACT_EMAIL` env var →
-`SEC_CONTACT_DEFAULT`. Rate-limited to `EDGAR_MIN_INTERVAL_SEC` (default
-0.4 s = ~2.5 req/sec single-pacing, ~5 req/sec aggregate when both
-per-ticker calls fire back-to-back — safely under the 10 req/sec hard
-cap) via the process-wide `_limiter`. The default was tuned down from
-0.21 s after a bulk run tripped SEC's rate-limiter mid-stream at
-ticker ~4200; sustained 5+ req/sec aggregate burst patterns trigger
-the limiter even when the per-call pacing is under the published cap.
-
-### `list_earnings_filings(cik)` — strict 10-K / 10-Q filter
-
-Walks the `filings.recent.form[] / filingDate[] / accessionNumber[] /
-reportDate[]` parallel arrays. Strict filter:
-
-- `form ∈ {"10-K", "10-Q"}` (exact — no `10-K/A` amendments, no `8-K`
-  earnings-release announcements, no `20-F` foreign filers).
-- `filingDate ≤ today` (defensive against future-dated entries).
-- `accession` matches `\d{10}-\d{2}-\d{6}`.
-
-Returns `[{"form", "accession", "file_date", "report_date"}, ...]`
-sorted most-recent-first by file_date.
-
-### Three conversion primitives in `edgar_client`
-
-**A. `filing_period(facts_dict, accession)` → `(start_iso, end_iso) | (None, None)`**
-
-Walks every fact with the given `accn`, keeps facts that have BOTH
-`start` and `end` (period-flow / income-statement facts; balance-sheet
-items with only `end` are dropped). Returns the `(start, end)` of the
-latest `end`.
-
-Why match by `accn` rather than `fp + fy`? A 10-K reports the same
-revenue concept at THREE different `(start, end)` tuples (current FY,
-prior FY, two-years-prior FY) all tagged `fp=FY fy={filing_fy}`.
-Calendar-quarter guessing misattributes on AAPL (FY ends late Sept),
-NVDA (52/53-week fiscal calendar), MSFT (FY ends late Jun). `accn` +
-latest `end` is the only robust pin.
-
-**B. `find_fact_by_period(facts_dict, tag_chain, start_iso, end_iso, tolerance_days)` → `float | None`**
-
-Walks `tag_chain` left-to-right. For each tag, walks all units, all
-facts. Keeps only `form ∈ {"10-K","10-Q"}` and `(start, end)` matching
-the target (exactly when `tolerance_days=0`, else within
-`±tolerance_days` on both ends). On tie, prefers the later `filed` date
-(restatements win — same convention Bloomberg / Capital IQ use). First
-tag with a hit returns.
-
-**C. `extract_quarter_values(facts_dict, accession)` → `{period_start, period_end, reported_eps, reported_rev_usd}`**
-
-Composes A + B. Resolves the filing's `(start, end)` via `filing_period`,
-then runs `find_fact_by_period` against `EPS_TAGS` and `REVENUE_TAGS`.
-Returns the raw USD revenue — `edgar_fill._filing_to_history_dict`
-divides by 1,000,000 before writing the parquet row (parquet uses $M to
-match Zacks's convention).
-
-### Tag chains (left = most specific, right = oldest fallback)
-
-```python
-REVENUE_TAGS = (
-    "Revenues",
-    "RevenueFromContractWithCustomerExcludingAssessedTax",
-    "RevenueFromContractWithCustomerIncludingAssessedTax",
-    "SalesRevenueNet",
-    "SalesRevenueGoodsNet",
-)
-EPS_TAGS = (
-    "EarningsPerShareDiluted",
-    "EarningsPerShareBasic",
-    "IncomeLossFromContinuingOperationsPerDilutedShare",
-)
-```
-
-Companies tag the same concept with different us-gaap tags depending on
-when they were last reviewed + which filing software template. Walking
-left-to-right with first-hit-wins handles cross-company variance.
-
-### `build_accn_index` — the perf primitive
-
-```python
-def build_accn_index(facts_dict) -> dict:
-    """Returns {accession: [fact_dict, ...]} for every us-gaap fact."""
-    index: dict = {}
-    ns = (facts_dict or {}).get("facts", {}).get("us-gaap") or {}
-    for tag_name, tag_data in ns.items():
-        for unit_name, fact_list in (tag_data.get("units") or {}).items():
-            for f in fact_list:
-                accn = f.get("accn")
-                if not accn: continue
-                fc = dict(f); fc["tag"] = tag_name; fc["unit"] = unit_name
-                index.setdefault(accn, []).append(fc)
-    return index
-```
-
-Built once per CIK at `fetch_companyfacts` time and attached to the
-facts dict as `_accn_index`. `facts_for_filing` checks for it and
-fast-paths through it; per-filing lookup drops from `O(all facts in
-blob)` to `O(facts for filing)`. Without the index, a 24-quarter bulk
-fill walks the whole namespace 24× per ticker.
-
-### Period conversion (parquet ↔ EDGAR)
-
-- Parquet `period_ending`: day-1 of the last month of the fiscal
-  quarter (e.g. Q1 2026 → `2026-03-01`). Works for both calendar and
-  non-calendar fiscal companies.
-- EDGAR `period_end`: actual last day (`2026-03-31`).
-- `period_end_to_parquet_day1(period_end_iso)` converts the EDGAR form
-  to the parquet form. Round-trips: same fiscal quarter regardless of
-  source, so `(ticker, period_ending)` dedup works cross-source.
-
-### Per-ticker fetch flow in `edgar_fill._fetch_one_ticker`
-
-1. `edgar_client.get_cik(ticker)` → padded CIK string or None. None →
-   `is_no_cik=True` (blacklist-eligible — definitive permanent miss).
-2. `fetch_submissions(cik)` → submissions blob. None on fetch failure
-   → carries `last_failure_kind()` (`rate_limited`, `network`, etc.)
-   and counts toward the block streak; NOT blacklisted.
-3. `list_earnings_filings(cik, submissions, today)` → filtered
-   10-K/10-Q list. Empty list → `is_empty=True, empty_reason=NO_FILINGS`
-   (blacklist-eligible — issuer has never filed 10-K/10-Q).
-4. Filter the filings to the 5-year cutoff window. Empty after filter
-   → `is_empty=True, empty_reason=OUT_OF_WINDOW` (blacklist-eligible —
-   issuer is delisted or hasn't filed in 5+ years).
-5. `fetch_companyfacts(cik)` → facts blob with `_accn_index` pre-built.
-   None on fetch failure → carries `last_failure_kind()`; NOT blacklisted.
-   If `facts.us-gaap` is empty/missing → `is_empty=True,
-   empty_reason=NO_US_GAAP` (blacklist-eligible — foreign filer using
-   `ifrs-full`).
-6. Per filing: `extract_quarter_values(facts, accession)` →
-   `_filing_to_history_dict` → row dict in canonical schema.
-   `period_ending` is normalized to day-1; `report_date` = filing date
-   exactly; estimates / surprises NaN (EDGAR has no analyst data).
-7. Same-period dedup (a 10-K and a prior 10-Q can both cover the same
-   quarter): keep the newest filing.
-8. If after all that no rows were produced (filings + facts both
-   present but the parser found no EPS / revenue under the current
-   tag chains) → `is_empty=True, empty_reason=NO_VALUES`. **NOT**
-   blacklist-eligible — a future tag-chain expansion might pick this
-   ticker up on the next gap_fill, so the ticker stays available.
-
-### Empty-reason taxonomy + blacklist eligibility
-
-`_FetchResult` carries an `empty_reason` field set alongside `is_empty`
-that distinguishes definitive permanent coverage misses (safe to
-auto-blacklist) from parser-side or transient misses (must NOT
-auto-blacklist). `_BLACKLISTABLE_EMPTY_REASONS` in `edgar_fill.py`
-(deleted module — see the removal note above) declared the set:
-
-| Reason             | Blacklist? | Why |
-|--------------------|:----------:|-----|
-| `no_cik`           | ✓ | Ticker not in SEC registry; permanent. |
-| `NO_FILINGS`       | ✓ | Issuer has zero 10-K / 10-Q filings; permanent. |
-| `OUT_OF_WINDOW`    | ✓ | Filings exist but all > 5y old; delisted / dormant. |
-| `NO_US_GAAP`       | ✓ | Foreign filer using `ifrs-full`; permanent under current tag chains. |
-| `NO_VALUES`        | ✗ | Filings + facts present but parser found nothing; future tag-chain update could unlock — leave on gap list. |
-| transient (429/network) | ✗ | Counts toward block streak; per-failure log at WARNING. |
-
-Tests in `tests/test_edgar_fill.py` (deleted with the module) pinned
-each of these classifications + the matching `is_blacklistable` flag.
-
-### Block-recovery policy
-
-`_fill_via_edgar` uses a two-stage recovery on consecutive real
-failures (`EDGAR_CONSEC_BLOCK_LIMIT = 5` defaults):
-
-- **First block in the failure window** → pause
-  (`EDGAR_INITIAL_BLOCK_PAUSE_SEC = 300 s`, doubling per subsequent
-  block, capped at `EDGAR_MAX_BLOCK_PAUSE_SEC = 1800 s`), then **rewind
-  to first_fail_idx** so transient blips (one-off 5xx / network) get
-  a retry under fresh state.
-- **Second block in the same window** → pause again, then **skip past
-  the failure cluster** instead of rewinding. The same N tickers were
-  about to re-fail under SEC's still-active rate-limit; better to move
-  on so the rest of the universe still gets processed. The skipped
-  tickers stay un-completed in the checkpoint so a future `gap_fill`
-  picks them up.
-- After `EDGAR_MAX_BLOCKS_PER_RUN = 3` blocks total → invoke
-  `on_block_callback`; the GUI worker returns `"stop"` and the loop
-  exits cleanly. **The checkpoint is preserved on any non-natural
-  halt** so the next launch resumes from where it left off — only
-  full completion (every ticker processed) clears it.
-
-### What EDGAR can't do
-
-- **Surprise %** — XBRL has no analyst estimates. EDGAR-source rows
-  always carry NaN `surprise_*` columns; the scanner's surprise filters
-  treat NaN per the global earnings-data flag.
-- **Foreign filers using `ifrs-full`** — 20-F filings (Alibaba, Toyota)
-  don't match the us-gaap tag chains. Gracefully degrade to coverage
-  miss; ticker auto-added to EDGAR blacklist.
-- **Pre-2009 quarters** — XBRL became mandatory in 2009.
-- **Future dates** — EDGAR filings are always past. EDGAR never wins
-  the reconciler's next_earnings slot.
-
-### Forking checklist
-
-If forking the algorithm into another project, you need:
-
-1. `requests` for HTTP plus a rate limiter. SEC's hard cap is
-   10 req/sec but sustained ≥5 req/sec aggregate bursts trip the
-   limiter in practice — `EDGAR_MIN_INTERVAL_SEC = 0.4` (~2.5 req/sec
-   single, ~5 req/sec aggregate when both per-ticker calls fire
-   back-to-back) is the empirically safe default.
-2. A `User-Agent` constant with a real contact email (SEC requirement;
-   `403 Forbidden` without).
-3. Three module-level constants: `_SUBMISSIONS_URL`,
-   `_COMPANYFACTS_URL`, `_TICKERS_URL` plus the tag chains.
-4. The five primitives: `build_accn_index`, `facts_for_filing` (with
-   fast-path on `_accn_index`), `filing_period`, `find_fact_by_period`,
-   `extract_quarter_values`.
-5. A submissions cache (`OrderedDict` + lock + LRU cap of ~20) and a
-   companyfacts cache (same shape, ~20 entries). The fetch helpers in
-   `edgar_client` deliberately don't add an LRU — the higher-level
-   per-fill loop processes each CIK once per run so caching there
-   would just add memory.
-6. `list_earnings_filings`-style helper for the strict 10-K/10-Q filter.
-7. Streaming + 50 MB cap on `fetch_companyfacts` (`requests.get(stream=
-   True)` + chunk-drain into byte cap; otherwise hostile origin can
-   balloon memory).
-
----
-
 ## Cookie acquisition flow (Firefox + mid-flight capture)
 
 When Imperva starts blocking (5 consecutive `FAIL_BLOCKED` failures — the `consec_error_limit` default), the worker pauses and the GUI launches Firefox at the persistent profile (`scanner_data/firefox_zacks_profile/`). The user solves any CAPTCHA / login challenge.
@@ -2000,7 +1974,7 @@ Independent of the bulk **Send to Watchlist** flow (which pushes the entire resu
 
 **Cue interception:** `MainWindow.eventFilter` is installed on `results_table.viewport()`. When `_hotkey_enabled` is True AND the QMouseEvent matches `_hotkey_cfg.cue` (button + modifiers), the filter resolves the row under the cursor via `view.indexAt(event.position().toPoint())`, selects it for visual feedback, dispatches `send_ticker` on a daemon `threading.Thread` so the GUI stays responsive, and returns True to swallow the event (suppresses the table's normal context menu / drag-select side effects). When the toggle is off, the filter passes through and the cue (e.g. right-click) does its normal table thing.
 
-**Safety — lowercase typing (v5.2.0):** `send_ticker` (and the bulk `tradestation.py` bridge) type the symbol in **lowercase**. `pyautogui.typewrite` produces capital letters by *holding Shift around each letter*, and `Shift`+letter collides with platform order-entry hotkeys — notably **TradeStation's chart Trade Bar**, where each capital of an UPPERCASE ticker fired a separate order hotkey (staging/submitting orders and splitting the symbol across the order bar and the command line). Lowercase letters carry no modifier, so they can't trigger a modifier+key hotkey; symbol entry is case-insensitive (`sdot` → SDOT) so search/load still works. A module-level `HOTKEY_FOCUS_DIAGNOSTICS` flag (default off) can re-enable per-send foreground/focused-window logging via `GetGUIThreadInfo` for future input-routing triage; `hotkey_probe.py` (repo root) is a standalone, staged (click-only / type / full) bisection probe for the same purpose (**SIM-mode only**).
+**Safety — lowercase typing (v5.2.0):** `send_ticker` (and the bulk `tradestation.py` bridge) type the symbol in **lowercase**. `pyautogui.typewrite` produces capital letters by *holding Shift around each letter*, and `Shift`+letter collides with platform order-entry hotkeys — notably **TradeStation's chart Trade Bar**, where each capital of an UPPERCASE ticker fired a separate order hotkey (staging/submitting orders and splitting the symbol across the order bar and the command line). Lowercase letters carry no modifier, so they can't trigger a modifier+key hotkey; symbol entry is case-insensitive (`sdot` → SDOT) so search/load still works. A module-level `HOTKEY_FOCUS_DIAGNOSTICS` flag (default off) can re-enable per-send foreground/focused-window logging via `GetGUIThreadInfo` for future input-routing triage; `trade_scanner_fh/tools/hotkey_probe.py` is a standalone, staged (click-only / type / full) bisection probe for the same purpose (**SIM-mode only**).
 
 **Return click (optional):** when `return_click_x/y` are set, an extra click fires AFTER the end-sequence keystroke. Use case — pair with the `Enter key (selected row)` cue so the full loop is keyboard-only: arrow keys move through the table, Enter fires the send (primary click → type → end-key → return click brings focus back to the scanner), arrow keys move again. The wait between the end-key and the return click is its **own** `return_delay_ms` knob (the *Delay end-key → return click* spinbox, default 200 ms) — independent of the click → type `delay_ms` — so the target app's submit-processing time can be tuned separately from its focus-acquisition time. (Pre-v5.3.0 configs that predate this field inherit their saved `delay_ms` on load, preserving prior behavior.) Toggle off via the `Clear` button next to the position label.
 
@@ -2090,7 +2064,11 @@ Loader (`MainWindow._load_preset`) tolerates missing keys via `.get()` for forwa
 
 ## Storage layout
 
-`scanner_data/` lives next to the executable in production (or under `data_engine.config.DATA_DIR` for development). Every entry is **sacred** — never touched by an exe rebuild.
+`scanner_data/` lives next to the executable — since v5.5.0 that means
+*inside* the `--onedir` bundle folder, `dist/Trade_Scanner_FH/scanner_data/`
+(`config.APP_ROOT` is `Path(sys.executable).parent` when frozen). A source
+run anchors it to the package directory instead. Every entry is **sacred** —
+never touched by a rebuild.
 
 | Path | Type | Source | Purpose |
 |------|------|--------|---------|
@@ -2103,6 +2081,7 @@ Loader (`MainWindow._load_preset`) tolerates missing keys via `.get()` for forwa
 | `earnings_disagreements.csv` | CSV | `report_cross_source_disagreements` (rewritten at every canonical history save) | Report-only cross-source EPS disagreement findings; always reflects the latest save |
 | `.finviz_bulk_checkpoint.json` / `.finnhub_bulk_checkpoint.json` | JSON | `fill_framework` | Resumable bulk-fill progress; cleared only on natural completion (preserved on stop / block-halt / spike-halt) |
 | `.gap_fill_dedup_v1.done` | sentinel | `migrate_to_gap_fill_dedup` | One-time gap-fill dedup migration marker |
+| `.acl_hardened_v2.done` | sentinel | `harden_data_dir_acl` | ACL hardening marker. Bumped to v2 in v5.5.0 so installs that ran the broken v1 repair themselves |
 | `zacks_cookies.txt` | text | Firefox cookie capture | Imperva session tokens (DPAPI-encrypted at rest) |
 | `firefox_zacks_profile/` | Firefox profile | Firefox itself | Persistent profile (login, cookies) |
 | `blacklist.txt` | comma-separated text | User | Tickers to skip during refresh |
@@ -2151,7 +2130,7 @@ data directory.
 
 ## Testing
 
-Test suite at `trade_scanner_fh/tests/` — **1,356 tests, all passing** as of 2026-08-12 (v5.4.0 added 107 covering the audit remediation). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
+Test suite at `trade_scanner_fh/tests/` — **1,396 tests, all passing** as of 2026-08-13 (v5.5.0 added 30, v5.4.0 added 107 covering the audit remediation). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
 
 ```bash
 cd c:/python/EDA_Project/Trade_Scanner_FH
@@ -2242,6 +2221,8 @@ client's rate limiter).
 | `test_tradestation.py` | TradeStation watchlist bridge |
 | `test_hotkey.py` | Per-row HOTKEY ticker sender |
 | `test_config.py` | Holiday calendar, atomic writes |
+| `test_refetch_overlap.py` | Incremental refetch overlap — widened window, provisional-bar replacement, history preservation, conflicting-resend guard, re-anchor filter both directions, tz normalisation |
+| `test_acl_hardening.py` | DATA_DIR ACL hardening against the REAL `icacls` — pre-existing files stay readable, non-empty DACL, v1-sentinel rerun |
 
 ### Test invariants
 
@@ -2251,183 +2232,314 @@ client's rate limiter).
 - The `tests/_*.py` files (underscore prefix) are diagnostic scripts NOT run by pytest collection — use them for manual smoke tests against live endpoints.
 
 ---
-
 ## Build & deploy
 
 ### Dev environment
 
+Python 3.11+. The shared interpreter at `C:\python\envs\eda-pipeline` is the
+expected dev/run environment.
+
 ```bash
-cd c:/python/EDA_Project/Trade_Scanner_FH
-# Shared interpreter at C:\python\envs\eda-pipeline (Python 3.11+) is the
-# expected dev/run environment. Required packages:
-pip install numpy pandas yfinance pyarrow pyautogui PyQt6 \
-            pyinstaller requests finance-calendars beautifulsoup4 \
-            financedatabase keyring lxml openpyxl curl_cffi psutil \
-            pywin32 finnhub-python
-# For the test suite + coverage:
-pip install pytest pytest-cov
+pip install -r requirements.txt
+pip install pytest pytest-cov      # for the test suite
 ```
 
-(scipy is NOT a dependency — the app has zero scipy imports, and the
-spec explicitly excludes it from the frozen build. The shared env carries
-it for sibling projects only. PyInstaller in this env: **6.15.0**.)
+PyInstaller in this env: **6.15.0**.
 
-### Build the exe
+### Build the bundle
 
 ```bash
 # 1. Run the test suite — must be green.
 cd c:/python/EDA_Project/Trade_Scanner_FH
-c:/python/envs/eda-pipeline/python.exe -m pytest -q
+c:/python/envs/eda-pipeline/python.exe -m pytest trade_scanner_fh/tests -q
 
-# 2. Nuke stale build artifacts AND bytecode caches.
-#    --clean alone does NOT clear __pycache__ — that's the gotcha
-#    that bit prior rebuilds. Stale .pyc files can mask source edits.
+# 2. Close any running instance. PyInstaller cannot overwrite a locked exe
+#    (WinError 5), and a half-written bundle is worse than no rebuild.
+
+# 3. Nuke stale build artifacts AND bytecode caches.
+#    --clean alone does NOT clear __pycache__ — that is the gotcha that has
+#    bitten prior rebuilds. Stale .pyc files can mask source edits.
 rm -rf build
 find . -name __pycache__ -type d -not -path "./venv/*" -not -path "./dist/*" \
        -exec rm -rf {} + 2>/dev/null
 
-# 3. Build. --clean clears build/, --noconfirm overwrites dist/.
+# 4. Build.
 c:/python/envs/eda-pipeline/python.exe -m PyInstaller \
     Trade_Scanner_FH.spec --clean --noconfirm
 
-# 4. Verify:
-ls -lh dist/Trade_Scanner_FH.exe          # fresh timestamp (~184 MB —
-                                          #  the scipy exclusion shaves
-                                          #  ~18 MB vs the ~201 MB
-                                          #  pre-2026-06 builds; measured
-                                          #  183,753,263 B on 2026-06-17, v5.2.0)
-ls dist/scanner_data/                     # all data files preserved
+# 5. Verify.
+ls -lh dist/Trade_Scanner_FH/Trade_Scanner_FH.exe   # ~25 MB stub
+du -sh dist/Trade_Scanner_FH                        # ~294 MB total
+ls dist/Trade_Scanner_FH/scanner_data/              # data intact
 ```
+
+### `--onedir`, and why the data directory moved
+
+The build was `--onefile` through v5.4.0. That meant the PyInstaller
+bootloader unpacked the **entire** payload to `%TEMP%\_MEIxxxxxx` on every
+single launch before one line of application code ran — measured on the
+v5.4.0 exe at **393 MB across 4,429 files, 8.4 s of pure extraction**,
+against **0.108 s** of actual app-side startup work. Windows Defender then
+real-time-scanned all 4,429 freshly written files. Because the bootloader
+only removes its directory on a clean exit, abandoned `_MEI` directories
+accumulated — 21 of them, 5.2 GB, on a volume with 23 GB free. That was the
+whole "slow to launch and sometimes hangs" problem; the app code was never
+involved.
+
+`--onedir` has no extraction step. The exe loads from `_internal/` beside it,
+so launch cost is process start plus imports.
+
+Two consequences:
+
+- **`scanner_data/` moved.** `config.APP_ROOT` is `Path(sys.executable).parent`
+  when frozen, so the data directory is now
+  `dist/Trade_Scanner_FH/scanner_data/`, not `dist/scanner_data/`. When
+  migrating an existing install, **move** the directory (a same-volume rename
+  — instant); never *copy* it, or the two stores diverge as each build writes
+  to its own.
+- **The release artifact is a folder**, so it needs zipping. See
+  [Packaging a release](#packaging-a-release).
 
 ### Spec file (`Trade_Scanner_FH.spec`)
 
-PyInstaller spec (built with PyInstaller 6.15.0) — pulls C-library DLLs from `BASE_PREFIX/Library/bin` so it works in venv or conda. Adds explicit hidden imports for lazy modules (yfinance, lxml, keyring, openpyxl, curl_cffi, psutil, win32api, finnhub).
+Pulls C-library DLLs from `BASE_PREFIX/Library/bin` so it works under venv or
+conda, and declares explicit hidden imports for lazily-imported modules
+(yfinance, lxml, keyring, openpyxl, curl_cffi, psutil, win32api, win32crypt,
+finnhub). **When adding a data source that imports lazily, update
+`hiddenimports`.**
 
-When adding a new data source that uses lazy imports, update the `hiddenimports` list in the spec.
+**Excludes.** The build environment is shared with unrelated projects, and
+their dependency closures were being swept in. `llvmlite.dll` alone was
+**101.7 MB — 26% of the payload** — pulled in by `numba`, required by
+`openai-whisper`. `sklearn` arrived via pyannote / pytorch-metric-learning /
+neurokit2, `jedi` via ipython. None is reachable from this app. Excluding
+them plus the pre-existing `matplotlib` / `tkinter` / `scipy` /
+`PySide6` / `shiboken6` entries took the bundle from **4,429 files / 393 MB**
+to **2,165 files / 294 MB**.
 
-**Qt binding exclusion.** The spec's `excludes` list drops `matplotlib`, `tkinter`, `test`, `unittest`, **`PySide6` / `shiboken6`, and `scipy`**. The shared build environment also carries PySide6 (sibling projects use it), and PyInstaller aborts the build the moment it detects two Qt bindings packages. This app is PyQt6-only, so PySide6 / shiboken6 are excluded explicitly — without that, the build fails at the `hook-PySide6` stage. `scipy` (added to the excludes 2026-06) is safe to drop because the app has zero scipy imports and pandas/yfinance only lazy-import it on paths never hit here (yfinance `repair=True` is never passed) — worth ~18 MB of exe.
+`PySide6` / `shiboken6` must stay excluded for a different reason: the shared
+env carries them for sibling projects, and PyInstaller aborts at the
+`hook-PySide6` stage the moment it detects two Qt bindings. This app is
+PyQt6-only.
+
+Keep `libscipy_openblas64_*.dll` — despite the name that is **numpy's** BLAS,
+not scipy.
+
+Before adding an exclude, verify it rather than assuming: block the module at
+import time and confirm the package still imports, the parquet round-trip
+still works, and the indicator functions still run.
 
 ### Version stamping
 
-The single source of truth for the app version is
-**`trade_scanner_fh.__version__`** (`trade_scanner_fh/__init__.py`).
-Two consumers mirror it:
+The single source of truth is **`trade_scanner_fh.__version__`**
+(`trade_scanner_fh/__init__.py`). Two consumers mirror it:
 
-- The window title (`MainWindow` sets `Trading Scanner v{__version__}`),
-  so screenshots and bug reports self-identify the build.
-- The Windows VERSIONINFO resource: the spec's `EXE(..., version='version_info.txt')`
-  embeds `version_info.txt` (repo root) into the exe — FileVersion /
-  ProductVersion strings and the numeric `filevers`/`prodvers` tuples all
-  derive from `__version__`. The resource intentionally carries **no
-  personal fields** (no author name/email).
+- The window title (`Trading Scanner v{__version__}`), so screenshots and bug
+  reports self-identify the build.
+- The Windows VERSIONINFO resource — the spec's `version='version_info.txt'`
+  embeds `version_info.txt` from the repo root. Its string fields and the
+  numeric `filevers` / `prodvers` tuples all derive from `__version__`. The
+  resource intentionally carries **no personal fields**.
 
-`version_info.txt` is hand-maintained; a version bump must touch both
-files. [`tests/test_version_info.py`](trade_scanner_fh/tests/test_version_info.py)
-pins the sync — bump `__version__` without updating `version_info.txt`
-and the suite goes red.
+`version_info.txt` is hand-maintained; a version bump must touch both files.
+[`tests/test_version_info.py`](trade_scanner_fh/tests/test_version_info.py)
+pins the sync — bump one without the other and the suite goes red.
 
-### CRITICAL: `scanner_data/` preservation
+### Packaging a release
 
-The user's instruction is `scanner_data/` is **never** touched by a rebuild. PyInstaller writes only to `dist/Trade_Scanner_FH.exe`; the existing `dist/scanner_data/` is left intact. Rebuilds can safely delete:
+The bundle folder contains the user's live `scanner_data/`, which holds
+personal data — cookies, the SEC contact email, saved presets, scan history,
+and the full local data stores. **Never zip the folder as-is.** Stage a copy
+with `scanner_data/` excluded entirely; the app recreates it on first launch.
 
-- `build/` — PyInstaller intermediate (regenerated)
-- `__pycache__/` directories under the source tree
-- `dist/Trade_Scanner_FH.exe` — replaced
+Excluded from any release archive:
 
-Rebuilds MUST NOT touch:
+| Path | Why |
+|------|-----|
+| `scanner_data/` (entire tree) | Cookies, SEC contact email, presets, scan history, blacklists, and the OHLCV / earnings stores |
+| `**/__pycache__/`, `*.pyc` | Build noise |
+| `*.log` | May contain scanned tickers |
 
-- Anything else under `dist/scanner_data/`
+A fresh unzip should therefore contain exactly `Trade_Scanner_FH.exe` and
+`_internal/`.
 
-The Firefox profile dir (`firefox_zacks_profile/`) was the one exception in earlier iterations when it accumulated session-restore data; the May 2026 user.js fix made deletion unnecessary (it's now safe to keep across rebuilds).
+### `scanner_data/` preservation
+
+`scanner_data/` is **never** touched by a rebuild. PyInstaller writes only
+`Trade_Scanner_FH.exe` and `_internal/`. A rebuild may safely delete `build/`,
+`__pycache__/` directories, and the previous `_internal/`; it must not touch
+anything under `scanner_data/`.
 
 ---
 
-## What changed in v5.4.0 (audit remediation, 2026-08-12)
+## Changelog
 
-A full robustness / efficiency / security audit produced 40 findings; all 40 are
-addressed in this release. The changes that alter observable behaviour:
+### v5.5.0 — packaging, OHLCV correctness, ACL repair (2026-08-13)
 
-**Data integrity**
+**Launch time.** The build moved from `--onefile` to `--onedir`. The old
+build re-extracted 393 MB across 4,429 files to `%TEMP%` on every launch —
+8.4 s before any app code ran, against 0.108 s of actual startup work — and
+left abandoned `_MEI` directories behind (21 of them, 5.2 GB). Excluding
+dependency closures that the shared build environment was contributing
+(`llvmlite` at 101.7 MB via numba ← openai-whisper; `sklearn`, `jedi`) took
+the bundle to 2,165 files / 294 MB. See
+[Build & deploy](#build--deploy); note that `scanner_data/` now lives inside
+the bundle folder.
 
-- **A transient read failure can no longer destroy a store.** `load_earnings_history()`
-  returned `None` for two opposite conditions — "no store yet" and "store exists
-  but I couldn't read it" — and both flush helpers treated `None` as "no
-  history", writing the flush buffer as the *whole* store. One simulated
+**The most recent OHLCV bar is no longer permanently wrong.** The
+incremental update started at `last_date + 1 day`, so the newest cached bar
+was never requested again — and the provider's newest daily bar is still
+provisional for hours after the close. Whatever a post-close refill captured
+that evening was therefore permanent. Sampling 60 tickers against a fresh
+pull of the same date: **Volume differed on 60 of 60** (52 understated,
+median 1.2%, p90 22.6%, worst 99% — one large-cap was short by 2.1 M shares),
+High differed on 30, Low on 31. That corrupts RVOL, ADR% and ATR on the most
+recent session. The window now reaches back
+`config.OHLCV_REFETCH_OVERLAP_DAYS` (5) so finalized bars replace provisional
+ones. The existing conflicting-bar guard still refuses any re-send that
+disagrees by more than `PRICE_JUMP_PCT`, and the corporate-action detector
+now ignores actions at or before the last cached bar so the overlap cannot
+re-trigger a full re-anchor every run.
+
+**`validate_ticker` now checks the prices themselves.** It validated NaNs,
+duplicate dates, zero volume, price jumps and date gaps — but never whether a
+price was sane. It was therefore silently passing 554 all-zero bars and 278
+**negative**-price bars in the live store. Two checks were added:
+non-positive prices, and OHLC bound violations (High must bound the bar
+above, Low below). The bound check uses a relative tolerance,
+`config.OHLC_INVARIANT_TOL_PCT` (0.1%), because the provider's
+split/dividend-adjusted prices are rounded: an exact comparison fires on ~21%
+of the store and buries the real defects.
+
+**Saved presets that appeared corrupt were an ACL bug.** v5.4.0's
+`scanner_data` hardening ran
+`icacls … /inheritance:r /grant user:(OI)(CI)F /T`. With `/T` that strips
+inherited ACEs from every *file* too, but `(OI)`/`(CI)` are container-only
+flags that produce no valid ACE on a file — so every pre-existing file ended
+with an **empty DACL, denying everyone including the owner**. Files written
+afterwards were fine, which made the damage look arbitrary; in practice it
+hit the saved presets and `sec_contact.txt`. Hardening is now two passes
+(harden the directory, then reset the children so they inherit) and the
+sentinel is bumped to `v2`, so an install that ran the broken version repairs
+itself on next launch. To repair a file by hand: `icacls "<file>" /reset`.
+
+**Also:** the earnings integrity auto-fix cleared the residue the v5.4.0
+checks were reporting, and `README.md` absorbed `quickstart.md` and the
+stray `UPDATE_*.md` notes so there is one document instead of four.
+
+Suite: **1,396 tests**, up from 1,366 (+11 price validation, +12 refetch
+overlap, +7 ACL hardening).
+
+### v5.4.0 — audit remediation (2026-08-12)
+
+A full robustness / efficiency / security audit produced 40 findings; all 40
+were addressed. The changes that alter observable behaviour:
+
+*Data integrity*
+
+- **A transient read failure can no longer destroy a store.**
+  `load_earnings_history()` returned `None` both for "no store yet" and for
+  "store exists but unreadable", and both flush helpers treated `None` as "no
+  history" — writing the flush buffer as the *whole* store. One simulated
   `OSError(32)` destroyed 4,001 of 4,003 rows. Both flush paths (and
-  `sector_map`, which had the identical bug with *no retry at all*) now defer
-  the merge and retry on the next flush. This ran ~600 times per universe fill.
-- **Dividends re-anchor the OHLCV cache.** `auto_adjust=True` back-adjusts for
-  dividends as well as splits, but only splits triggered a full re-download —
-  so every ex-dividend date left a permanent price discontinuity *inside* a
-  cached file (measured: 19 of 20 payers drifting >0.5%, worst 1.76%). The cache
-  self-heals: the next dividend per payer triggers one re-anchor, so no bulk
-  operation and no data deletion is needed.
+  `sector_map`, which had the same bug with no retry at all) now defer and
+  retry. This path ran ~600 times per universe fill.
+- **Dividends re-anchor the OHLCV cache.** `auto_adjust=True` back-adjusts
+  for dividends as well as splits, but only splits triggered a re-download —
+  so every ex-dividend date left a permanent discontinuity inside a cached
+  file (19 of 20 payers drifting >0.5%, worst 1.76%). Self-healing: the next
+  dividend per payer triggers one re-anchor.
 - **Reconcile no longer destroys forward earnings dates.** It read its own
   inputs by exact `source ==` match out of the same row whose label it then
-  rewrote, so pass #2 NaT'd the finviz forward date — which exists nowhere
-  else. New immutable `last_source` / `next_source` columns make each pass
-  idempotent. *The ~1,500 dates already lost must be re-fetched; no code fix
-  recovers them.*
+  rewrote, so pass #2 NaT'd the finviz forward date. Immutable
+  `last_source` / `next_source` columns make each pass idempotent.
 - **`verify_integrity` gained four checks** (`report_before_period_end`,
   `future_report_date`, `absurd_yoy`, `placeholder_no_actual`) and canonical
-  saves now leave rolling `.autobak` backups. There was no automatic backup
+  saves now leave rolling `.autobak` backups — there was no automatic backup
   anywhere in the project before this.
 - **finnhub and zacks reject rows with no reported EPS**, matching finviz.
-  Placeholder rows occupied their quarter slot and suppressed the gap fill that
+  Placeholder rows occupied a quarter slot and suppressed the gap fill that
   would have replaced them.
-- **Lowering a history-depth setting now asks first**, stating the row count it
-  will drop. Both depths silently deleted data on the next write.
-- **A re-sent OHLCV bar that contradicts the cache by >`PRICE_JUMP_PCT` is
-  rejected** in favour of the cached bar, rather than overwriting it forever.
+- **Lowering a history-depth setting now asks first**, stating the row count
+  it will drop.
+- **A re-sent OHLCV bar contradicting the cache by >`PRICE_JUMP_PCT` is
+  rejected** in favour of the cached bar.
 
-**Performance**
+*Performance*
 
-- **Scans are ~2.8× faster on a cold cache** (measured on the live
-  14,300-ticker cache: 224 s → 81 s) — the per-ticker compute loop now runs on
-  a `SCAN_MAX_WORKERS` (6) thread pool. Output is bit-identical; set the value
-  to 1 to force the old serial path.
-- **The per-scan earnings setup is built once per run**, not once per
-  timeframe. A sequenced run rebuilt a 148k-row parquet up to 30 times.
+- **Scans are ~2.8× faster on a cold cache** (224 s → 81 s on a
+  14,300-ticker cache) via a `SCAN_MAX_WORKERS` (6) thread pool. Output is
+  bit-identical; set it to 1 for the old serial path.
+- **Per-scan earnings setup is built once per run**, not once per timeframe —
+  a sequenced run rebuilt a 148k-row parquet up to 30 times.
 - **Cached OHLCV reads are column-projected, tz-naive and float32**
-  (10.4 ms → 1.9 ms per file), and the cache is keyed by symbol so a refresh
-  *replaces* rather than accretes (it previously grew toward a 1.6 GB ceiling).
-- **Fills flush every 200 tickers, not 25** — mainly to shrink the window in
-  which the truncation bug above could fire.
+  (10.4 ms → 1.9 ms per file), keyed by symbol so a refresh *replaces*
+  rather than accretes toward a 1.6 GB ceiling.
+- **Fills flush every 200 tickers, not 25.**
 
-**Security**
+*Security*
 
-- `scanner_data/` is ACL-restricted to the current user + SYSTEM on first run.
+- `scanner_data/` is ACL-restricted to the current user + SYSTEM on first run
+  (see the v5.5.0 note above for the follow-up fix).
 - Ticker symbols are validated against an **allowlist** before reaching a URL
-  or a filesystem path; the old denylist let `AAPL/../../admin` through. The
-  pattern is validated against the live universe and keeps all 404 preferred /
-  rights symbols (`ABR$D`, `AIIA^`).
-- The NASDAQ symbol directory is fetched over **HTTPS**, falling back to the
-  historical anonymous FTP only on failure.
+  or filesystem path; the old denylist let `AAPL/../../admin` through.
+- The NASDAQ symbol directory is fetched over **HTTPS**, falling back to
+  anonymous FTP only on failure.
 - `TRADE_SCANNER_FH_DATA_DIR` is gated to non-frozen runs, rejects UNC paths,
   and warns loudly when ignored.
-- The Finnhub key suffix is gone from the logs, and `token=` is redacted from
-  network-error messages rather than relying on the log level.
+- The Finnhub key suffix is gone from logs; `token=` is redacted from
+  network-error messages.
 - Cookie capture takes only the Imperva cookies it needs, and a DPAPI failure
-  is now a visible WARNING instead of silently writing plaintext.
+  is a visible WARNING instead of silently writing plaintext.
 - Exports neutralise CSV/XLSX formula injection.
-- `pywin32` 304 → 312, `psutil` 5.9.5 → 7.2.2.
 
-**Deliberately not done** — recorded so they aren't re-litigated:
+*Deliberately not done, recorded so they aren't re-litigated*
 
 - **Exe code signing** needs a certificate this environment cannot supply.
-  `disable_windowed_traceback=True` (the actionable half of that finding) is
-  set; `--onedir` remains a distribution-shape decision.
+  `disable_windowed_traceback=True` (the actionable half) is set.
 - **Re-enabling Firefox updates / the pop-up blocker** on the dedicated Zacks
-  profile. Both prefs exist to keep an unattended Imperva challenge working,
-  and neither change can be validated without a live challenge.
-- **`ticker` as a category dtype.** Categorical groupers change `groupby`
-  semantics (`observed=False` yields a group per unused category) across
-  several call sites — a correctness risk well beyond the memory it saves.
-- **Proxy-based view filtering** in the results table. The existing full-model
-  reset is already heavily optimised (124,608 ms → 363 ms) and the remaining
-  win is structural; the table carries a lot of accumulated colour/re-entrancy
-  correctness. The low-risk half (pre-extracting rows instead of `df.iloc[r]`
-  per row) *is* done.
+  profile — both prefs exist to keep an unattended Imperva challenge working.
+- **`ticker` as a category dtype** — categorical groupers change `groupby`
+  semantics across several call sites; a correctness risk beyond the memory
+  saved.
+- **Proxy-based view filtering** in the results table. The full-model reset is
+  already heavily optimised (124,608 ms → 363 ms); the low-risk half
+  (pre-extracting rows) is done.
+
+### v5.3.0 (2026-06-18)
+
+Hotkey: adjustable return-click delay. Repository published publicly; the
+GitHub release version now matches internal `__version__`.
+
+### v5.2.0 (2026-06-17)
+
+**Hotkey / TradeStation order-misfire fix** — tickers are typed lowercase so
+`pyautogui`'s Shift-for-capitals cannot trigger Trade Bar order hotkeys.
+**Finnhub 403 handling** — out-of-plan symbols route to the skip list without
+counting toward the block-backoff streak. **Non-sequenced preset date
+re-anchoring** — End moves to the most recent trading day and Start preserves
+the saved span; sequenced runs keep exact dates. Dev-only
+`TRADE_SCANNER_FH_DATA_DIR` override added.
+
+### Earlier (2026-06)
+
+Three waves landed in June 2026: **(1)** observability + version stamping and
+the `Settings → Advanced…` user config; **(2)** a MainWindow decomposition
+(`gui/earnings_coordinator.py`, `gui/blacklists.py`, `gui/exports.py`,
+`gui/columns.py`), the shared `fill_framework.py` orchestrator, and scraper
+resilience (drift-tolerant fallback parsers + a parse-failure spike alarm);
+**(3)** new scan features — RVOL filter, ATR Stop column, watchlist diffing,
+single-level undo delete, Quick Export, the in-app scan scheduler, the
+cross-source EPS disagreement CSV, and opt-in launch-time OHLCV prefetch. A
+follow-up reworked the **ADR% formula** to the classic ratio form
+`mean(100 × (High/Low − 1))` with the default lookback 14 → 20, and added the
+**$ADR filter + ADR Stop column + per-scan stop multipliers**.
+
+A SEC EDGAR (GAAP) earnings source existed through 2026-05-31 and was
+removed — GAAP figures aren't useful for this scanner's purpose, and every
+remaining EPS source is single-basis (adjusted). The separate SEC
+`company_tickers.json` download is retained purely as a **universe-building**
+ticker source. Finviz took EDGAR's priority slot the same day.
 
 ---
 
@@ -2475,24 +2587,22 @@ These are properties the codebase depends on. Breaking any one is a regression w
 28. **View-only "Earnings Dates" coverage signal** = at least one non-NaN value across calendar columns (`last_report_date`, `next_earnings_date`, `days_since_er`, `days_until_er`) OR any q-beats date column (`q{1..20}_report_date_eps`, `q{1..20}_report_date_rev`) OR any earnings DATA column (data ⇒ date). Always passes a strict superset of what the data view filter passes.
 29. **View-only "Color Match Only" coverage signal** = `_earnings_aligned_dates` is a non-empty list. Empty list, NaN, or missing column all evaluate to "no match" → row dropped.
 
-### Earnings source policy (post-EDGAR gap-fill rewrite)
+### Earnings source policy
 
 32. **Per-`(ticker, period_ending)` priority dedup** runs at WRITE time inside `save_earnings_history` (gated on `dedup=True` which defaults to the value of `sort`). Canonical (dedup=True) saves leave at most one row per slot on disk; per-flush mid-fill writes (`sort=False, dedup=False`) can transiently leave multi-source slots, which is why read-side consumers (`get_ticker_history`, the scanner lookup) re-dedup. Priority chain: `finviz > zacks > finnhub`. Within the same source, the most-recently-updated row wins.
 33. **Gap-fill across periods is preserved.** A single ticker can carry rows from multiple sources covering different fiscal-quarter slots — Finviz for most quarters + Zacks for a quarter Finviz hasn't pulled + Finnhub for a quarter neither covers. Only same-slot multi-source rows trigger the per-slot dedup.
-34. *(Historical — EDGAR removed 2026-05-31; kept for the forking reference in §14.)* **EDGAR rows always carried NaN for `estimated_*` and `surprise_*`** — SEC XBRL has no analyst-estimate data, so EDGAR-only quarters surfaced only the YoY signal post-`compute_yoy_columns`.
-35. *(Historical — EDGAR removed 2026-05-31.)* **EDGAR's `report_date` was the filing date** (always past), so EDGAR rows could never win the reconciler's next_earnings slot. Their `report_date_proxy` was always False (filings are real, not proxies).
 36. **One-time `migrate_to_gap_fill_dedup` on first launch** re-dedups the on-disk parquet under the new per-slot priority. Sentinel at `scanner_data/.gap_fill_dedup_v1.done` prevents re-running. Dropped rows are preserved in `earnings_raw/`.
 37. **Reconciler chain for earnings_dates is `nasdaq > yahoo > finviz > zacks > finnhub`.** Live calendar feeds outrank history-derived sources; among the history sources finviz leads (real announcement dates + times) and finnhub stays last.
-38. *(Historical — EDGAR removed 2026-05-31; the principle lives on in every per-source skip list.)* **Auto-blacklisting is gated on definitive permanent misses only.** Transient failures (`rate_limited` / `forbidden` / `server_error` / `network` / `parse_error`) are NEVER auto-blacklisted — a rate-limit storm must not silently orphan thousands of good tickers.
-39. *(Historical — EDGAR removed 2026-05-31; the same two-stage policy now lives in `fill_framework.run_fill_loop` for finviz/finnhub.)* **Block-recovery rewinds once, then skips.** First block in a failure window rewinds to retry the cluster under fresh state. Second+ block in the same window advances past the cluster instead. Skipped tickers stay un-completed in the checkpoint so a future `gap_fill` picks them up.
-40. *(Historical — EDGAR removed 2026-05-31; the same rule applies to `.finviz_bulk_checkpoint.json` / `.finnhub_bulk_checkpoint.json` via `fill_framework`.)* **Checkpoint preserved on partial halts.** Only natural completion clears a bulk checkpoint. Block-triggered halts, user stops, parse-spike halts, and "stop" callback returns all preserve it so the next launch resumes — fixed after a prior buggy halt cleared the checkpoint and orphaned ~4200 already-processed tickers.
+38. **Auto-blacklisting is gated on definitive permanent misses only.** Transient failures (`rate_limited` / `forbidden` / `server_error` / `network` / `parse_error`) are NEVER auto-blacklisted — a rate-limit storm must not silently orphan thousands of good tickers.
+39. **Block-recovery (`fill_framework.run_fill_loop`) rewinds once, then skips.** First block in a failure window rewinds to retry the cluster under fresh state. Second+ block in the same window advances past the cluster instead. Skipped tickers stay un-completed in the checkpoint so a future `gap_fill` picks them up.
+40. **Checkpoint preserved on partial halts.** Only natural completion clears a bulk checkpoint. Block-triggered halts, user stops, parse-spike halts, and "stop" callback returns all preserve it so the next launch resumes — fixed after a prior buggy halt cleared the checkpoint and orphaned ~4200 already-processed tickers.
 41. **ETF/ADR auto-skip applies to every earnings bulk + gap fill.** Computed dynamically from `universe.csv` flags via `_etf_adr_auto_skip_set()`; layered into the three combined-skip helpers. NOT persisted to per-source `*_blacklist.txt` files (universe refreshes flow through immediately). Spot fill uses a user-only skip check so the user can manually test an ETF / ADR if needed.
 
 ### Build / deploy
 
-42. **`scanner_data/` survives rebuilds.** Verified by checking ohlcv parquet count + presets dir + cookies file before and after.
+42. **`scanner_data/` survives rebuilds.** Verified by checking ohlcv parquet count + presets dir + cookies file before and after. A rebuild writes only `Trade_Scanner_FH.exe` and `_internal/`.
 43. **`__pycache__/` MUST be cleared before any rebuild.** Stale bytecode can mask source edits — burned us once with the multi-column-drag and Display-Only regressions.
-44. **SEC contact email never lives in source.** `SEC_CONTACT_DEFAULT` in `config.py` is a non-functional placeholder; the SEC universe source stays dormant until a real contact email is supplied via the gitignored `scanner_data/sec_contact.txt` (Settings → Set SEC Contact Email…) or the `SEC_CONTACT_EMAIL` env var. The dev copy and the frozen exe each need their own `sec_contact.txt` (under `trade_scanner_fh/scanner_data/` and `dist/scanner_data/` respectively). Rebuilds land in `dist/Trade_Scanner_FH.exe`; the legacy public-distribution build at `dist2/Trade_Scanner_FH_public.exe` predates this scheme and must never be touched by a rebuild from this tree.
+44. **SEC contact email never lives in source.** `SEC_CONTACT_DEFAULT` in `config.py` is a non-functional placeholder; the SEC universe source stays dormant until a real contact email is supplied via the gitignored `scanner_data/sec_contact.txt` (Settings → Set SEC Contact Email…) or the `SEC_CONTACT_EMAIL` env var. The dev copy and the frozen bundle each need their own `sec_contact.txt` (under `trade_scanner_fh/scanner_data/` and `dist/Trade_Scanner_FH/scanner_data/` respectively). It must never appear in a release archive.
 
 ### 2026-06 additions
 
@@ -2502,6 +2612,14 @@ These are properties the codebase depends on. Breaking any one is a regression w
 48. **The parse-failure spike alarm halts loudly, preserves the checkpoint, and never blacklists.** ≥`PARSE_SPIKE_FAIL_PCT`% parse failures over ≥`PARSE_SPIKE_MIN_SAMPLE` attempts means the page format drifted — that's upstream's fault, not the tickers'. `FAIL_PARSE_ERROR` is reserved for genuinely unparseable pages; a readable-but-empty payload stays a coverage miss (FAIL_NOT_FOUND / FAIL_EMPTY).
 49. **The launch-time OHLCV prefetch never contends with the startup updater.** It starts only after the update finishes (or is skipped), runs at most once per launch, is stoppable, and a mid-flight stop is safe (per-symbol loads are independent reads).
 50. **Scheduled scans degrade gracefully unattended.** A schedule fire routes would-be modal dialogs to the log; it is skipped (and retried on a later tick) when a scan is already running, consumed for the day when the preset no longer exists, and each entry fires at most once per day.
+
+### 2026-08 additions (v5.5.0)
+
+51. **The incremental OHLCV window always re-requests the last cached bar.** The provider's newest daily bar is provisional for hours after the close, and the incremental path is the ONLY thing that would ever revisit it — starting at `last_date + 1` cemented whatever a post-close refill happened to capture. `config.OHLCV_REFETCH_OVERLAP_DAYS` must stay ≥ 0 (0 still re-requests the last day itself); there is deliberately no setting that restores the never-look-back behaviour.
+52. **The corporate-action detector only considers bars AFTER `last_date`.** The refetch overlap re-downloads bars already on disk, so an unfiltered check would re-detect a dividend inside the overlap window and re-trigger the full-history re-anchor on every run, for every payer, until it aged out. `_bars_after` also normalises tz — `_last_cached_date` returns an aware timestamp from its full-read fallback and a naive one from the parquet-statistics fast path.
+53. **`validate_ticker` checks price sanity, not just statistics.** Non-positive prices are always a defect; OHLC bound violations are compared against `config.OHLC_INVARIANT_TOL_PCT` (0.1%) because the provider's adjusted prices are rounded. Do NOT tighten the bound check to an exact comparison — it fires on ~21% of the store and buries the real defects.
+54. **ACL hardening must never leave a file with an empty DACL.** `icacls /inheritance:r` applied to a FILE with `(OI)(CI)` grants produces no valid ACE, and an empty DACL denies everyone including the owner. Harden the directory alone, then `/reset` the children so they inherit. `tests/test_acl_hardening.py` runs the real `icacls` — a mock reproduces the bug happily.
+55. **A release archive never contains `scanner_data/`.** It holds cookies, the SEC contact email, presets, scan history, and the local data stores. A fresh unzip is exactly `Trade_Scanner_FH.exe` + `_internal/`.
 
 ---
 

@@ -141,6 +141,23 @@ def _last_cached_date(symbol: str) -> Optional[pd.Timestamp]:
         return None
 
 
+def _bars_after(index: pd.Index, cutoff: pd.Timestamp) -> "pd.Series | list":
+    """Boolean mask of `index` entries strictly after `cutoff`.
+
+    `_last_cached_date` returns a tz-AWARE timestamp from its full-read
+    fallback but a tz-NAIVE one from the parquet-statistics fast path, while a
+    freshly downloaded index is always tz-aware. Normalising both sides keeps
+    the comparison from raising depending on which branch happened to run.
+    """
+    idx = index
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    cut = pd.Timestamp(cutoff)
+    if cut.tzinfo is not None:
+        cut = cut.tz_localize(None)
+    return idx > cut
+
+
 def _download_raw(symbol: str, start: str, end: str) -> pd.DataFrame:
     """
     Download OHLCV from yfinance for a single ticker between start and end.
@@ -190,18 +207,57 @@ def validate_ticker(symbol: str, df: pd.DataFrame) -> list[str]:
         if cnt > 0:
             issues.append(f"{cnt} NaN values in {col}")
 
-    # 2. Duplicate dates
+    # 2. Non-positive prices. A traded security cannot print <= 0: zeros are
+    #    missing-data placeholders the provider sent instead of a gap, and
+    #    negatives come from a split/dividend back-adjustment overshooting the
+    #    price. Neither is salvageable downstream — every indicator that
+    #    touches such a bar produces garbage — so they are reported ahead of
+    #    the softer statistical checks below.
+    price_cols = [c for c in ("Open", "High", "Low", "Close") if c in df.columns]
+    if price_cols:
+        prices = df[price_cols].apply(pd.to_numeric, errors="coerce")
+        neg_bars = int((prices < 0).any(axis=1).sum())
+        zero_bars = int((prices == 0).any(axis=1).sum())
+        if neg_bars > 0:
+            issues.append(f"{neg_bars} bar(s) with negative price(s)")
+        if zero_bars > 0:
+            issues.append(f"{zero_bars} bar(s) with zero price(s)")
+
+    # 3. OHLC bound violations — High must bound the bar from above and Low
+    #    from below. Compared against a relative tolerance because the
+    #    provider's adjusted prices are rounded, which puts Close a few 1e-6
+    #    above High often enough that an exact comparison fires on ~21% of the
+    #    store and buries the real artifacts (see OHLC_INVARIANT_TOL_PCT).
+    if {"Open", "High", "Low", "Close"}.issubset(df.columns):
+        o, h, l, c = (
+            pd.to_numeric(df[col], errors="coerce")
+            for col in ("Open", "High", "Low", "Close")
+        )
+        level = pd.concat([o, h, l, c], axis=1).abs().max(axis=1)
+        tol = level * (config.OHLC_INVARIANT_TOL_PCT / 100.0)
+        bad = (
+            (l - h > tol) | (o - h > tol) | (c - h > tol)
+            | (l - o > tol) | (l - c > tol)
+        ).fillna(False)
+        if bad.any():
+            dates_str = ", ".join(str(d.date()) for d in df.index[bad][:5])
+            issues.append(
+                f"{int(bad.sum())} bar(s) violating OHLC bounds "
+                f"(first: {dates_str})"
+            )
+
+    # 4. Duplicate dates
     dup_count = df.index.duplicated().sum()
     if dup_count > 0:
         issues.append(f"{dup_count} duplicate date(s)")
 
-    # 3. Zero-volume bars
+    # 5. Zero-volume bars
     if "Volume" in df.columns:
         zero_vol = (df["Volume"] == 0).sum()
         if zero_vol > 0:
             issues.append(f"{zero_vol} zero-volume bar(s)")
 
-    # 4. Price jumps exceeding threshold
+    # 6. Price jumps exceeding threshold
     if "Close" in df.columns and len(df) > 1:
         close = df["Close"].dropna()
         pct_change = close.pct_change().abs() * 100
@@ -215,7 +271,7 @@ def validate_ticker(symbol: str, df: pd.DataFrame) -> list[str]:
                 f"(first: {dates_str})"
             )
 
-    # 5. Missing trading days (gaps > 4 calendar days ≈ long weekends ok)
+    # 7. Missing trading days (gaps > 4 calendar days ≈ long weekends ok)
     if len(df) > 1:
         date_diffs = pd.Series(df.index).diff().dt.days
         # Weekends = 3 days gap is normal; flag runs > threshold
@@ -281,8 +337,29 @@ def download_one(symbol: str) -> ScrapeResult:
         last_date = _last_cached_date(symbol)
 
         if last_date is not None:
-            # Incremental: fetch from day after last cached date
-            start = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+            # Incremental: re-request a short tail of already-cached bars along
+            # with the new ones.
+            #
+            # This used to start at `last_date + 1 day`, which meant the last
+            # cached date was never asked for again — and the provider's most
+            # recent daily bar is still provisional for hours after the close.
+            # Whatever a post-close refill captured that evening was therefore
+            # PERMANENT. Measured 2026-08-13 on 60 random tickers against the
+            # bars written by the 2026-08-12 17:21-19:10 refill: Volume
+            # differed on 60/60 (52 understated — median 1.2%, p90 22.6%, IP
+            # 2,894,764 vs 4,992,100), High on 30/60, Low on 31/60, and 854
+            # tickers store-wide ended up with Open outside [Low, High]. That
+            # corrupts RVOL, ADR% and ATR on the most recent session.
+            #
+            # Overlapping the window lets the finalized bars replace the
+            # provisional ones. Safe by construction: `_reject_conflicting_bars`
+            # still refuses any re-sent bar disagreeing by more than
+            # PRICE_JUMP_PCT, and the `keep="last"` dedup below adopts
+            # normal-sized corrections.
+            start = (
+                last_date
+                - timedelta(days=config.OHLCV_REFETCH_OVERLAP_DAYS)
+            ).strftime("%Y-%m-%d")
             result.was_incremental = True
         else:
             # Full pull: go back OHLCV_HISTORY_YEARS
@@ -321,15 +398,22 @@ def download_one(symbol: str) -> ScrapeResult:
         # ticker is corrected with no bulk operation and no data deletion.
         corp_action = None
         if last_date is not None and not new_df.empty:
-            if ("Stock Splits" in new_df.columns
-                    and (new_df["Stock Splits"] != 0).any()):
-                corp_action = ("split", new_df.loc[
-                    new_df["Stock Splits"] != 0
+            # Only actions AFTER the last cached bar are new. The refetch
+            # overlap above deliberately re-downloads bars already on disk, so
+            # without this filter a dividend sitting inside the overlap window
+            # would re-trigger the full-history re-anchor on every run until it
+            # aged out — turning one 5-year re-download per ex-date into one
+            # per day for OHLCV_REFETCH_OVERLAP_DAYS days, across every payer.
+            unseen = new_df.loc[_bars_after(new_df.index, last_date)]
+            if ("Stock Splits" in unseen.columns
+                    and (unseen["Stock Splits"] != 0).any()):
+                corp_action = ("split", unseen.loc[
+                    unseen["Stock Splits"] != 0
                 ].index.tolist())
-            elif ("Dividends" in new_df.columns
-                    and (new_df["Dividends"] != 0).any()):
-                corp_action = ("dividend", new_df.loc[
-                    new_df["Dividends"] != 0
+            elif ("Dividends" in unseen.columns
+                    and (unseen["Dividends"] != 0).any()):
+                corp_action = ("dividend", unseen.loc[
+                    unseen["Dividends"] != 0
                 ].index.tolist())
         if corp_action is not None:
             kind, action_dates = corp_action

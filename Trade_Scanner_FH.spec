@@ -2,7 +2,9 @@
 """PyInstaller spec for Trade_Scanner_FH — the Finnhub fork of the
 trading scanner.
 
-  - Output exe: Trade_Scanner_FH.exe (windowed, single-file).
+  - Output: dist/Trade_Scanner_FH/ (windowed, --onedir). Was --onefile until
+    2026-08-13; see the comment above EXE() for why it changed and what it
+    means for scanner_data/ placement and for releases.
   - hiddenimports cover the trade_scanner_fh package plus its lazy
     runtime deps (yfinance, lxml, keyring, openpyxl, curl_cffi,
     psutil, win32api, finnhub, …).
@@ -149,34 +151,69 @@ a = Analysis(
     # scipy is safe to exclude: the app has zero scipy imports, and
     # pandas/yfinance only lazy-import it on paths never hit here
     # (yfinance repair=True is never passed).
+    #
+    # 2026-08-13: the build env is SHARED with unrelated projects, and their
+    # dependency closures were being swept into this app. Measured on the
+    # extracted payload: llvmlite.dll alone was 101.7 MB — 26% of 393 MB —
+    # pulled in by numba, which is required by openai-whisper. sklearn (18 MB)
+    # arrives via pyannote / pytorch-metric-learning / neurokit2, and jedi
+    # (3.3 MB) via ipython. None of it is reachable from this app.
+    #
+    # Verified before excluding, not assumed: with all of these blocked at
+    # import time, all 21 runtime modules imported, every third-party dep
+    # (pandas / numpy / pyarrow / yfinance / lxml / curl_cffi / keyring /
+    # openpyxl) imported, a pyarrow parquet round-trip succeeded, and 22 of 23
+    # indicator functions executed against real OHLCV — with ZERO blocked
+    # imports intercepted. `engine="numba"` appears nowhere in the source, so
+    # pandas' optional numba path is never taken.
     excludes=['matplotlib', 'tkinter', 'test', 'unittest',
-              'PySide6', 'shiboken6', 'scipy'],
+              'PySide6', 'shiboken6', 'scipy',
+              'numba', 'llvmlite', 'sklearn', 'scikit-learn',
+              'jedi', 'IPython', 'torch', 'whisper',
+              'pyannote', 'neurokit2', 'financetoolkit'],
     noarchive=False,
     optimize=0,
 )
 
 pyz = PYZ(a.pure)
 
+# --onedir (2026-08-13). The build was --onefile, which meant the bootloader
+# unpacked the WHOLE payload to %TEMP%\_MEIxxxxxx on every single launch before
+# one line of app code ran. Measured on the shipped exe: 393 MB across 4,429
+# files, 8.4 s of pure extraction on a warm run — against 0.108 s of actual
+# app-side startup work. Windows Defender real-time protection then scans all
+# 4,429 freshly written files, and 21 abandoned _MEI directories totalling
+# 5.2 GB had accumulated in TEMP from launches that did not exit cleanly (the
+# bootloader only removes its directory on a clean shutdown), on a volume with
+# 23 GB free. That is the whole "slow to launch and often hangs" story.
+#
+# onedir has NO extraction step: the exe loads its dependencies from the
+# _internal/ folder beside it, so launch cost drops to process start + imports.
+# The trade-off, and the reason this was deferred at the 2026-08-12 audit, is
+# that the release artifact becomes a FOLDER rather than one file — it needs
+# zipping for a GitHub release.
+#
+# NOTE: config.APP_ROOT is `Path(sys.executable).parent` when frozen, so the
+# app now looks for scanner_data/ beside dist/Trade_Scanner_FH/Trade_Scanner_FH.exe
+# rather than beside dist/Trade_Scanner_FH.exe. The existing data directory has
+# to be reachable from the new location or the app starts cold.
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='Trade_Scanner_FH',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    runtime_tmpdir=None,
     console=False,
     # Audit 2026-08-12 (SEC-6): with console=False an unhandled exception
     # otherwise raises a traceback DIALOG. Combined with SEC-5's latent
     # token-in-URL leak that is a plausible secret-in-traceback path, and the
     # dialog tells a user nothing actionable anyway — the same traceback is
-    # already written to scanner_data/logs/. Signing and --onedir remain
-    # deferred (a certificate is an external dependency; --onedir changes the
-    # release artifact from one file to a folder).
+    # already written to scanner_data/logs/. Signing remains deferred (a
+    # certificate is an external dependency).
     disable_windowed_traceback=True,
     argv_emulation=False,
     target_arch=None,
@@ -186,4 +223,14 @@ exe = EXE(
     # Windows VERSIONINFO resource — versions mirror
     # trade_scanner_fh.__version__.
     version='version_info.txt',
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='Trade_Scanner_FH',
 )

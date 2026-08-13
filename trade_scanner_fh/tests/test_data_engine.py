@@ -525,3 +525,123 @@ def test_prefetch_stop_flag_aborts_early(tmp_path, monkeypatch):
     count = data_engine.prefetch_ohlcv(syms, max_workers=1, stop_flag=stop)
     assert count == 1
     assert calls == ["S00"]
+
+
+# ----------------------------------------------------------------------
+# validate_ticker — non-positive prices and OHLC bound violations
+#
+# Both checks were added 2026-08-13 after a full-store sweep found the
+# validator passing 554 all-zero bars (DEC) and 278 negative-price bars
+# (CBIO) in silence: it checked NaN, duplicate dates, zero volume, price
+# jumps and date gaps, but never the prices themselves.
+# ----------------------------------------------------------------------
+
+def _ohlcv(rows):
+    """Build a validate_ticker-shaped frame from (date, o, h, l, c, v) rows."""
+    idx = pd.to_datetime([r[0] for r in rows])
+    idx.name = "Date"
+    return pd.DataFrame(
+        {
+            "Open": [r[1] for r in rows],
+            "High": [r[2] for r in rows],
+            "Low": [r[3] for r in rows],
+            "Close": [r[4] for r in rows],
+            "Volume": [r[5] for r in rows],
+        },
+        index=idx,
+    )
+
+
+def _issues(df):
+    return data_engine.validate_ticker("TEST", df)
+
+
+def test_validate_ticker_clean_frame_has_no_price_issues():
+    df = _ohlcv([
+        ("2026-08-10", 10.0, 10.5, 9.8, 10.2, 1000),
+        ("2026-08-11", 10.2, 10.6, 10.0, 10.4, 1100),
+    ])
+    assert _issues(df) == []
+
+
+def test_validate_ticker_flags_negative_prices():
+    """CBIO's failure mode: a back-adjustment overshoot drives prices below
+    zero. Previously invisible — no check looked at price sign."""
+    df = _ohlcv([
+        ("2026-08-10", -225.5, -216.7, -230.0, -217.8, 1969),
+        ("2026-08-11", 10.2, 10.6, 10.0, 10.4, 1100),
+    ])
+    assert any("1 bar(s) with negative price(s)" in i for i in _issues(df))
+
+
+def test_validate_ticker_flags_zero_prices():
+    """DEC's failure mode: the provider sends an all-zero bar (with real
+    volume) instead of omitting the day."""
+    df = _ohlcv([
+        ("2026-08-10", 0.0, 0.0, 0.0, 0.0, 2800),
+        ("2026-08-11", 10.2, 10.6, 10.0, 10.4, 1100),
+    ])
+    issues = _issues(df)
+    assert any("1 bar(s) with zero price(s)" in i for i in issues)
+    # a zero price must not be mistaken for a negative one
+    assert not any("negative price" in i for i in issues)
+
+
+def test_validate_ticker_flags_partial_zero_bar():
+    """CSRA/SNSC: only High and Low are zeroed; Open/Close are real."""
+    df = _ohlcv([("2026-08-12", 25.14, 0.0, 0.0, 25.13, 0)])
+    assert any("1 bar(s) with zero price(s)" in i for i in _issues(df))
+
+
+def test_validate_ticker_flags_open_above_high():
+    """The provisional-bar signature: Open outside [Low, High] while High,
+    Low and Close remain mutually consistent."""
+    df = _ohlcv([("2026-08-12", 74.39, 74.25, 72.00, 73.54, 6_284_876)])
+    assert any("violating OHLC bounds" in i for i in _issues(df))
+
+
+def test_validate_ticker_flags_high_below_low():
+    df = _ohlcv([("2026-08-12", 10.0, 9.0, 11.0, 10.0, 500)])
+    assert any("violating OHLC bounds" in i for i in _issues(df))
+
+
+def test_validate_ticker_flags_close_above_high():
+    df = _ohlcv([("2026-08-12", 10.0, 10.5, 9.8, 12.0, 500)])
+    assert any("violating OHLC bounds" in i for i in _issues(df))
+
+
+def test_validate_ticker_tolerates_adjustment_rounding():
+    """The provider's split/dividend-adjusted prices are rounded, leaving
+    Close a hair above High on ~21% of the store. An exact comparison buried
+    the real artifacts, so breaches under OHLC_INVARIANT_TOL_PCT are ignored."""
+    close = 16.98
+    high = close - 1e-9          # far below the 0.1% tolerance
+    df = _ohlcv([("2026-08-12", 16.9, high, 16.1, close, 500)])
+    assert not any("violating OHLC bounds" in i for i in _issues(df))
+
+
+def test_validate_ticker_ohlc_tolerance_is_relative_to_price():
+    """Tolerance scales with the bar's price level, so a sub-dollar stock is
+    held to the same relative standard as a $2,000 one."""
+    # 0.5% breach on a $0.36 penny stock — above the 0.1% tolerance
+    df = _ohlcv([("2026-08-12", 0.36, 0.3900, 0.3799, 0.3900, 500)])
+    assert any("violating OHLC bounds" in i for i in _issues(df))
+
+
+def test_validate_ticker_price_checks_survive_missing_columns():
+    """A frame without the full OHLC set must not raise — the bound check
+    simply does not run."""
+    idx = pd.to_datetime(["2026-08-12"])
+    idx.name = "Date"
+    df = pd.DataFrame({"Close": [10.0], "Volume": [100]}, index=idx)
+    issues = data_engine.validate_ticker("TEST", df)
+    assert not any("violating OHLC bounds" in i for i in issues)
+
+
+def test_validate_ticker_reports_first_offending_dates():
+    df = _ohlcv([
+        ("2026-08-10", 10.0, 9.0, 11.0, 10.0, 500),
+        ("2026-08-11", 10.2, 10.6, 10.0, 10.4, 1100),
+    ])
+    msg = next(i for i in _issues(df) if "violating OHLC bounds" in i)
+    assert "2026-08-10" in msg
