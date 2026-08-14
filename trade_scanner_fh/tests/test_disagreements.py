@@ -232,20 +232,91 @@ def test_csv_written_atomically_on_canonical_save(tmp_parquets):
     assert not list(tmp_parquets.glob("*.tmp"))
 
 
-def test_csv_overwritten_each_run_clean_scan_empties_it(tmp_parquets):
-    """The CSV reflects the CURRENT scan: a later clean canonical save
-    overwrites a previously-populated report with an empty one."""
+def test_resolved_disagreement_clears_the_csv(tmp_parquets):
+    """Self-clearing is preserved for the case it exists to cover: a later
+    save that DOES have cross-source slots to compare, and finds them
+    consistent, empties a previously-populated report."""
     eh.save_earnings_history(pd.DataFrame([
         _row("AAPL", "2026-03-01", "finviz", eps=1.00),
         _row("AAPL", "2026-03-01", "zacks", eps=2.00),
     ]))
     assert len(pd.read_csv(_csv_path(tmp_parquets))) == 1
+
+    # Same slot, still two sources — but now they agree.
     eh.save_earnings_history(pd.DataFrame([
-        _row("MSFT", "2026-03-01", "finviz", eps=3.00),
+        _row("AAPL", "2026-03-01", "finviz", eps=1.00),
+        _row("AAPL", "2026-03-01", "zacks", eps=1.00),
     ]))
     rep = pd.read_csv(_csv_path(tmp_parquets))
     assert rep.empty
     assert list(rep.columns) == eh.DISAGREEMENT_COLUMNS
+
+
+def test_save_with_nothing_to_compare_leaves_the_csv_intact(tmp_parquets):
+    """The 2026-08-13 regression, in miniature.
+
+    `report_cross_source_disagreements` runs on every canonical save, right
+    BEFORE `dedupe_history` collapses each slot to a single source. So the
+    save that finds a disagreement also destroys the evidence, and the NEXT
+    canonical save — reading an already-deduped frame — has zero comparable
+    slots. Treating that as "clean" wiped the report: 701 real findings
+    survived two minutes on the live store before the next fill finalized.
+
+    A frame with nothing to compare yields no information, so it must not
+    overwrite a report that does.
+    """
+    eh.save_earnings_history(pd.DataFrame([
+        _row("AAPL", "2026-03-01", "finviz", eps=1.00),
+        _row("AAPL", "2026-03-01", "zacks", eps=2.00),
+    ]))
+    assert len(pd.read_csv(_csv_path(tmp_parquets))) == 1
+
+    # A single-source frame: nothing here can be compared to anything.
+    eh.save_earnings_history(pd.DataFrame([
+        _row("MSFT", "2026-03-01", "finviz", eps=3.00),
+    ]))
+
+    rep = pd.read_csv(_csv_path(tmp_parquets))
+    assert len(rep) == 1, "a no-information save wiped the report"
+    assert rep.iloc[0]["ticker"] == "AAPL"
+
+
+def test_reload_and_resave_of_a_deduped_store_preserves_the_report(tmp_parquets):
+    """End-to-end shape of the live failure: fill -> canonical save (finds
+    the disagreement, dedups the store) -> a later save driven by whatever
+    is now on disk. The second save must not erase the first's findings."""
+    eh.save_earnings_history(pd.DataFrame([
+        _row("AAPL", "2026-03-01", "finviz", eps=1.00),
+        _row("AAPL", "2026-03-01", "zacks", eps=2.00),
+    ]))
+    assert len(pd.read_csv(_csv_path(tmp_parquets))) == 1
+
+    on_disk = eh.load_earnings_history()
+    assert len(on_disk) == 1, "dedup should have collapsed the slot"
+    eh.save_earnings_history(on_disk)
+
+    assert len(pd.read_csv(_csv_path(tmp_parquets))) == 1
+
+
+def test_comparable_slot_count_distinguishes_no_data_from_clean():
+    """The gate itself: multi-source slots are comparable, single-source
+    slots (however many) are not."""
+    assert eh._comparable_slot_count(None) == 0
+    assert eh._comparable_slot_count(pd.DataFrame()) == 0
+    assert eh._comparable_slot_count(pd.DataFrame([
+        _row("AAPL", "2026-03-01", "finviz", eps=1.0),
+        _row("MSFT", "2026-03-01", "finviz", eps=2.0),
+        _row("AAPL", "2025-12-01", "zacks", eps=3.0),
+    ])) == 0
+    assert eh._comparable_slot_count(pd.DataFrame([
+        _row("AAPL", "2026-03-01", "finviz", eps=1.0),
+        _row("AAPL", "2026-03-01", "zacks", eps=2.0),
+    ])) == 1
+    # same source twice in a slot is NOT comparable
+    assert eh._comparable_slot_count(pd.DataFrame([
+        _row("AAPL", "2026-03-01", "finviz", eps=1.0, updated="2026-06-01"),
+        _row("AAPL", "2026-03-01", "finviz", eps=2.0, updated="2026-06-02"),
+    ])) == 0
 
 
 def test_per_flush_save_skips_report(tmp_parquets):
@@ -264,14 +335,19 @@ def test_loud_log_when_found_silent_when_clean(tmp_parquets, caplog):
             _row("AAPL", "2026-03-01", "zacks", eps=2.00),
         ]))
     assert any(
-        "cross-source EPS disagreements — see earnings_disagreements.csv"
-        in r.getMessage() and r.getMessage().startswith("1 ")
+        "cross-source EPS disagreements" in r.getMessage()
+        and "earnings_disagreements.csv" in r.getMessage()
+        and r.getMessage().startswith("1 ")
+        # the comparable-slot count says how much was actually evaluated,
+        # which is what distinguishes "clean" from "nothing to compare"
+        and "1 comparable slot(s)" in r.getMessage()
         for r in caplog.records
     )
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="scanner.earnings_history"):
         eh.save_earnings_history(pd.DataFrame([
             _row("MSFT", "2026-03-01", "finviz", eps=3.00),
+            _row("MSFT", "2026-03-01", "zacks", eps=3.00),
         ]))
     assert not any(
         "cross-source EPS disagreements" in r.getMessage()

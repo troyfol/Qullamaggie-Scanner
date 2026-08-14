@@ -765,21 +765,69 @@ def find_cross_source_disagreements(
     )
 
 
+def _comparable_slot_count(df: Optional[pd.DataFrame]) -> int:
+    """Number of ``(ticker, period_ending)`` slots carrying more than one
+    SOURCE — the only slots ``find_cross_source_disagreements`` can evaluate.
+
+    Zero means the scan had nothing to compare, which is emphatically NOT the
+    same as "compared everything and found it consistent". See
+    ``report_cross_source_disagreements`` for why the difference matters.
+    """
+    if df is None or df.empty:
+        return 0
+    if not {"ticker", "period_ending", "source"}.issubset(df.columns):
+        return 0
+    pe = pd.to_datetime(df["period_ending"], errors="coerce")
+    ok = pe.notna()
+    if not ok.any():
+        return 0
+    key = pd.DataFrame({
+        "ticker": df.loc[ok, "ticker"].astype(str),
+        "period_ending": pe.loc[ok],
+        "source": df.loc[ok, "source"].astype(str).str.lower(),
+    }).drop_duplicates()
+    per_slot = key.groupby(["ticker", "period_ending"], sort=False)["source"].size()
+    return int((per_slot > 1).sum())
+
+
 def report_cross_source_disagreements(
     history_df: Optional[pd.DataFrame],
 ) -> pd.DataFrame:
     """Run the disagreement scan and persist the result to
-    scanner_data/earnings_disagreements.csv (atomic overwrite — the file
-    always reflects the most recent canonical-save scan, so previously
-    reported slots that the dedup has since resolved disappear on the
-    next run). Logs loudly when any disagreement is found; silent when
-    clean. Returns the report frame."""
+    scanner_data/earnings_disagreements.csv. Logs loudly when any
+    disagreement is found; silent when clean. Returns the report frame.
+
+    The CSV is rewritten ONLY when the frame actually held cross-source slots
+    to evaluate. Without that gate the report destroyed itself: this runs on
+    every canonical save, immediately BEFORE ``dedupe_history`` collapses each
+    slot to one source — so the save that finds the disagreements also removes
+    the evidence, and the very next canonical save (whose frame comes off the
+    now-deduped parquet) sees zero comparable slots and overwrote the file with
+    a bare header. Observed 2026-08-13: 701 real finviz-vs-zacks findings
+    written at 19:59 were gone by 20:01, two minutes later, when the next fill
+    finalized. The findings were only recoverable because a rolling .autobak
+    still held the pre-dedup frame.
+
+    A frame with comparable slots and no disagreements still clears the file —
+    that is a genuine "previously reported, now resolved" signal, and the
+    self-clearing behaviour it provides is the reason the gate keys on
+    comparability rather than simply refusing to write an empty report.
+    """
     rep = find_cross_source_disagreements(history_df)
+    comparable = _comparable_slot_count(history_df)
+    if comparable == 0:
+        log.debug(
+            "cross-source disagreement scan skipped — no multi-source slots "
+            "to compare; leaving %s as-is",
+            config.EARNINGS_DISAGREEMENTS_CSV_NAME,
+        )
+        return rep
     config.atomic_write_csv(rep, _disagreements_csv_path(), index=False)
     if len(rep):
         log.warning(
-            "%d cross-source EPS disagreements — see %s",
-            len(rep), config.EARNINGS_DISAGREEMENTS_CSV_NAME,
+            "%d cross-source EPS disagreements across %d comparable slot(s) "
+            "— see %s",
+            len(rep), comparable, config.EARNINGS_DISAGREEMENTS_CSV_NAME,
         )
     return rep
 
