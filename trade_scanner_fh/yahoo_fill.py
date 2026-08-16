@@ -139,7 +139,7 @@ def targeted_fill_yahoo(
             progress_cb(i + 1, total)
 
         if len(pending) >= flush_every:
-            ec._merge_and_save(pending, ec.load_earnings_cache())
+            ec._merge_and_save(pending, ec.load_earnings_cache(), source="yahoo")
             _flush_raw()
             log.info(
                 "Yahoo targeted: flushed %d rows (%d/%d processed, "
@@ -157,7 +157,7 @@ def targeted_fill_yahoo(
         time.sleep(delay)
 
     if pending:
-        ec._merge_and_save(pending, ec.load_earnings_cache())
+        ec._merge_and_save(pending, ec.load_earnings_cache(), source="yahoo")
     _flush_raw()
 
     # Reconcile only the tickers we actually touched so the Yahoo rows
@@ -198,7 +198,7 @@ def spot_fill_yahoo(symbol: str, blacklist: set[str]) -> tuple[int, str]:
     if row is None:
         return 0, "no_data"
 
-    ec._merge_and_save([row], ec.load_earnings_cache())
+    ec._merge_and_save([row], ec.load_earnings_cache(), source="yahoo")
     if raw_row is not None:
         try:
             earnings_raw.append_yahoo_rows([raw_row], earnings_raw.new_run_id())

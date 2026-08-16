@@ -11,6 +11,11 @@ from trade_scanner_fh import config, earnings_cache, earnings_raw, nasdaq_fill
 
 @pytest.fixture
 def tmp_world(tmp_path, monkeypatch):
+    # Audit 2026-08-16 (F17): DATA_DIR must be redirected too — any
+    # call-time-resolved path (the per-source date store, the
+    # disagreement CSV, the gap ledger) resolves against it, and a
+    # fixture that leaves it pointing at the real tree writes there.
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     monkeypatch.setattr(earnings_cache.config, "EARNINGS_PARQUET",
                         tmp_path / "earnings.parquet")
     raw_root = tmp_path / "earnings_raw"

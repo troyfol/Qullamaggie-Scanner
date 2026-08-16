@@ -15,7 +15,10 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from .. import config
 from ..data_engine import (
-    _last_cached_date, download_many, download_one, prefetch_ohlcv,
+    _last_cached_date, cached_spans, clear_ohlcv_cache, download_many,
+    download_one, find_interior_gaps, prefetch_ohlcv, rebuild_ticker,
+    record_gap_attempts, reference_sessions, select_gap_rebuilds,
+    write_anomaly_report,
 )
 from ..scanner import ScanParams, ScanResult, build_scan_context, run_scan
 from ..ticker_universe import refresh_universe
@@ -302,6 +305,10 @@ class UpdateWorker(QThread):
         # Phase 4 R16: Event instead of bool for documented thread safety
         self._stop = threading.Event()
         self._failed_tickers: list[str] = []
+        # Audit 2026-08-16 (F12): every ScrapeResult of the run, so the
+        # validate_ticker anomalies can be persisted at the end instead of
+        # being logged at INFO and discarded.
+        self._results: list = []
 
     def request_stop(self):
         self._stop.set()
@@ -335,10 +342,24 @@ class UpdateWorker(QThread):
                  "(target date: %s, market_closed: %s)",
                  len(self.symbols), target_date, market_closed)
 
+        # Audit 2026-08-16 (F2): one footer read per ticker, shared by the
+        # staleness test (needs the LAST date) and the interior-gap sweep
+        # (needs first + last + row count). Measured 10.6 ms/file cold across
+        # 11,854 files, so reading the same footers twice would add ~2 minutes
+        # to every launch.
+        self._spans = cached_spans(self.symbols)
+
         stale = []
         missing = []
         for sym in self.symbols:
-            last = _last_cached_date(sym)
+            span = self._spans.get(sym)
+            if span is not None:
+                last = span[1]
+            else:
+                # No footer statistics (an older writer) — fall back to the
+                # full read rather than treating the ticker as uncached and
+                # re-downloading its entire history.
+                last = _last_cached_date(sym)
             if last is None:
                 missing.append(sym)
             else:
@@ -379,6 +400,7 @@ class UpdateWorker(QThread):
             mutation and signal emission are safe."""
             nonlocal updated, errors, completed
             completed += 1
+            self._results.append(res)
             if res.status == "ok":
                 updated += 1
             elif res.status == "stopped":
@@ -459,11 +481,110 @@ class UpdateWorker(QThread):
                     log.warning("Rate limit persists, stopping update")
                     break
 
-        msg = f"OHLCV update complete: {updated} updated, {errors} errors"
+        # Audit 2026-08-16 (F12): persist what `validate_ticker` found instead
+        # of logging it at INFO and dropping it on the floor.
+        try:
+            written = write_anomaly_report(self._results)
+            if written:
+                self.log_msg.emit(
+                    f"OHLCV anomalies: {written} flagged — see "
+                    f"{config.OHLCV_ANOMALIES_CSV_NAME}"
+                )
+        except Exception as exc:      # a report must never break the update
+            log.warning("OHLCV anomaly report skipped: %s", exc)
+
+        # Audit 2026-08-16 (F2): repair interior holes. Staleness above is
+        # judged only by a file's LAST bar, so a ticker whose most recent bar
+        # is current is never re-fetched however many sessions are missing from
+        # the middle — and an incremental update could only repair the last few
+        # days anyway. Bounded and ledger-guarded; see _repair_interior_gaps.
+        gaps_fixed = 0
+        if config.OHLCV_GAP_CHECK_ENABLED and not self._stop.is_set():
+            try:
+                gaps_fixed = self._repair_interior_gaps()
+            except Exception as exc:
+                log.warning("OHLCV gap sweep skipped: %s", exc, exc_info=True)
+
+        msg = (f"OHLCV update complete: {updated} updated, {errors} errors"
+               + (f", {gaps_fixed} gap-repaired" if gaps_fixed else ""))
         self.log_msg.emit(msg)
         log.info(msg)
         self.error_tickers.emit(self._failed_tickers)
         self.finished.emit(updated, errors)
+
+    def _repair_interior_gaps(self) -> int:
+        """Detect and rebuild tickers with holes inside their own date range.
+
+        Runs AFTER the incremental pass so it judges freshly-updated files, and
+        uses `rebuild_ticker` rather than `download_one`: the hole is in the
+        middle, and an incremental update starts at `last_date - overlap`, so
+        only a full re-pull can close it. `rebuild_ticker` moves the existing
+        file aside and restores it on any failure, so a failed repair can never
+        leave a ticker with no history at all.
+
+        Every attempt is recorded — including ones that don't help — so a
+        source-level hole (a real halt, or bars the provider lacks) is not
+        rebuilt again on every launch for the rest of time.
+        """
+        sessions = reference_sessions()
+        if sessions is None or len(sessions) == 0:
+            log.info(
+                "OHLCV gap sweep skipped — reference ticker %s is not cached "
+                "yet (expected on a fresh install)",
+                config.OHLCV_GAP_REFERENCE_TICKER,
+            )
+            return 0
+
+        # Reuse the footers read during the staleness pass. Tickers rebuilt or
+        # updated since then have a stale span, which at worst defers their
+        # repair by one launch — never a wrong repair, and the alternative is
+        # a second full sweep of the cache.
+        gaps = find_interior_gaps(
+            self.symbols, sessions=sessions,
+            spans=getattr(self, "_spans", None),
+        )
+        if not gaps:
+            log.info("OHLCV gap sweep: no interior holes found")
+            return 0
+
+        todo = select_gap_rebuilds(gaps)
+        held = len(gaps) - len(todo)
+        self.log_msg.emit(
+            f"OHLCV gaps: {len(gaps)} ticker(s) have interior holes; "
+            f"repairing {len(todo)} this run"
+            + (f" ({held} bounded/recently-tried)" if held else "")
+        )
+        log.info("OHLCV gap sweep: %d holed, %d queued, %d held back",
+                 len(gaps), len(todo), held)
+        if not todo:
+            return 0
+
+        repaired = 0
+        attempted: list[str] = []
+        for i, sym in enumerate(todo, 1):
+            if self._stop.is_set():
+                log.info("OHLCV gap sweep stopped at %d/%d", i - 1, len(todo))
+                break
+            attempted.append(sym)
+            try:
+                res = rebuild_ticker(sym)
+            except Exception as exc:
+                log.debug("gap rebuild failed for %s: %s", sym, exc)
+                continue
+            if res.status == "ok":
+                repaired += 1
+            if i % 25 == 0 or i == len(todo):
+                self.log_msg.emit(
+                    f"OHLCV gap repair: {i}/{len(todo)} ({repaired} rebuilt)")
+
+        # Record every ticker we actually TRIED, whether or not the rebuild
+        # closed the hole — an attempt that didn't help is precisely the case
+        # the ledger exists to remember. Tickers we never reached (stop
+        # requested) stay unrecorded so the next run picks them up.
+        record_gap_attempts(attempted)
+        if attempted:
+            clear_ohlcv_cache()
+        return repaired
 
 
 class PrefetchWorker(QThread):

@@ -133,6 +133,139 @@ def save_earnings_cache(df: pd.DataFrame) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Per-source date store (audit 2026-08-16, F4)
+# ---------------------------------------------------------------------------
+#
+# `earnings_dates.parquet` holds ONE row per ticker, so every date source —
+# nasdaq, yahoo, and finviz's forward date — wrote into the same row. Whichever
+# fill ran last won the value, and the reconciler could only ever read that one
+# collapsed row back. The documented priority chain (nasdaq > yahoo > finviz >
+# zacks > finnhub) therefore never got a chance to apply to the date-backed
+# sources: it was decided by fill order.
+#
+# The three history-backed sources never had this problem, because
+# earnings_history.parquet retains a row per source and the reconciler
+# re-derives each source's contribution independently. This gives the date
+# sources the same thing: a long-form store keyed (ticker, source), which the
+# reconciler reads and collapses into the one-row-per-ticker consumer file.
+#
+# The consumer file's shape is UNCHANGED, so scanner/GUI readers need no edits.
+
+SOURCE_COLUMNS: list[str] = ["ticker", "source", "last_earnings",
+                            "next_earnings", "updated_at"]
+
+# Serializes the load→merge→save cycle on the per-source store, exactly like
+# DATES_WRITE_LOCK does for the consumer file.
+SOURCE_WRITE_LOCK = threading.RLock()
+
+
+def load_source_dates() -> pd.DataFrame | None:
+    """Read earnings_dates_by_source.parquet. None if it doesn't exist yet
+    (a fresh install, or a store written before F4)."""
+    path = config.earnings_source_parquet()
+    if not path.exists():
+        return None
+    for attempt in range(2):
+        try:
+            df = pd.read_parquet(path)
+            break
+        except Exception as exc:  # noqa: BLE001
+            if attempt == 0:
+                time.sleep(0.2)
+            else:
+                log.warning("Failed to read %s: %s", path.name, exc)
+                return None
+    for col in ("last_earnings", "next_earnings", "updated_at"):
+        if col in df.columns and pd.api.types.is_datetime64_any_dtype(df[col]):
+            try:
+                if df[col].dt.tz is not None:
+                    df[col] = df[col].dt.tz_localize(None)
+            except (AttributeError, TypeError):
+                pass
+    return df
+
+
+def save_source_dates(df: pd.DataFrame) -> None:
+    keep = [c for c in SOURCE_COLUMNS if c in df.columns]
+    out = df[keep + [c for c in df.columns if c not in keep]]
+    config.atomic_write_parquet(
+        out, config.earnings_source_parquet(), engine="pyarrow", index=False,
+    )
+
+
+def record_source_dates(rows: list[dict], source: str) -> None:
+    """Upsert this source's ``(ticker, last, next)`` observations.
+
+    Keyed on ``(ticker, source)``, so a nasdaq sweep can never overwrite what
+    yahoo reported and vice versa — which is the whole point of F4.
+
+    A NULL date does not erase a known one, mirroring `_collapse_by_ticker`:
+    finviz writes only a forward date, and NaT there means "this fill didn't
+    learn it", never "it was cleared".
+    """
+    if not rows:
+        return
+    new_df = pd.DataFrame(rows)
+    if "ticker" not in new_df.columns:
+        return
+    new_df["source"] = source
+    for col in ("last_earnings", "next_earnings", "updated_at"):
+        if col in new_df.columns:
+            new_df[col] = pd.to_datetime(new_df[col], errors="coerce")
+        else:
+            new_df[col] = pd.NaT
+    new_df = new_df[[c for c in SOURCE_COLUMNS if c in new_df.columns]]
+
+    with SOURCE_WRITE_LOCK:
+        base = load_source_dates()
+        if base is not None and not base.empty:
+            if config.earnings_source_parquet().exists() and base.empty:
+                return
+            combined = pd.concat([base, new_df], ignore_index=True)
+        else:
+            combined = new_df
+        # Newest row per (ticker, source) wins its identity; each DATE falls
+        # back through older rows independently so a partial observation can't
+        # blank the other position.
+        combined = _collapse_by_keys(combined, ["ticker", "source"])
+        save_source_dates(combined)
+
+
+def _collapse_by_keys(combined: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+    """One row per key tuple, newest wins — except that a NULL date never
+    overwrites a known one. Generalisation of `_collapse_by_ticker`."""
+    if combined.empty or not combined.duplicated(subset=keys).any():
+        return combined.reset_index(drop=True)
+    newest = combined.drop_duplicates(subset=keys, keep="last").set_index(keys)
+    for col in ("last_earnings", "next_earnings"):
+        if col in combined.columns:
+            newest[col] = combined.groupby(keys)[col].last().reindex(
+                newest.index)
+    return newest.reset_index()
+
+
+def source_dates_lookup(
+    source: str, df: pd.DataFrame | None = None,
+) -> dict:
+    """``{ticker: (last, next)}`` for one source, straight off the per-source
+    store. Replaces the label-matching heuristics the reconciler needed when
+    every source shared one row."""
+    if df is None:
+        df = load_source_dates()
+    if df is None or df.empty or "source" not in df.columns:
+        return {}
+    sub = df.loc[df["source"].astype(str) == source]
+    if sub.empty:
+        return {}
+    return {
+        str(t): (last, nxt)
+        for t, last, nxt in zip(sub["ticker"], sub["last_earnings"],
+                                sub["next_earnings"])
+        if isinstance(t, str) or t is not None
+    }
+
+
 def get_earnings_dates(
     ticker: str, earnings_df: pd.DataFrame
 ) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
@@ -184,10 +317,23 @@ def _collapse_by_ticker(combined: pd.DataFrame) -> pd.DataFrame:
     return newest.reset_index()
 
 
-def _merge_and_save(new_rows: list[dict], existing: pd.DataFrame | None):
-    """Merge new earnings rows with existing cache and save."""
+def _merge_and_save(new_rows: list[dict], existing: pd.DataFrame | None,
+                    *, source: str | None = None):
+    """Merge new earnings rows with existing cache and save.
+
+    Audit 2026-08-16 (F4): also records the rows in the per-source store when
+    ``source`` is given, so the reconciler can tell whose date is whose. The
+    consumer-file write is unchanged, which keeps a fill's result visible
+    immediately even before the reconcile that follows it.
+    """
     if not new_rows:
         return
+    if source:
+        try:
+            record_source_dates(new_rows, source)
+        except Exception as exc:      # never let provenance break a fill
+            log.warning("per-source date record failed for %s: %s",
+                        source, exc)
     new_df = pd.DataFrame(new_rows)
     # Ensure datetime columns
     for col in ("last_earnings", "next_earnings", "updated_at"):

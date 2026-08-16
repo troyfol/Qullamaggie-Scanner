@@ -365,10 +365,23 @@ def _filter_symbols(df: pd.DataFrame) -> pd.DataFrame:
 # yfinance validation
 # ============================================================================
 
+class EmptyValidationBatch(RuntimeError):
+    """The provider answered without raising, but returned nothing usable.
+
+    Audit 2026-08-16 (F3): this is what RATE LIMITING looks like — an empty or
+    all-NaN frame, not an exception. `_validate_via_yfinance`'s retry and
+    per-ticker fallback were keyed on `except Exception`, so for the single
+    most likely failure mode they never ran, and every symbol in the batch was
+    marked failed and then DELETED from the universe. Raising turns the silent
+    case into the loud one the fallback already handles.
+    """
+
+
 def _run_validation_batch(batch: list[str]) -> tuple[set[str], set[str]]:
     """One-shot batch validation via `yf.download(..., period='5d')`. Returns
-    (valid, failed) sets over the batch. Raises on network/API error so the
-    caller can apply retry/fallback logic."""
+    (valid, failed) sets over the batch. Raises on network/API error — and on a
+    wholly-empty response (see EmptyValidationBatch) — so the caller can apply
+    retry/fallback logic."""
     valid: set[str] = set()
     failed: set[str] = set()
     joined = " ".join(batch)
@@ -379,6 +392,13 @@ def _run_validation_batch(batch: list[str]) -> tuple[set[str], set[str]]:
         threads=True,
         group_by="ticker",
     )
+
+    # A batch of real listed symbols never comes back completely empty. When it
+    # does, the provider is throttling us, not telling us the symbols are dead.
+    if data is None or getattr(data, "empty", True):
+        raise EmptyValidationBatch(
+            f"yfinance returned an empty frame for {len(batch)} symbol(s)"
+        )
 
     if len(batch) == 1:
         sym = batch[0]
@@ -470,6 +490,38 @@ def _validate_via_yfinance(symbols: list[str]) -> tuple[set[str], set[str]]:
 # Public API
 # ============================================================================
 
+def _load_previous_universe(csv_path: Path) -> set:
+    """Symbols from the existing universe.csv, or an empty set if there is no
+    file yet.
+
+    Audit 2026-08-16 (F3): this read used to be `except Exception: pass`
+    inline. A locked file, a partial read, or a renamed column silently yielded
+    an EMPTY set — which flips the caller from "validate only what's new" to
+    "re-validate all ~16,000 symbols". Pair that with a throttling provider and
+    the refresh replaces universe.csv with whatever survived.
+
+    A MISSING file is a legitimate first run and returns empty. A file that
+    exists and cannot be read raises: the safest outcome is to leave the
+    existing universe alone, since it is at most UNIVERSE_STALE_DAYS out of
+    date, whereas a truncated one silently narrows every scan.
+    """
+    if not csv_path.exists():
+        return set()
+    try:
+        prev_df = pd.read_csv(csv_path)
+        return set(prev_df["symbol"].unique())
+    except Exception as exc:
+        log.error(
+            "Could not read the existing universe at %s (%s) — ABORTING the "
+            "refresh rather than re-validating everything against a "
+            "possibly-throttled provider and overwriting it with whatever "
+            "survives.", csv_path, exc,
+        )
+        raise RuntimeError(
+            f"universe.csv exists but could not be read: {exc}"
+        ) from exc
+
+
 def refresh_universe(
     force: bool = False,
     skip_validation: bool = False,
@@ -496,6 +548,13 @@ def refresh_universe(
     log.info("=" * 60)
     log.info("Ticker Universe Update Started")
     log.info("=" * 60)
+
+    # ── Read the existing universe ONCE (audit 2026-08-16, F3) ──
+    # Needed twice: as the "already validated" set below, and as the baseline
+    # for the shrink floor at the end. Read up front so an unreadable file
+    # fails the run immediately, before hours of network work.
+    prev_syms = _load_previous_universe(csv_path)
+    prev_count = len(prev_syms)
 
     # ── Source 1: NASDAQ FTP ──
     ftp_df = _fetch_nasdaq_ftp()
@@ -574,15 +633,6 @@ def refresh_universe(
         log.info("Skipping yfinance validation (skip_validation=True)")
         combined["validated"] = True
     else:
-        # Check if we have a previous universe to diff against
-        prev_syms = set()
-        if csv_path.exists():
-            try:
-                prev_df = pd.read_csv(csv_path)
-                prev_syms = set(prev_df["symbol"].unique())
-            except Exception:
-                pass
-
         current_syms = set(combined["symbol"].unique())
         new_tickers = current_syms - prev_syms
 
@@ -624,6 +674,23 @@ def refresh_universe(
     keep_cols = ["symbol", "name", "exchange", "market_category", "etf", "adr", "source"]
     keep_cols = [c for c in keep_cols if c in combined.columns]
     out = combined[keep_cols].reset_index(drop=True)
+
+    # Audit 2026-08-16 (F3): refuse a catastrophic shrink. universe.csv feeds
+    # EVERY scan and every fill's work list, and validation failures are
+    # destructive — a symbol that fails is dropped from the file. The codebase
+    # already applies exactly this kind of sanity cap to an upstream response
+    # (FINANCEDATABASE_MAX_ROWS refuses an absurd dataset); the universe, which
+    # matters far more, had none. Keeping the previous file is always the safer
+    # error: it is at most UNIVERSE_STALE_DAYS out of date, whereas a truncated
+    # one silently narrows every scan until someone notices.
+    if prev_count and len(out) < prev_count * (1.0 - config.UNIVERSE_MAX_SHRINK_PCT / 100.0):
+        raise RuntimeError(
+            f"Refusing to write universe.csv: {len(out):,} symbols is more "
+            f"than {config.UNIVERSE_MAX_SHRINK_PCT:.0f}% below the previous "
+            f"{prev_count:,}. This usually means the validation provider was "
+            f"throttling. The existing universe.csv has been left untouched; "
+            f"re-run the refresh later."
+        )
     # Atomic write (temp + os.replace) so a crash/power-loss/kill mid-write
     # can't leave a truncated universe.csv that the next load_universe() then
     # fails to parse — matches the "atomic writes everywhere" invariant the

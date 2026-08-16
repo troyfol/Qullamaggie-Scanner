@@ -840,8 +840,14 @@ def test_flush_keys_replacement_on_row_ticker_not_pending_key(tmp_world):
         f"Expected 1 row (replacement), got {len(df)} — mask_replace "
         f"didn't catch the existing row by its ticker"
     )
-    # Verify the NEW values won (not the seeded ones)
-    assert df.iloc[0]["estimated_eps"] == 1.95
+    # Verify the NEW values won (not the seeded ones). Asserted on the REPORTED
+    # actual rather than the estimate: audit 2026-08-16 (F14) makes the
+    # estimate-derived columns finviz-only, and both rows here are finnhub, so
+    # their estimates are stripped before the write. The reported value is what
+    # this test is really about anyway — it proves the replacement mask matched
+    # the existing row by the row's own ticker.
+    assert df.iloc[0]["reported_eps"] == 2.05
+    assert df.iloc[0]["eps_source"] == "finnhub"
 
 
 def test_5_year_cap_uses_config_constant(tmp_world, fake_clients):

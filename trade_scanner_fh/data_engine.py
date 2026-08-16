@@ -141,6 +141,230 @@ def _last_cached_date(symbol: str) -> Optional[pd.Timestamp]:
         return None
 
 
+def _footer_span(path: Path) -> Optional[tuple[pd.Timestamp, pd.Timestamp, int]]:
+    """``(first_date, last_date, row_count)`` read from the parquet FOOTER only.
+
+    Same metadata-only trick as ``_last_cached_date``: per-column min/max
+    statistics plus ``num_rows`` answer the question without touching a single
+    data page, which is what makes the gap sweep affordable across ~12k files.
+    Returns None when the file is empty, has no ``Date`` column, or was written
+    without statistics.
+    """
+    try:
+        md = pq_reader.read_metadata(path)
+    except Exception:
+        return None
+    try:
+        if md.num_rows == 0:
+            return None
+        idx = md.schema.to_arrow_schema().get_field_index("Date")
+        if idx < 0:
+            return None
+        lo = hi = None
+        for rg in range(md.num_row_groups):
+            st = md.row_group(rg).column(idx).statistics
+            if st is None or not st.has_min_max:
+                return None
+            if lo is None or st.min < lo:
+                lo = st.min
+            if hi is None or st.max > hi:
+                hi = st.max
+        if lo is None or hi is None:
+            return None
+        return (_naive_day(lo), _naive_day(hi), int(md.num_rows))
+    except Exception:
+        return None
+
+
+def _naive_day(value) -> pd.Timestamp:
+    """Normalise a parquet-statistics timestamp to a tz-naive calendar day.
+
+    Every cached file carries a `datetimetz America/New_York` index, and
+    pyarrow hands back its statistics as tz-AWARE UTC — so comparing one
+    directly against the tz-naive reference index raises
+    "Cannot compare tz-naive and tz-aware datetime-like objects". Same hazard
+    `_bars_after` exists to handle on the download path.
+
+    Converting to UTC and dropping the zone is safe for the calendar-day
+    comparison this feeds: daily bars are stamped midnight ET, and ET is always
+    a NEGATIVE offset, so the UTC instant lands later the same day and the date
+    is unchanged.
+    """
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert(None)
+    return ts.normalize()
+
+
+def reference_sessions(
+    symbol: Optional[str] = None,
+) -> Optional[pd.DatetimeIndex]:
+    """Trading-session calendar taken from a ticker already in the cache.
+
+    Deliberately NOT derived from ``config._NYSE_HOLIDAYS``: that table starts
+    at 2024 while OHLCV history reaches ``OHLCV_HISTORY_YEARS`` back, so every
+    pre-2024 year would contribute ~10 phantom "missing" sessions. A liquid
+    reference that trades every session is the ground truth we already hold —
+    and SPY is a REFERENCE_TICKER, so it is always present and always refreshed.
+
+    Returns a normalised, sorted DatetimeIndex, or None when the reference
+    isn't cached (a fresh install) — in which case the caller skips the sweep.
+    """
+    sym = symbol or config.OHLCV_GAP_REFERENCE_TICKER
+    p = _parquet_path(sym)
+    if not p.exists():
+        return None
+    try:
+        df = pd.read_parquet(p, columns=["Close"])
+    except Exception as exc:
+        log.debug("gap sweep: reference %s unreadable — %s", sym, exc)
+        return None
+    if df.empty:
+        return None
+    idx = df.index
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    return pd.DatetimeIndex(idx).normalize().sort_values()
+
+
+def cached_spans(symbols: list[str]) -> dict:
+    """``{symbol: (first, last, rows) | None}`` — ONE footer read per symbol.
+
+    The launch path needs a file's last date (staleness) and its first date +
+    row count (interior gaps), and all three come out of the same footer. Read
+    once and share: the sweep measured 10.6 ms/file COLD across 11,854 files
+    (~125 s), which is disk seek, not parsing — paying it twice would put two
+    minutes on every launch for nothing.
+    """
+    out: dict = {}
+    for sym in symbols:
+        p = _parquet_path(sym)
+        out[sym] = _footer_span(p) if p.exists() else None
+    return out
+
+
+def find_interior_gaps(
+    symbols: list[str],
+    *,
+    sessions: Optional[pd.DatetimeIndex] = None,
+    spans: Optional[dict] = None,
+) -> dict[str, int]:
+    """Map ``{symbol: missing_session_count}`` for tickers with holes strictly
+    INSIDE their own first→last range (audit 2026-08-16, F2).
+
+    A ticker is compared only against the reference sessions that fall within
+    its OWN span, so a recent IPO or a delisted name is judged on the window it
+    actually covers rather than being flagged for the history it never had.
+
+    Counting is by row COUNT against expected sessions rather than by set
+    difference, because the footer gives us the count for free. A file whose
+    dates extend outside the reference span yields a negative difference and is
+    simply not flagged.
+
+    ``spans``: precomputed ``cached_spans`` output. Supply it to reuse the
+    footer reads the caller already did rather than paying for them twice.
+    """
+    sess = sessions if sessions is not None else reference_sessions()
+    if sess is None or len(sess) == 0:
+        return {}
+    out: dict[str, int] = {}
+    for sym in symbols:
+        if spans is not None:
+            span = spans.get(sym)
+        else:
+            p = _parquet_path(sym)
+            span = _footer_span(p) if p.exists() else None
+        if span is None:
+            continue
+        lo, hi, rows = span
+        expected = int(sess.searchsorted(hi, "right")
+                       - sess.searchsorted(lo, "left"))
+        missing = expected - rows
+        if missing > 0:
+            out[sym] = missing
+    return out
+
+
+# ── Gap-rebuild attempt ledger ─────────────────────────────────────────
+
+def _gap_attempts_path() -> Path:
+    """Resolved at call time so tests that monkeypatch config.DATA_DIR are
+    honoured (mirrors the migration-flag path helpers)."""
+    return config.DATA_DIR / config.OHLCV_GAP_ATTEMPTS_FILE
+
+
+def load_gap_attempts() -> dict:
+    """``{ticker: ISO date of last rebuild attempt}``. Any unreadable or
+    malformed file degrades to "no attempts recorded" — the ledger is an
+    optimisation, and losing it costs a repeated rebuild, never data."""
+    import json
+    try:
+        raw = _gap_attempts_path().read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if k}
+
+
+def record_gap_attempts(symbols: list[str], *, today=None) -> None:
+    """Stamp today against each symbol we just tried to repair. Never raises."""
+    import json
+    if not symbols:
+        return
+    stamp = (today or datetime.now().date()).isoformat()
+    data = load_gap_attempts()
+    for s in symbols:
+        data[str(s)] = stamp
+    try:
+        config.atomic_write_text(
+            _gap_attempts_path(), json.dumps(data, indent=1, sort_keys=True))
+    except OSError as exc:
+        log.debug("gap attempt ledger write failed: %s", exc)
+
+
+def select_gap_rebuilds(
+    gaps: dict,
+    *,
+    limit: Optional[int] = None,
+    recheck_days: Optional[int] = None,
+    today=None,
+) -> list[str]:
+    """Worst-first, bounded, and skipping anything attempted recently.
+
+    The recheck window is what stops a permanent source-level hole — a real
+    trading halt, or bars the provider simply doesn't have — from being
+    rebuilt on every single launch forever. The bound is what stops the first
+    run after this ships from queueing thousands of full re-pulls.
+    """
+    if not gaps:
+        return []
+    cap = (limit if limit is not None
+           else config.OHLCV_GAP_MAX_REBUILDS_PER_RUN)
+    days = (recheck_days if recheck_days is not None
+            else config.OHLCV_GAP_RECHECK_DAYS)
+    ref = today or datetime.now().date()
+    cutoff = ref - timedelta(days=int(days))
+
+    attempts = load_gap_attempts()
+    eligible = []
+    for sym, missing in gaps.items():
+        prior = attempts.get(str(sym))
+        if prior:
+            try:
+                if datetime.fromisoformat(prior).date() > cutoff:
+                    continue          # tried recently — let it rest
+            except (TypeError, ValueError):
+                pass                  # unparseable stamp → treat as eligible
+        eligible.append((sym, missing))
+
+    eligible.sort(key=lambda kv: (-kv[1], str(kv[0])))
+    if cap is not None and cap >= 0:
+        eligible = eligible[:int(cap)]
+    return [s for s, _ in eligible]
+
+
 def _bars_after(index: pd.Index, cutoff: pd.Timestamp) -> "pd.Series | list":
     """Boolean mask of `index` entries strictly after `cutoff`.
 
@@ -286,7 +510,19 @@ def _reject_conflicting_bars(
     symbol: str, old_df: pd.DataFrame, new_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """Drop incoming bars that contradict an already-cached bar for the same
-    date by more than ``config.PRICE_JUMP_PCT`` (audit 2026-08-12, INT-11).
+    date (audit 2026-08-12 INT-11; extended 2026-08-16 F5).
+
+    Two independent tests, either of which rejects the bar:
+
+    * **Close disagreement** beyond ``config.PRICE_JUMP_PCT`` — a wholesale bad
+      response.
+    * **Volume regression** beyond ``config.OHLCV_VOLUME_REGRESSION_PCT`` — the
+      incoming bar reports materially LESS volume than the cached one. Settled
+      daily volume is revised up, not down, so this means the incoming bar is
+      the more provisional of the two. Checking Close alone missed exactly the
+      field the refetch-overlap was introduced to repair (Volume was wrong on
+      60/60 sampled tickers; see OHLCV_VOLUME_REGRESSION_PCT). Rejecting the
+      whole bar also protects its High/Low, which are wrong in the same bars.
 
     Only bars whose date ALREADY exists in the cache are considered — a normal
     incremental update appends new dates and is untouched. Overlap happens when
@@ -294,7 +530,7 @@ def _reject_conflicting_bars(
     used to overwrite good data permanently.
 
     Conservative by construction: a disagreement is resolved in favour of the
-    data already on disk, and anything unexpected (missing Close, empty
+    data already on disk, and anything unexpected (missing columns, empty
     overlap, a comparison that raises) returns ``new_df`` unchanged so this can
     never make an update fail.
     """
@@ -308,13 +544,35 @@ def _reject_conflicting_bars(
         new_close = pd.to_numeric(new_df.loc[overlap, "Close"], errors="coerce")
         base = old_close.abs()
         diff_pct = ((new_close - old_close).abs() / base.where(base > 0)) * 100.0
-        conflicting = overlap[diff_pct > config.PRICE_JUMP_PCT]
+        bad_close = (diff_pct > config.PRICE_JUMP_PCT).fillna(False)
+
+        # F5 — volume regression. Only fires when BOTH sides carry a usable
+        # positive volume, so a missing or zero cached volume can never reject
+        # a good incoming bar.
+        bad_volume = pd.Series(False, index=overlap)
+        if "Volume" in old_df.columns and "Volume" in new_df.columns:
+            old_vol = pd.to_numeric(old_df.loc[overlap, "Volume"], errors="coerce")
+            new_vol = pd.to_numeric(new_df.loc[overlap, "Volume"], errors="coerce")
+            floor = old_vol * (1.0 - config.OHLCV_VOLUME_REGRESSION_PCT / 100.0)
+            bad_volume = (
+                old_vol.notna() & new_vol.notna() & (old_vol > 0)
+                & (new_vol < floor)
+            ).fillna(False)
+
+        conflicting = overlap[(bad_close | bad_volume).to_numpy()]
         if len(conflicting) == 0:
             return new_df
+        reasons = []
+        if bad_close.any():
+            reasons.append(f"close >{config.PRICE_JUMP_PCT:.0f}%")
+        if bad_volume.any():
+            reasons.append(
+                f"volume >{config.OHLCV_VOLUME_REGRESSION_PCT:.0f}% below cache"
+            )
         log.warning(
-            "%s — %d re-sent bar(s) disagree with the cache by >%.0f%%; "
-            "keeping the cached value(s) for %s",
-            symbol, len(conflicting), config.PRICE_JUMP_PCT,
+            "%s — %d re-sent bar(s) contradict the cache (%s); keeping the "
+            "cached value(s) for %s",
+            symbol, len(conflicting), " / ".join(reasons),
             ", ".join(str(d.date()) for d in conflicting[:5]),
         )
         return new_df.drop(index=conflicting)
@@ -843,6 +1101,59 @@ def prefetch_ohlcv(
     return warmed
 
 
+# ── OHLCV anomaly report (audit 2026-08-16, F12) ───────────────────────
+
+ANOMALY_COLUMNS = ["ticker", "anomaly", "detected_at"]
+
+
+def anomalies_csv_path() -> Path:
+    """scanner_data/ohlcv_anomalies.csv — resolved at call time so test
+    fixtures that monkeypatch config.DATA_DIR redirect it too (mirrors
+    earnings_history._disagreements_csv_path)."""
+    return config.DATA_DIR / config.OHLCV_ANOMALIES_CSV_NAME
+
+
+def write_anomaly_report(results, *, now=None) -> int:
+    """Persist the ``validate_ticker`` findings from a download run.
+
+    Before this, ``ScrapeResult.anomalies`` was populated, logged at INFO and
+    then discarded — ``UpdateWorker`` only propagated ``error_tickers`` (hard
+    download failures), so the ONE OHLCV integrity check in the project could
+    not reach the user, could not be persisted, and could not be trended. That
+    is why the store-wide holes in F2 had to be found by ad-hoc probing rather
+    than by the tool built to find them.
+
+    One row per (ticker, anomaly). Returns the row count written. The file is
+    left ALONE when a run produced no anomalies at all, so a scan that touched
+    two tickers can't erase a full sweep's findings — the same trap that
+    destroyed the cross-source disagreement report before v5.5.1.
+    """
+    rows = []
+    stamp = (now or datetime.now()).isoformat(timespec="seconds")
+    for res in results or []:
+        for msg in getattr(res, "anomalies", None) or []:
+            rows.append({"ticker": res.symbol, "anomaly": msg,
+                         "detected_at": stamp})
+    if not rows:
+        log.debug("OHLCV anomaly report: nothing flagged — leaving %s as-is",
+                  config.OHLCV_ANOMALIES_CSV_NAME)
+        return 0
+    try:
+        config.atomic_write_csv(
+            pd.DataFrame(rows, columns=ANOMALY_COLUMNS),
+            anomalies_csv_path(), index=False,
+        )
+    except Exception as exc:      # a report must never break an update
+        log.warning("OHLCV anomaly report write failed: %s", exc)
+        return 0
+    log.warning(
+        "%d OHLCV anomal%s across %d ticker(s) — see %s",
+        len(rows), "y" if len(rows) == 1 else "ies",
+        len({r["ticker"] for r in rows}), config.OHLCV_ANOMALIES_CSV_NAME,
+    )
+    return len(rows)
+
+
 # ── Parquet schema stamp (Phase 4 R18) ──────────────────────────────────
 
 def stamp_schema_version() -> None:
@@ -871,22 +1182,44 @@ def read_schema_version() -> Optional[int]:
         return None
 
 
-def check_schema_version() -> None:
-    """Inspect the parquet cache's schema version and log any mismatch.
-    Stamps the current version if none is recorded (assumes existing cache
-    matches the current code — zero-migration default)."""
+SCHEMA_OK = "ok"            # stamp matches, or there was nothing to stamp
+SCHEMA_OLDER = "older"      # cache predates this build
+SCHEMA_NEWER = "newer"      # cache was written by a NEWER build — the risky one
+
+
+def check_schema_version() -> tuple[str, Optional[int], int]:
+    """Inspect the parquet cache's schema version.
+
+    Returns ``(status, stamped, expected)`` where status is one of
+    ``SCHEMA_OK`` / ``SCHEMA_OLDER`` / ``SCHEMA_NEWER``. Stamps the current
+    version if none is recorded (assumes an existing cache matches the current
+    code — zero-migration default).
+
+    Audit 2026-08-16 (F11): this used to log a WARNING into
+    ``scanner_data/logs/`` and let the app carry on reading, merging and
+    WRITING the cache as though nothing were wrong. Returning the verdict lets
+    the caller put it in front of the user. The two directions are separated
+    because they are not equally dangerous: an OLDER cache is a migration
+    question, while a NEWER one means a future build already wrote this cache
+    and today's code may not understand its columns — writing to it is how you
+    lose the newer data.
+    """
+    expected = config.PARQUET_SCHEMA_VERSION
     stamped = read_schema_version()
     if stamped is None:
         if config.PARQUET_DIR.exists() and any(config.PARQUET_DIR.glob("*.parquet")):
             log.info("Parquet cache has no schema stamp; treating as v%d.",
-                     config.PARQUET_SCHEMA_VERSION)
+                     expected)
         stamp_schema_version()
-    elif stamped != config.PARQUET_SCHEMA_VERSION:
-        log.warning(
-            "Parquet cache is schema v%d but this build expects v%d — "
-            "some tickers may need a cache rebuild.",
-            stamped, config.PARQUET_SCHEMA_VERSION,
-        )
+        return (SCHEMA_OK, None, expected)
+    if stamped == expected:
+        return (SCHEMA_OK, stamped, expected)
+    status = SCHEMA_NEWER if stamped > expected else SCHEMA_OLDER
+    log.warning(
+        "Parquet cache is schema v%d but this build expects v%d (%s) — "
+        "some tickers may need a cache rebuild.", stamped, expected, status,
+    )
+    return (status, stamped, expected)
 
 
 # ── Manual ticker-cache rebuild (Phase 4 R9) ────────────────────────────

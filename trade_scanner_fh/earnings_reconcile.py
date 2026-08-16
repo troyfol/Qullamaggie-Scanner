@@ -331,6 +331,34 @@ def reconcile_earnings_dates(
         today = pd.Timestamp.today().normalize()
     now = pd.Timestamp(datetime.now())
 
+    # Audit 2026-08-16 (F4): prefer the per-source date store. Before it, every
+    # date source wrote into the SAME one-row-per-ticker record, so the last
+    # fill to run won the value and the reconciler could only read that
+    # collapsed row back — the priority chain below never actually applied to
+    # nasdaq / yahoo / finviz-next. `_extract_dates_lookup`'s label matching
+    # existed only to guess whose date it was looking at.
+    #
+    # Falls back to that legacy path when the per-source store is absent (a
+    # pre-F4 data directory), so nothing on disk changes meaning.
+    src_dates = ec.load_source_dates()
+    have_src = src_dates is not None and not src_dates.empty
+
+    def _dates_for(source: str) -> dict:
+        """Per-source lookup, falling back to the legacy label matching when
+        this source has nothing in the new store yet.
+
+        The fallback is PER SOURCE, not per store: during a transition the new
+        store fills up one fill at a time, so after the first yahoo fill it
+        exists but knows nothing about nasdaq. Gating on the store as a whole
+        would silently discard nasdaq's dates until its next sweep. Anyone
+        starting from a wiped data directory never sees either path differ.
+        """
+        if have_src:
+            found = ec.source_dates_lookup(source, src_dates)
+            if found:
+                return found
+        return _extract_dates_lookup(dates_df, source)
+
     # finviz is a hybrid source: its LAST comes from the per-quarter
     # history (real announcement dates), but its NEXT comes from the dates
     # cache — finviz_fill writes the forward `earningsDate` there as a
@@ -339,7 +367,7 @@ def reconcile_earnings_dates(
     # two so finviz contributes a next_earnings without ever putting a
     # future NaN-actual row into the per-quarter history.
     fv_hist = _extract_history_lookups(history_df, "finviz", today)
-    fv_dates = _extract_dates_lookup(dates_df, "finviz")
+    fv_dates = _dates_for("finviz")
     finviz_lookup: dict[str, tuple[pd.Timestamp, pd.Timestamp]] = {}
     for t in set(fv_hist) | set(fv_dates):
         h_last, h_next = fv_hist.get(t, (pd.NaT, pd.NaT))
@@ -356,8 +384,8 @@ def reconcile_earnings_dates(
         "finviz":  finviz_lookup,
         "zacks":   _extract_history_lookups(history_df, "zacks", today),
         "finnhub": _extract_history_lookups(history_df, "finnhub", today),
-        "nasdaq":  _extract_dates_lookup(dates_df, "nasdaq"),
-        "yahoo":   _extract_dates_lookup(dates_df, "yahoo"),
+        "nasdaq":  _dates_for("nasdaq"),
+        "yahoo":   _dates_for("yahoo"),
     }
 
     # Candidates: every ticker present in any lookup.

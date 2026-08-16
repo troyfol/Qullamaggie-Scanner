@@ -468,53 +468,123 @@ def test_dedupe_zacks_still_beats_finnhub_without_finviz():
     assert deduped.iloc[0]["source"] == "zacks"
 
 
-def test_dedupe_backfill_fills_winner_nan_surprise_from_lower_source():
-    """backfill_estimates=True: when the slot winner (Zacks) is missing
-    estimate/surprise but a lower-priority same-slot row (Finnhub) has
-    them, the winner inherits those NaN-only fields. Both sources are
-    the same adjusted basis, so reported_eps is never overwritten."""
+def test_reported_actuals_mix_freely_across_sources():
+    """Audit 2026-08-16 (F13/F14): every source quotes the same adjusted basis,
+    so the REPORTED actuals are taken per column from the highest-priority row
+    that has one — EPS and revenue independently."""
     rows = [
+        _row("AAPL", "2025-12-01", "2026-01-29", source="finviz",
+             eps_est=1.95, eps_rep=None, eps_surp=None, eps_pct=None),
         _row("AAPL", "2025-12-01", "2026-01-29", source="zacks",
-             eps_est=None, eps_rep=2.10,            # Zacks missing estimate
-             eps_surp=None, eps_pct=None),
+             eps_est=None, eps_rep=2.10, eps_surp=None, eps_pct=None),
         _row("AAPL", "2025-12-01", "2026-01-29", source="finnhub",
-             eps_est=1.95, eps_rep=2.05,
-             eps_surp=0.10, eps_pct=5.13),
+             eps_est=None, eps_rep=2.05, eps_surp=None, eps_pct=None),
     ]
-    df = pd.DataFrame(rows)
-    deduped = eh.dedupe_history(df, backfill_estimates=True)
+    rows[0].update({"reported_rev": None})
+    rows[1].update({"reported_rev": None})
+    rows[2].update({"reported_rev": 1000.0})
+
+    deduped = eh.dedupe_history(pd.DataFrame(rows), merge_sources=True)
     assert len(deduped) == 1
     win = deduped.iloc[0]
-    # Winner identity + its own adjusted reported_eps untouched.
-    assert win["source"] == "zacks"
+
+    assert win["source"] == "finviz"          # slot winner is unchanged
+    # EPS from zacks (finviz had none, zacks outranks finnhub).
     assert win["reported_eps"] == 2.10
-    # Estimate / surprise inherited from the lower same-slot row.
+    assert win["eps_source"] == "zacks"
+    # Revenue from finnhub, independently.
+    assert win["reported_rev"] == 1000.0
+    assert win["rev_source"] == "finnhub"
+
+
+def test_estimates_and_surprises_are_finviz_only():
+    """Audit 2026-08-16 (F14): the estimate and its surprise are one provider's
+    opinion and are inextricably paired (surprise = actual − estimate), so the
+    whole cluster is single-sourced. A zacks estimate never reaches the
+    parquet, and a merge can never pull one onto the winner."""
+    rows = [
+        _row("AAPL", "2025-12-01", "2026-01-29", source="finviz",
+             eps_est=None, eps_rep=None, eps_surp=None, eps_pct=None),
+        _row("AAPL", "2025-12-01", "2026-01-29", source="zacks",
+             eps_est=1.90, eps_rep=2.05, eps_surp=0.15, eps_pct=7.9),
+    ]
+    # The finviz row owns the slot but has NOTHING — the merge must pull the
+    # actuals across and nothing else.
+    rows[0].update({"estimated_rev": None, "reported_rev": None,
+                    "surprise_rev": None, "surprise_rev_pct": None})
+    rows[1].update({"estimated_rev": 900.0, "reported_rev": 1000.0,
+                    "surprise_rev": 100.0, "surprise_rev_pct": 11.1})
+
+    win = eh.dedupe_history(pd.DataFrame(rows), merge_sources=True).iloc[0]
+
+    # The REPORTED actuals cross over...
+    assert win["reported_eps"] == 2.05
+    assert win["eps_source"] == "zacks"
+    assert win["reported_rev"] == 1000.0
+    assert win["rev_source"] == "zacks"
+    # ...but nothing estimate-derived does.
+    for col in ("estimated_eps", "surprise_eps", "surprise_eps_pct",
+                "estimated_rev", "surprise_rev", "surprise_rev_pct"):
+        assert pd.isna(win[col]), f"{col} leaked from a non-finviz source"
+
+
+def test_finviz_keeps_its_own_estimates_and_surprises():
+    """The other half: finviz's own estimate cluster is what the columns are
+    for, so it must survive the same pass untouched."""
+    rows = [
+        _row("AAPL", "2025-12-01", "2026-01-29", source="finviz",
+             eps_est=1.95, eps_rep=2.10, eps_surp=0.15, eps_pct=7.7),
+        _row("AAPL", "2025-12-01", "2026-01-29", source="zacks",
+             eps_est=1.90, eps_rep=2.05, eps_surp=0.15, eps_pct=7.9),
+    ]
+    win = eh.dedupe_history(pd.DataFrame(rows), merge_sources=True).iloc[0]
+
+    assert win["source"] == "finviz"
+    assert win["reported_eps"] == 2.10
+    assert win["eps_source"] == "finviz"
     assert win["estimated_eps"] == 1.95
-    assert win["surprise_eps"] == 0.10
-    assert win["surprise_eps_pct"] == 5.13
+    assert win["surprise_eps"] == 0.15
+    assert win["surprise_eps_pct"] == 7.7
 
 
-def test_dedupe_backfill_adjusted_winner_keeps_own_reported():
-    """A Zacks winner is the same basis as the donor, so its own
-    reported_eps and present estimate are NEVER overwritten — only
-    genuinely-NaN fields back-fill."""
+def test_reported_source_is_na_when_there_is_no_reported_value():
+    """No value means no source to attribute."""
+    rows = [
+        _row("AAPL", "2025-12-01", "2026-01-29", source="finviz",
+             eps_est=None, eps_rep=None, eps_surp=None, eps_pct=None),
+    ]
+    rows[0].update({"reported_rev": None})
+    win = eh.dedupe_history(pd.DataFrame(rows), merge_sources=True).iloc[0]
+    assert pd.isna(win["eps_source"])
+    assert pd.isna(win["rev_source"])
+
+
+def test_dedupe_winner_keeps_its_own_reported_value():
+    """A present value is never overwritten by a lower-priority one — the
+    merge only fills genuine NaNs.
+
+    (Audit 2026-08-16 F14 changed the estimate half of this: neither of these
+    rows is finviz, so their estimates are stripped and no longer assertable.
+    The reported-value precedence this really guards is unchanged.)"""
     rows = [
         _row("AAPL", "2025-12-01", "2026-01-29", source="zacks",
              eps_est=1.95, eps_rep=2.10, eps_surp=0.15, eps_pct=7.7),
         _row("AAPL", "2025-12-01", "2026-01-29", source="finnhub",
              eps_est=1.90, eps_rep=2.05, eps_surp=0.15, eps_pct=7.9),
     ]
-    deduped = eh.dedupe_history(pd.DataFrame(rows), backfill_estimates=True)
+    deduped = eh.dedupe_history(pd.DataFrame(rows), merge_sources=True)
     assert len(deduped) == 1
     win = deduped.iloc[0]
     assert win["source"] == "zacks"
     assert win["reported_eps"] == 2.10   # Zacks' own, not Finnhub's 2.05
-    assert win["estimated_eps"] == 1.95
+    assert win["eps_source"] == "zacks"
 
 
-def test_dedupe_backfill_off_by_default_leaves_winner_nan():
-    """Without the flag (the write-time canonical path), the winner
-    stays pure — no lower-source estimate bleed onto disk."""
+def test_dedupe_merge_off_by_default_leaves_winner_nan():
+    """Without the flag the winner stays pure — no cross-source fill at all.
+    (The write path now passes it; audit 2026-08-16 F13. The default itself is
+    unchanged, and this guards it — `get_ticker_history` and the integrity
+    fixer both rely on the plain dedup not rewriting values.)"""
     rows = [
         _row("AAPL", "2025-12-01", "2026-01-29", source="zacks",
              eps_est=None, eps_rep=2.10, eps_surp=None, eps_pct=None),
@@ -530,8 +600,8 @@ def test_dedupe_backfill_off_by_default_leaves_winner_nan():
     assert pd.isna(win["surprise_eps_pct"])
 
 
-def test_dedupe_backfill_does_not_invent_a_quarter():
-    """Back-fill must collapse same-slot dups to ONE row, never leave
+def test_dedupe_merge_does_not_invent_a_quarter():
+    """The merge must collapse same-slot dups to ONE row, never leave
     the duplicate behind — this is the column-shift regression guard."""
     rows = [
         _row("AAOI", "2026-03-01", "2026-05-07", source="zacks",
@@ -541,7 +611,7 @@ def test_dedupe_backfill_does_not_invent_a_quarter():
         _row("AAOI", "2025-12-01", "2026-02-26", source="zacks"),
         _row("AAOI", "2025-12-01", "2025-12-31", source="finnhub"),
     ]
-    deduped = eh.dedupe_history(pd.DataFrame(rows), backfill_estimates=True)
+    deduped = eh.dedupe_history(pd.DataFrame(rows), merge_sources=True)
     # Two distinct fiscal quarters → exactly two rows, no doubles.
     assert len(deduped) == 2
     assert sorted(p.date().isoformat()
@@ -1623,15 +1693,56 @@ def test_bulk_fill_flush_every_persists_partial_progress(tmp_parquets):
     assert {"A", "B"}.issubset(set(df["ticker"]))
 
 
-def test_bulk_fill_replaces_existing_ticker_rows(tmp_parquets):
-    """Refetching a ticker should fully replace its prior history rows
-    rather than appending duplicates."""
+def test_bulk_fill_replaces_rather_than_duplicating_a_refetched_quarter(
+        tmp_parquets):
+    """Refetching a quarter must REPLACE its prior row, not append a duplicate.
+
+    This is the Phase 6.5 contract. Audit 2026-08-16 (F1) narrowed the scope of
+    the replacement from "every row this (ticker, source) has" to "the span this
+    response covers" — so the anti-duplicate property is asserted here on a
+    response that actually re-covers the stored quarters, and the retention
+    property gets its own test below.
+    """
     seed = pd.DataFrame([
         _row("AAPL", "2024-12-01", "2025-01-30"),
         _row("AAPL", "2024-09-01", "2024-10-31"),
     ])
     eh.save_earnings_history(seed)
 
+    # Response reaches back to (and past) the oldest stored quarter, so it is
+    # authoritative over the whole stored span.
+    canned = {"AAPL": [
+        _fake_zacks_rows("2024-09-01", "2024-10-31"),
+        _fake_zacks_rows("2024-12-01", "2025-01-30"),
+        _fake_zacks_rows("2025-12-01", "2026-01-29"),
+    ]}
+    fake = _FakeSession(canned)
+    with patch.object(eh, "ZacksSession", return_value=fake), \
+         patch.object(eh.time, "sleep", lambda *_: None):
+        eh.bulk_fill_zacks(["AAPL"], blacklist=set(), delay_sec=0)
+
+    df = eh.load_earnings_history()
+    aapl = df.loc[df["ticker"] == "AAPL"]
+    assert len(aapl) == 3, "a re-covered quarter must not duplicate"
+    assert not aapl.duplicated(subset=["period_ending"]).any()
+    assert aapl["period_ending"].max() == pd.Timestamp("2025-12-01")
+
+
+def test_bulk_fill_keeps_quarters_a_short_response_did_not_cover(tmp_parquets):
+    """Audit 2026-08-16 (F1, CRITICAL): a 200-OK-but-SHORT response must not
+    delete the quarters it simply didn't mention.
+
+    Before F1 the flush dropped EVERY (ticker, source) row and wrote whatever
+    came back, so one partially-rendered page permanently truncated years of
+    history — silently, per ticker, on every run.
+    """
+    seed = pd.DataFrame([
+        _row("AAPL", "2024-12-01", "2025-01-30"),
+        _row("AAPL", "2024-09-01", "2024-10-31"),
+    ])
+    eh.save_earnings_history(seed)
+
+    # Only the newest quarter comes back — the truncation signature.
     canned = {"AAPL": [_fake_zacks_rows("2025-12-01", "2026-01-29")]}
     fake = _FakeSession(canned)
     with patch.object(eh, "ZacksSession", return_value=fake), \
@@ -1640,8 +1751,12 @@ def test_bulk_fill_replaces_existing_ticker_rows(tmp_parquets):
 
     df = eh.load_earnings_history()
     aapl = df.loc[df["ticker"] == "AAPL"]
-    assert len(aapl) == 1  # old rows replaced, not appended
-    assert aapl.iloc[0]["period_ending"] == pd.Timestamp("2025-12-01")
+    periods = set(aapl["period_ending"])
+    assert periods == {
+        pd.Timestamp("2024-09-01"),
+        pd.Timestamp("2024-12-01"),
+        pd.Timestamp("2025-12-01"),
+    }, "the short response deleted history it never covered"
 
 
 def test_targeted_fill_iterates_only_provided_tickers(tmp_parquets):

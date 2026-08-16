@@ -51,6 +51,10 @@ def _dates(**overrides):
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
+    # Audit 2026-08-16 (F17/F4): DATA_DIR too — the per-source date
+    # store resolves against it at call time, and without this the
+    # reconciler under test reads the developer's real one.
+    monkeypatch.setattr(ec.config, "DATA_DIR", tmp_path)
     monkeypatch.setattr(ec.config, "EARNINGS_PARQUET",
                         tmp_path / "earnings_dates.parquet")
 

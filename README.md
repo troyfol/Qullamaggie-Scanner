@@ -41,6 +41,10 @@ features at a live order-entry platform.
   qualifying window.
 - **Watchlist diffing**, an in-app scan scheduler, Quick Export, and a
   TradeStation bridge plus a per-row HOTKEY sender.
+- **Store integrity as a first-class concern** (v6.0.0): responses can only
+  supersede the range they cover, reported values merge across sources with
+  per-column provenance, interior OHLCV gaps are detected and repaired, and
+  every atomic write is `fsync`'d.
 - **Local-first**: everything lives in `scanner_data/` beside the executable.
   No account, no telemetry, no cloud dependency.
 
@@ -528,7 +532,7 @@ log line when non-empty, silent when clean. Tests in
 
 ## Module-by-module map
 
-Line counts and entry points as of 2026-08-13 (v5.5.0).
+Line counts and entry points as of 2026-08-16 (v6.0.0).
 The package is **110 Python files** including tests (23 top-level
 modules, 12 `gui/` modules, 1 `tools/` helper, 74 files under `tests/`).
 
@@ -736,7 +740,13 @@ estimated_rev      float64
 reported_rev       float64
 surprise_rev       float64
 surprise_rev_pct   float64
-source             string           "finviz" | "zacks" | "finnhub"
+source             string           "finviz" | "zacks" | "finnhub" — the
+                                    row's WINNING source (which source's row
+                                    survived the per-slot dedup), and still
+                                    the (ticker, source) flush key. Since
+                                    v6.0.0 this no longer tells you where the
+                                    row's numbers came from — see eps_source
+                                    / rev_source below.
 updated_at         datetime64[ns]
 report_date_proxy  bool             True if report_date is a period_ending
                                     stand-in (Finnhub free tier sometimes
@@ -749,7 +759,41 @@ yoy_eps_pct        float64          Year-over-year EPS % growth — computed
                                     missing or prior reported_eps == 0.
 yoy_rev_pct        float64          Year-over-year revenue % growth — same
                                     derivation rules as yoy_eps_pct.
+eps_source         category         v6.0.0. Origin of reported_eps. NA when
+                                    the row has no reported EPS.
+rev_source         category         v6.0.0. Origin of reported_rev. NA when
+                                    the row has no reported revenue.
 ```
+
+**Reported actuals mix across sources (v6.0.0).** `reported_eps` and
+`reported_rev` are each taken from the highest-priority row in the slot that
+actually has one, independently of each other. All three sources quote the same
+adjusted / non-GAAP basis, so a quarter may legitimately carry a zacks EPS
+alongside a finnhub revenue. `eps_source` / `rev_source` record which, because
+`source` alone can no longer answer it.
+
+Before v6.0.0 the losing source's row was simply deleted at save time, so
+revenue a lower-priority source held for a quarter the winner lacked was
+discarded. The merge happens at the canonical write, which is the only moment
+those rows still exist.
+
+**Estimate-derived columns are finviz-only (v6.0.0).** `estimated_eps`,
+`surprise_eps`, `surprise_eps_pct`, `estimated_rev`, `surprise_rev` and
+`surprise_rev_pct` are nulled on every non-finviz row before write. The estimate
+and its surprise are one provider's opinion and are inextricably paired
+(`surprise = actual − estimate`, and the percentage divides by that same
+estimate), so mixing providers across the pair would state a relationship
+nobody computed. The other sources still supply these figures — they remain in
+the `earnings_raw/` audit layer and are still compared by the cross-source
+disagreement report — they just never reach the consumer parquet.
+
+**Revenue-only quarters are kept (v6.0.0).** A row needs at least one *actual*
+(EPS **or** revenue) to be written, not an EPS specifically. Zacks' sales table
+runs deeper than its EPS table, and that revenue was previously fetched and
+discarded. The property that keeps this safe is that
+`find_smart_refresh_candidates` still keys coverage on `reported_eps`, so a
+revenue-only row is not counted as a captured quarter and cannot suppress the
+gap fill that would complete it.
 
 Sort on save: `(ticker ASC, period_ending DESC)`. Cadence-gap detection in `compute_consecutive_beats` uses `period_ending` (NOT `report_date`) — see §[Editing mathematical assumptions](#editing-mathematical-assumptions-of-existing-filters) for the rationale.
 
@@ -772,6 +816,13 @@ beats block agreeing with the single-quarter pick).
 **YoY columns** are derived locally — NOT pulled from any source — by `earnings_history.compute_yoy_columns(df)`. The helper runs at the end of every fill (`_finalize_fill` in the Zacks path; `fill_framework.finalize_fill` for Finviz/Finnhub), refreshing the entire parquet so newly-arrived prior-year rows back-fill their current-year counterparts' YoY values. Formula: `(cur - prior) / |prior| * 100`, applied to `reported_eps` and `reported_rev` independently. The `|prior|` denominator handles negative-prior cases correctly (negative-to-positive transition produces a positive YoY%, matching the "improvement" intent).
 
 **External readers**: this is an additive schema change. Existing readers that select specific columns (`pd.read_parquet(path, columns=[...])`) are unaffected. Readers that read the whole file (`pd.read_parquet(path)`) will see two new float64 columns at the end. The pre-YoY column order is unchanged.
+
+**External readers, v6.0.0**: `eps_source` / `rev_source` are likewise appended
+at the END of the column list, so every pre-existing column keeps its position.
+The change that *does* affect readers is a value one, not a schema one — a
+surprise or estimate read from a zacks- or finnhub-sourced row is now NaN.
+Anything that needs every source's estimate figures should read the
+`earnings_raw/` layer, which still preserves them verbatim.
 
 ### Per-ticker OHLCV parquet (data_engine.py)
 
@@ -2076,10 +2127,13 @@ never touched by a rebuild.
 | `universe.csv` | CSV | NASDAQ FTP + GitHub + SEC | Ticker universe with metadata |
 | `sector_map.parquet` | DataFrame | Finnhub `/stock/profile2` (with FinanceDatabase + yfinance fallback) | ticker → (sector, sector_etf); 56-key SECTOR_ETF_MAP routes Finnhub sub-industries to SPDR ETFs |
 | `earnings_dates.parquet` | DataFrame | Reconcile output (`nasdaq > yahoo > finviz > zacks > finnhub` priority chain) | last/next earnings dates per ticker (1:1 with ticker). Carries `last_source` / `next_source` — the IMMUTABLE per-position origins — alongside the compound, rewritten `source` label (v5.4.0) |
-| `earnings_history.parquet` | DataFrame | Finviz scrape + Zacks scraper + Finnhub `/stock/earnings` | Per-quarter EPS / revenue history (`EARNINGS_HISTORY_YEARS`, default 10); per-slot priority dedup (finviz > zacks > finnhub) |
-| `earnings_raw/{source}/<run_id>.parquet` | DataFrame | Each fill's raw response | Append-only audit/replay layer; pruned at startup per source — 30 d for the bulky finviz/zacks captures, 365 d for the small nasdaq/yahoo/finnhub calendar files (`RAW_RETENTION_DAYS` / `RAW_RETENTION_DAYS_BY_SOURCE`). Four destructive operations cite this layer as their recovery path, which a flat 30 d against a ten-year store did not deliver |
+| `earnings_dates_by_source.parquet` | DataFrame | `nasdaq_fill`, `yahoo_fill`, finviz's forward-date flush | **v6.0.0.** Each date source's own observation, keyed `(ticker, source)`. Before it, all three wrote into the single row above, so the last fill to run won and the priority chain never applied to the date-backed sources. The reconciler reads this and still writes the 1:1 consumer file, so readers are unaffected |
+| `earnings_history.parquet` | DataFrame | Finviz scrape + Zacks scraper + Finnhub `/stock/earnings` | Per-quarter EPS / revenue history (`EARNINGS_HISTORY_YEARS`, default 10); per-slot priority dedup (finviz > zacks > finnhub), with reported actuals merged across sources and estimate/surprise figures finviz-only (v6.0.0) |
+| `earnings_raw/{source}/<run_id>.parquet` | DataFrame | Each fill's raw response | Append-only audit/replay layer. **v6.0.0:** 365 d for every source (`RAW_RETENTION_DAYS`) plus a keep-newest-N floor (`RAW_MIN_RUNS_KEPT`, 5) that survives any quiet stretch. finviz/zacks were on 30 d, which is where the truncation guard falls back — and an age-only rule empties the directory exactly when the store has sat untouched |
 | `earnings_disagreements.csv` | CSV | `report_cross_source_disagreements` (rewritten at every canonical history save) | Report-only cross-source EPS disagreement findings; always reflects the latest save |
-| `.finviz_bulk_checkpoint.json` / `.finnhub_bulk_checkpoint.json` | JSON | `fill_framework` | Resumable bulk-fill progress; cleared only on natural completion (preserved on stop / block-halt / spike-halt) |
+| `ohlcv_anomalies.csv` | CSV | `data_engine.write_anomaly_report` (end of every OHLCV update) | **v6.0.0.** One row per (ticker, anomaly) from `validate_ticker` — zero/negative prices, OHLC-bound violations, duplicate dates, price jumps, date gaps. Previously computed, logged at INFO and discarded. A run that flags nothing leaves the file alone rather than erasing a full sweep's findings |
+| `.finviz_bulk_checkpoint.json` / `.finnhub_bulk_checkpoint.json` / `.zacks_bulk_checkpoint.json` | JSON | `fill_framework` | Resumable bulk-fill progress; cleared only on natural completion (preserved on stop / block-halt / spike-halt). **The zacks one is v6.0.0** — that fill had no resume at all, so a killed bulk restarted ~6.5 h of work |
+| `.ohlcv_gap_attempts.json` | JSON | `data_engine.record_gap_attempts` | **v6.0.0.** Ledger of interior-gap repair attempts, so a hole that survives a rebuild (a real trading halt, or bars the provider lacks) isn't rebuilt again for `OHLCV_GAP_RECHECK_DAYS` (90) |
 | `.gap_fill_dedup_v1.done` | sentinel | `migrate_to_gap_fill_dedup` | One-time gap-fill dedup migration marker |
 | `.acl_hardened_v2.done` | sentinel | `harden_data_dir_acl` | ACL hardening marker. Bumped to v2 in v5.5.0 so installs that ran the broken v1 repair themselves |
 | `zacks_cookies.txt` | text | Firefox cookie capture | Imperva session tokens (DPAPI-encrypted at rest) |
@@ -2088,6 +2142,16 @@ never touched by a rebuild.
 | `zacks_blacklist.txt` | `TICKER<TAB>ADDED_ON<TAB>REASON` | Auto + user | Zacks-specific skip list (auto-added on FAIL_NOT_FOUND) |
 | `finnhub_blacklist.txt` | `TICKER<TAB>ADDED_ON<TAB>REASON` | Auto + user | Finnhub-specific skip list (auto-added on empty `/stock/earnings` response — typically ETFs) |
 | `finviz_blacklist.txt` | `TICKER<TAB>ADDED_ON<TAB>REASON` | Auto + user | Finviz-specific skip list (auto-added on definitive FAIL_EMPTY — uncovered tickers) |
+
+| `sec_contact.txt` | text | User (Settings → Set SEC Contact Email…) | Contact email SEC EDGAR requires in the request User-Agent for the universe download. Absent → SEC source skipped. Also settable via the `SEC_CONTACT_EMAIL` env var. |
+| `user_config.json` | JSON | Settings → Advanced… (`config.save_user_config`) | User overrides for `OHLCV_HISTORY_YEARS`, `EARNINGS_HISTORY_YEARS`, `REFERENCE_TICKERS`, `PREFETCH_OHLCV_AT_LAUNCH`. Clamped on load; corrupt file degrades to defaults. Gitignored with the rest of `scanner_data/` |
+| `presets/{name}.json` | JSON | User | Saved indicator + scan-window configs |
+| `scan_history.json` | JSON | `scan_history.py` (written on every scan completion) | F2 watchlist diffing: latest per-(preset-or-adhoc, period) ticker set + bounded rolling run summary (200 entries). Atomic writes; corrupt file degrades to "no prior run" |
+| `schedules.json` | JSON | `gui/scheduler.py` (Scans → Schedule… dialog + per-fire marker updates) | F3 scan scheduler entries ({label, preset, time, days, enabled} + last-fired date). Atomic writes; corrupt file degrades to "no schedules" |
+| `exports/scan_*.xlsx` | XLSX | Quick Export (Scans → Quick Export, or auto after a scheduled scan) | Timestamped no-dialog result snapshots — all periods, current visible columns. Dir created lazily |
+| `logs/*.log` | text | LogPanel | Per-session diagnostic logs (`scan_*`, `ohlcv_*`, `universe_*`, `bridge_*`). Rotated at `LOG_MAX_BYTES` (5 MB, 2 backups) and pruned past `LOG_RETENTION_DAYS` (30) at launch — nothing bounded these before v5.4.0 |
+| `failed_tickers.log` | text | `ticker_universe` | Tickers dropped during yfinance universe validation |
+| `ftp_raw/` | text | NASDAQ FTP (when SAVE_FTP_RAW=True) | Raw downloads for debugging |
 
 **Skip-list format (v5.4.0).** The three per-source lists carry `ADDED_ON` and
 `REASON` under a `#` header instead of bare ticker lines. Before this they held
@@ -2100,19 +2164,15 @@ auto-added more than `SKIP_RECHECK_DAYS` (90) ago, capped at
 next fill. Manual entries are never re-checked. The loader reads legacy
 bare-ticker files unchanged, so upgrading loses nothing.
 
+> A consequence worth knowing: because manual entries are never re-offered, a
+> list whose entries all carry `REASON=manual` is a permanent exclusion set. If
+> a list was bulk-stamped `manual` by an older build, re-stamping those rows to
+> `empty` is what puts them back in the re-check rotation.
+
 Relatedly, the universal `blacklist.txt` is no longer *unioned into* the finviz
 and finnhub lists. That merge was irreversible — removing a ticker from
 `blacklist.txt` left it skipped by those two sources permanently. It is now
 combined at read time only, matching what `zacks_blacklist.txt` always did.
-| `sec_contact.txt` | text | User (Settings → Set SEC Contact Email…) | Contact email SEC EDGAR requires in the request User-Agent for the universe download. Absent → SEC source skipped. Also settable via the `SEC_CONTACT_EMAIL` env var. |
-| `user_config.json` | JSON | Settings → Advanced… (`config.save_user_config`) | User overrides for `OHLCV_HISTORY_YEARS`, `EARNINGS_HISTORY_YEARS`, `REFERENCE_TICKERS`, `PREFETCH_OHLCV_AT_LAUNCH`. Clamped on load; corrupt file degrades to defaults. Gitignored with the rest of `scanner_data/` |
-| `presets/{name}.json` | JSON | User | Saved indicator + scan-window configs |
-| `scan_history.json` | JSON | `scan_history.py` (written on every scan completion) | F2 watchlist diffing: latest per-(preset-or-adhoc, period) ticker set + bounded rolling run summary (200 entries). Atomic writes; corrupt file degrades to "no prior run" |
-| `schedules.json` | JSON | `gui/scheduler.py` (Scans → Schedule… dialog + per-fire marker updates) | F3 scan scheduler entries ({label, preset, time, days, enabled} + last-fired date). Atomic writes; corrupt file degrades to "no schedules" |
-| `exports/scan_*.xlsx` | XLSX | Quick Export (Scans → Quick Export, or auto after a scheduled scan) | Timestamped no-dialog result snapshots — all periods, current visible columns. Dir created lazily |
-| `logs/*.log` | text | LogPanel | Per-session diagnostic logs (`scan_*`, `ohlcv_*`, `universe_*`, `bridge_*`). Rotated at `LOG_MAX_BYTES` (5 MB, 2 backups) and pruned past `LOG_RETENTION_DAYS` (30) at launch — nothing bounded these before v5.4.0 |
-| `failed_tickers.log` | text | `ticker_universe` | Tickers dropped during yfinance universe validation |
-| `ftp_raw/` | text | NASDAQ FTP (when SAVE_FTP_RAW=True) | Raw downloads for debugging |
 
 QSettings (registry-backed under `HKCU\Software\trade_scanner_fh\Trade_Scanner_FH\`) holds:
 - Cookie-browser monitor preference
@@ -2130,7 +2190,7 @@ data directory.
 
 ## Testing
 
-Test suite at `trade_scanner_fh/tests/` — **1,396 tests, all passing** as of 2026-08-13 (v5.5.0 added 30, v5.4.0 added 107 covering the audit remediation). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
+Test suite at `trade_scanner_fh/tests/` — **1,498 tests, all passing** as of 2026-08-16 (v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
 
 ```bash
 cd c:/python/EDA_Project/Trade_Scanner_FH
@@ -2400,6 +2460,99 @@ directories, and the previous `_internal/`.
 
 ## Changelog
 
+### v6.0.0 — data-integrity overhaul (2026-08-16)
+
+A full audit of the earnings and OHLCV stores, on the premise that they
+accumulate for years between resets and so **silent corruption is the
+highest-cost failure mode**. Seventeen findings; the major version reflects
+two behaviour changes external readers can see (see *External readers* under
+the [earnings_history schema](#earnings_historyparquet-schema-earnings_historypy)).
+
+**Silent data loss on the write path**
+
+- **A short-but-successful source response no longer truncates a ticker.** Both
+  flush paths dropped every `(ticker, source)` row and wrote whatever came
+  back, so a 200-OK response carrying fewer quarters than last time — a
+  partially-rendered page, a cached stub, a source trimming its own history —
+  permanently deleted the difference. Silent, per-ticker, and repeating every
+  run. Replaced with a span rule: **a response is authoritative over the range
+  it covers and only that range.** A full-span response still supersedes
+  everything, so a genuine restatement can still withdraw a quarter. Simulated
+  against a 215k-row store, this retained **19,200 rows** a single truncating
+  run would have deleted.
+- **A fill can only retract what it owns.** With reported values now merged
+  across sources, a row can sit on disk as `source=finviz` while holding zacks
+  revenue — and the next finviz fill superseded it by `source`, taking the
+  zacks value with it while the donor row had already been deleted. Foreign
+  values now ride across onto the incoming row.
+- **Re-sent OHLCV bars are rejected on a volume regression**, not just on
+  `Close`. The refetch overlap exists so final bars replace provisional ones,
+  but the guard deciding that compared `Close` alone — while volume was the
+  field actually wrong on 60/60 sampled tickers. Settled volume is revised up,
+  never down, so a material drop means the incoming bar is the less-final one.
+- **Numeric columns can't drift to `object`.** A finnhub-only batch has no
+  revenue at all, so the column arrived as object-dtype `None`s and dragged the
+  float column with it on concat. This is the drift `verify_integrity` check #6
+  was written to *report*; it is now fixed at the origin.
+
+**Cross-source merging (the reason for the major bump)**
+
+- **Reported actuals now mix across sources.** `reported_eps` and `reported_rev`
+  are taken independently from the highest-priority row that has one, with
+  `eps_source` / `rev_source` recording which. The merge mechanism existed but
+  was dead code: the canonical save deleted the losing rows before any reader
+  could inherit from them. On a real store that left **2,946 quarters showing an
+  EPS with no revenue, 1,069 of which had revenue in a row the dedup was about
+  to discard.**
+- **Estimates and surprises are finviz-only.** They are one provider's opinion
+  and inextricably paired, so the columns now mean the same thing on every row.
+  Other sources still supply them to the raw layer and the disagreement report.
+- **Revenue-only quarters are kept.** Zacks' sales table runs deeper than its
+  EPS table; that revenue was being fetched and discarded. Ingest now agrees
+  with `verify_integrity` check #14 instead of contradicting it.
+- **The Zacks EPS/revenue merge keys on `period_ending`, not `report_date`** —
+  the quarter's identity everywhere else in the codebase. Two quarters announced
+  on the same day (a catch-up filing after a delinquency) previously overwrote
+  each other.
+
+**Detection — the tools could not see any of the above**
+
+- **Interior OHLCV gaps are found and repaired.** Staleness was judged only by a
+  file's *last* bar, so a ticker with a current last bar was never re-fetched
+  however many sessions were missing from the middle — and an incremental update
+  could only ever repair the last few days. A footer-only sweep against a
+  reference ticker's sessions found **5,634 of 11,854 cached tickers holed**,
+  4,428 of them missing the same three sessions. Repair is bounded per run
+  (`OHLCV_GAP_MAX_REBUILDS_PER_RUN`) and ledger-guarded so an unfixable hole
+  isn't rebuilt every launch.
+- **`verify_integrity` gained a missing-quarter check** (#15) over a recent
+  window — the detector for the truncation above.
+- **`validate_ticker` findings are persisted** to `ohlcv_anomalies.csv` instead
+  of being logged at INFO and discarded.
+- **A parquet schema-version mismatch now prompts** instead of writing one line
+  to a log file. An *older* cache offers continue / re-stamp / exit; a *newer*
+  one — written by a build this one may not understand — defaults to exit.
+
+**Universe, durability, resume**
+
+- **`universe.csv` can no longer be silently truncated.** The prior-universe
+  read no longer swallows errors (which flipped the refresh into full
+  re-validation), an empty validation response now reaches the per-ticker
+  fallback (it was keyed on exceptions, so the most likely failure mode never
+  triggered it), and a shrink floor keeps the previous file.
+- **Earnings dates are stored per source**, so the documented priority chain
+  applies instead of being decided by whichever fill ran last.
+- **Atomic writes `fsync` before the rename.** The previous form survived a
+  process crash but not a power loss, where the rename can land before the data
+  and leave an empty file under the real filename.
+- **The Zacks bulk fill resumes from a checkpoint** — it was the only fill
+  without one, so a kill restarted ~6.5 hours of work.
+- **Orphaned atomic-write temps are reaped**, and history backups are spaced by
+  *time* rather than by write, so three slots span three days instead of three
+  saves in one session.
+
+**Test suite:** 1,399 → **1,498**.
+
 ### v5.5.0 — packaging, OHLCV correctness, ACL repair (2026-08-13)
 
 **Launch time.** The build moved from `--onefile` to `--onedir`. The old
@@ -2646,6 +2799,17 @@ These are properties the codebase depends on. Breaking any one is a regression w
 53. **`validate_ticker` checks price sanity, not just statistics.** Non-positive prices are always a defect; OHLC bound violations are compared against `config.OHLC_INVARIANT_TOL_PCT` (0.1%) because the provider's adjusted prices are rounded. Do NOT tighten the bound check to an exact comparison — it fires on ~21% of the store and buries the real defects.
 54. **ACL hardening must never leave a file with an empty DACL.** `icacls /inheritance:r` applied to a FILE with `(OI)(CI)` grants produces no valid ACE, and an empty DACL denies everyone including the owner. Harden the directory alone, then `/reset` the children so they inherit. `tests/test_acl_hardening.py` runs the real `icacls` — a mock reproduces the bug happily.
 55. **A release archive never contains `scanner_data/`.** It holds cookies, the SEC contact email, presets, scan history, and the local data stores. A fresh unzip is exactly `Trade_Scanner_FH.exe` + `_internal/`.
+
+### 2026-08 additions (v6.0.0)
+
+56. **A source response may only supersede the span it covers.** Stored rows older than the response's oldest `period_ending` are retained; everything from that quarter forward is replaced. This single rule is what lets a *full* response still withdraw a restated quarter while a *short* one cannot delete history it never mentioned — which is why a plain merge-by-key would be wrong. Do not "simplify" it back to replace-by-`(ticker, source)`.
+57. **A fill may only retract what it owns.** Because reported values now merge across sources, a row can carry another source's value while its own `source` says otherwise. When a superseded row holds a value whose `*_source` names a different source and the incoming response has none of its own, the value rides across. Without this, every merged value erodes on the winning source's next refresh.
+58. **Sources mix per column for reported actuals, never for the estimate cluster.** `estimated_*` and `surprise_*` come from `ESTIMATE_SOURCE` (finviz) alone, because the surprise is derived from that same estimate and actual — mixing providers across the pair asserts a relationship nobody computed. `eps_source` / `rev_source` exist because `source` can no longer answer "where did this number come from".
+59. **Ingest requires an ACTUAL, not an EPS specifically.** A revenue-only quarter is real reported data; a scheduled-but-unreported quarter has neither figure and is still rejected. The property that keeps this safe is that `find_smart_refresh_candidates` keys coverage on `reported_eps`, so a revenue-only row is never counted as captured and cannot suppress its own completion. Finviz forward rows are excluded on the **announcement date**, not as a side effect of requiring an EPS.
+60. **The session calendar comes from a cached reference ticker, never from `_NYSE_HOLIDAYS`.** That table starts at 2024 while OHLCV history reaches much further back, so a calendar-derived expectation reports ~10 phantom gaps per pre-2024 year. `config.OHLCV_GAP_REFERENCE_TICKER` must stay a liquid name that is always cached (it is a `REFERENCE_TICKERS` member).
+61. **Gap repair is bounded and remembers its attempts.** Unbounded, the first sweep of a holed cache queues thousands of full re-downloads at provider pacing. And a hole that survives a rebuild is source-level — a real halt, or bars the provider lacks — so it must not be retried every launch.
+62. **A report that finds nothing leaves its file alone.** Applies to `ohlcv_anomalies.csv` exactly as it does to `earnings_disagreements.csv`: rewriting unconditionally lets a two-ticker run erase a full sweep's findings.
+63. **Every `DATA_DIR`-derived path used by a test must be redirected by the fixture.** Module-level `Path` constants bake the real `scanner_data/` at import, so patching `DATA_DIR` alone is not enough — tests wrote into the live tree twice during this audit. Prefer a call-time helper (`config.earnings_source_parquet()`) over a new module constant.
 
 ---
 

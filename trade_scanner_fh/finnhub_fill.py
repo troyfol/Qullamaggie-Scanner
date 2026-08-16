@@ -128,7 +128,14 @@ def _record_to_history_dict(
     # row cannot satisfy any of the earnings filters, and its presence is
     # actively harmful to refresh selection. The raw audit layer keeps the
     # original response either way.
-    if record.get("actual") is None:
+    #
+    # Audit 2026-08-16: relaxed from "must have an EPS" to "must have at least
+    # one ACTUAL". A quarter with revenue but no EPS is real reported data, not
+    # a placeholder — and the property that made INT-7 safe is unchanged, since
+    # `find_smart_refresh_candidates` still keys coverage on `reported_eps` and
+    # therefore will not treat a revenue-only row as a captured quarter. A
+    # scheduled-but-unreported quarter has neither figure and is still rejected.
+    if record.get("actual") is None and record.get("revenueActual") is None:
         return None
 
     # Normalize period_ending to day-1 of its month (Zacks convention).
@@ -617,7 +624,11 @@ def spot_fill_finnhub(
 
     run_id = earnings_raw.new_run_id()
     pending = {sym: result.rows}
-    _flush_pending_to_disk(pending, is_final=True)
+    # Audit 2026-08-16 (F9): `is_final=True` here was redundant — _finalize_fill
+    # below already performs the canonical (sorted + deduped) save. Passing it
+    # made a ONE-TICKER lookup rewrite the whole ~12 MB store twice and rotate
+    # the rolling backup set twice.
+    _flush_pending_to_disk(pending)
     if result.raw_records:
         try:
             earnings_raw.append_finnhub_rows(result.raw_records, run_id)

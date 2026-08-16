@@ -112,15 +112,21 @@ RAW_SOURCES = (
 # audit time the oldest surviving file was 4 weeks old, earnings_raw/yahoo/
 # was empty and finnhub/ held one file.
 #
-# The bulky sources keep the short window; the small ones (a nasdaq or yahoo
-# calendar sweep is a few KB) get a year, which costs almost nothing and makes
-# the recovery claim real for them.
-RAW_RETENTION_DAYS = 30
-RAW_RETENTION_DAYS_BY_SOURCE: dict = {
-    "nasdaq": 365,
-    "yahoo": 365,
-    "finnhub": 365,   # one calendar file per sweep — tiny
-}
+# Audit 2026-08-16 (F10): the 2026-08-12 pass raised only the SMALL sources to
+# a year and left finviz + zacks — which carry essentially all of the
+# per-quarter history — on 30 days. Those two are the ones F1's truncation
+# guard falls back on, so the short window undercut the recovery claim exactly
+# where it mattered. All sources now get a year.
+RAW_RETENTION_DAYS = 365
+RAW_RETENTION_DAYS_BY_SOURCE: dict = {}
+
+# Newest N run files per source that are kept REGARDLESS of age. Age alone is
+# not a recovery guarantee: after a quiet stretch longer than the retention
+# window the prune empties the directory, and the layer is at its least useful
+# precisely when the store has been sitting untouched. Measured 2026-08-15, the
+# live layer held 3 days of finviz captures against a 215k-row store, so the
+# floor is what actually makes "the raw layer is the recovery path" true.
+RAW_MIN_RUNS_KEPT = 5
 
 
 # v1 left every pre-existing FILE with an empty DACL — see harden_data_dir_acl.
@@ -266,6 +272,55 @@ def ensure_dirs() -> None:
     # Audit 2026-08-12 (INT-14): bound the log population. Cheap (an mtime
     # walk) and self-suppressing once the directory is inside the window.
     prune_old_logs()
+    # Audit 2026-08-16 (F8): reap atomic-write temps orphaned by a hard kill.
+    prune_stale_temp_files()
+
+
+# -- Orphaned atomic-write temp files (audit 2026-08-16, F8) ---------------
+# The three atomic writers unlink their temp on an EXCEPTION, but a hard kill
+# leaves it behind and nothing ever swept for them. Observed on the live tree:
+# `.earnings_dates.parquet.3696.<uuid>.tmp`, 57,731 bytes, orphaned two days
+# and LARGER than the 55,138-byte file it was going to become. This will keep
+# happening because the documented rebuild procedure requires closing the
+# running exe — i.e. killing a process that may be mid-write.
+#
+# The pattern is deliberately exact (`.<name>.<pid>.<32-hex-uuid>.tmp`, see
+# _unique_tmp_path) so this can only ever match a temp WE created — never a
+# user file, and never anything inside firefox_zacks_profile/.
+_TEMP_FILE_RE = re.compile(r"^\..+\.\d+\.[0-9a-f]{32}\.tmp$")
+
+# Grace period before a temp is considered orphaned. Comfortably longer than
+# any single write, so a temp belonging to a concurrently-running writer (or
+# to a second instance) is never removed out from under it.
+TEMP_FILE_MAX_AGE_HOURS = 24
+
+
+def prune_stale_temp_files(max_age_hours: Optional[float] = None) -> int:
+    """Delete orphaned atomic-write temp files under DATA_DIR. Returns the
+    count removed.
+
+    Called from ``ensure_dirs`` so it runs once per launch. Never raises — a
+    housekeeping failure must not stop the app from starting.
+    """
+    hours = (max_age_hours if max_age_hours is not None
+             else TEMP_FILE_MAX_AGE_HOURS)
+    if not DATA_DIR.exists():
+        return 0
+    cutoff = (datetime.now() - timedelta(hours=hours)).timestamp()
+    removed = 0
+    try:
+        for f in DATA_DIR.rglob(".*.tmp"):
+            try:
+                if not _TEMP_FILE_RE.match(f.name):
+                    continue
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    removed += 1
+            except OSError:
+                continue      # in use, or vanished under us
+    except OSError:
+        return removed
+    return removed
 
 
 # -- Atomic file helpers ----------------------------------------------------
@@ -280,6 +335,31 @@ def _unique_tmp_path(path: Path) -> Path:
     just a lost update). Lives beside the target so the rename stays on the
     same volume (atomic on Windows)."""
     return path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+
+
+def _flush_to_disk(fh) -> None:
+    """Force an open file's bytes out of the OS cache before the rename.
+
+    Audit 2026-08-16 (F7). All three atomic writers were write-temp-then-rename
+    with NO fsync, and their docstrings claimed "a crash mid-write cannot
+    corrupt the target file". That holds for a PROCESS crash — the OS still
+    owns the written pages and flushes them — but not for a power loss or a
+    BSOD, where NTFS can make the rename durable before the data pages. The
+    result is a zero-length or partially-populated file sitting under the REAL
+    filename, which is strictly worse than the pre-atomic behaviour: the `.tmp`
+    name no longer marks it as suspect.
+
+    Directory fsync is deliberately not attempted — it isn't available on
+    Windows, and the file-level flush is the part that closes this window.
+    """
+    try:
+        fh.flush()
+        os.fsync(fh.fileno())
+    except (OSError, ValueError, AttributeError):
+        # A filesystem that can't fsync (some network shares) must not turn a
+        # successful write into a failed one — we're strictly better off than
+        # before either way.
+        pass
 
 
 def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
@@ -299,7 +379,9 @@ def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None
     tmp = _unique_tmp_path(path)
     tmp.parent.mkdir(parents=True, exist_ok=True)
     try:
-        tmp.write_text(content, encoding=encoding)
+        with open(tmp, "w", encoding=encoding, newline="") as fh:
+            fh.write(content)
+            _flush_to_disk(fh)          # F7 — durable before the rename
         tmp.replace(path)
     except BaseException:
         try:
@@ -315,11 +397,14 @@ def atomic_write_parquet(df, path: Path, **kwargs) -> None:
     Readers always see either the old complete file or the new complete file,
     never a torn write — even when two threads write the same target at once
     (the temp name is per-writer). The temp is removed if the write fails so a
-    failed write leaves no residue."""
+    failed write leaves no residue, and the bytes are fsync'd before the rename
+    so a power loss can't promote an empty file (F7)."""
     tmp = _unique_tmp_path(path)
     tmp.parent.mkdir(parents=True, exist_ok=True)
     try:
-        df.to_parquet(tmp, **kwargs)
+        with open(tmp, "wb") as fh:
+            df.to_parquet(fh, **kwargs)
+            _flush_to_disk(fh)
         tmp.replace(path)
     except BaseException:
         try:
@@ -335,7 +420,13 @@ def atomic_write_csv(df, path: Path, **kwargs) -> None:
     tmp = _unique_tmp_path(path)
     tmp.parent.mkdir(parents=True, exist_ok=True)
     try:
-        df.to_csv(tmp, **kwargs)
+        # newline="" so pandas owns the line terminator — writing through a
+        # text handle in text mode would otherwise translate "\n" to "\r\n"
+        # again on Windows and produce blank lines between rows.
+        with open(tmp, "w", encoding=kwargs.pop("encoding", "utf-8"),
+                  newline="") as fh:
+            df.to_csv(fh, **kwargs)
+            _flush_to_disk(fh)
         tmp.replace(path)
     except BaseException:
         try:
@@ -575,8 +666,91 @@ OHLC_INVARIANT_TOL_PCT = 0.1
 # never-look-back behaviour, which was the bug.
 OHLCV_REFETCH_OVERLAP_DAYS = 5
 
+# How far BELOW the cached value a re-sent bar's Volume may fall before the
+# bar is rejected in favour of the cache (audit 2026-08-16, F5).
+#
+# The overlap above exists so FINAL bars replace PROVISIONAL ones, but the
+# guard that decides whether a re-sent bar may overwrite a cached one compared
+# `Close` and nothing else — while the field actually measured wrong was
+# Volume (60/60 sampled tickers, median 1.2% short, p90 22.6%), with High and
+# Low wrong on roughly half. A bar whose Close matches to the cent but whose
+# Volume is a fraction of the true figure is exactly the provisional signature,
+# and it sailed through.
+#
+# Direction is what makes this safe: settled daily volume is revised UP as late
+# prints clear, essentially never down. So a HIGHER incoming Volume is the
+# correction we want and is always adopted; a materially LOWER one means the
+# incoming bar is the less-final of the two and the whole bar is rejected —
+# which protects that bar's High/Low too, since a provisional bar is wrong in
+# all three fields at once. 10% sits above the p90 provisional shortfall while
+# staying far below any plausible legitimate downward revision.
+#
+# Split re-adjustments also rescale Volume, but those take the full-history
+# re-download path (last_date is reset to None), so they never reach this guard.
+OHLCV_VOLUME_REGRESSION_PCT = 10.0
+
+# -- OHLCV interior gap detection (audit 2026-08-16, F2) -------------------
+# Staleness was judged ONLY by a file's last bar, so a ticker whose most recent
+# bar is current was never re-fetched no matter what its interior looked like —
+# and `download_one`'s incremental window starts at `last_date - overlap`, so
+# even when it did run it could only repair the last few days.
+#
+# Measured 2026-08-15 against SPY's own session index: 261 of 581 sampled
+# tickers (44.9%) were missing sessions strictly INSIDE their own date range,
+# and all 261 had a current last bar. The missing dates were not scattered —
+# essentially every affected ticker was missing the same three sessions
+# (2026-07-21, 2026-07-22, 2026-07-31), which is one upstream partial response
+# written as complete and then cemented.
+OHLCV_GAP_CHECK_ENABLED = True
+# The session calendar is taken from a ticker already in the cache rather than
+# a holiday table: `_NYSE_HOLIDAYS` only starts at 2024 while OHLCV history can
+# reach 25 years back, so a calendar-derived expectation would report ~10 false
+# gaps per pre-2024 year. SPY is a REFERENCE_TICKER, so it is always cached and
+# always refreshed.
+OHLCV_GAP_REFERENCE_TICKER = "SPY"
+# Ceiling on how many gapped tickers ONE run repairs. Unbounded, the first run
+# after this ships would queue ~5,300 full re-pulls (45% of 11,854) at yfinance
+# pacing — many hours, and not what a launch should silently start. Mirrors
+# SECTOR_STALE_MAX_PER_RUN: worst-first, amortised across sessions.
+OHLCV_GAP_MAX_REBUILDS_PER_RUN = 200
+# A ticker whose gaps SURVIVE a full rebuild has a source-level hole (a real
+# trading halt, or bars the provider genuinely lacks). Re-attempting it every
+# launch would churn forever, so an attempt is recorded and not repeated inside
+# this window. Same shape as SKIP_RECHECK_DAYS.
+OHLCV_GAP_RECHECK_DAYS = 90
+OHLCV_GAP_ATTEMPTS_FILE = ".ohlcv_gap_attempts.json"
+
+# -- OHLCV anomaly report (audit 2026-08-16, F12) --------------------------
+# `validate_ticker` is the only OHLCV integrity check in the project — negative
+# and zero prices, OHLC bound violations, duplicate dates, price jumps, date
+# gaps — and its output was logged at INFO and discarded. Nothing reached the
+# GUI, nothing was persisted, nothing could be trended. Written beside
+# earnings_disagreements.csv, which is the same pattern already working.
+# Name only; resolved against DATA_DIR at call time so test fixtures redirect it.
+OHLCV_ANOMALIES_CSV_NAME = "ohlcv_anomalies.csv"
+
+# -- Earnings quarter-gap detection (audit 2026-08-16, F6) -----------------
+# `verify_integrity` had 14 checks and none asked whether a ticker's quarters
+# are CONTIGUOUS, so the F1 truncation could run for months without leaving a
+# visible trace. Restricted to a recent window because legitimate gaps (IPOs,
+# companies going dark and returning, fiscal-year changes, and the 25-year cap
+# leaving one very old quarter followed by nothing) dominate the deep history:
+# 2,700 gap events across 1,262 of 4,858 tickers store-wide, largely benign.
+EARNINGS_GAP_CHECK_YEARS = 3
+
 # -- Universe staleness (days) ---------------------------------------------
 UNIVERSE_STALE_DAYS = 7
+# Refuse to write a universe.csv that shrank by more than this percentage
+# against the previous one (audit 2026-08-16, F3).
+#
+# universe.csv feeds EVERY scan and every fill's work list, and validation
+# failures are destructive — a symbol that fails is dropped from the file. The
+# codebase already applies this kind of sanity cap to a third-party dataset
+# (FINANCEDATABASE_MAX_ROWS refuses an absurd response); the universe, which
+# matters considerably more, had none. Real churn between refreshes is a few
+# percent — delistings and new listings — so 25% is far above any legitimate
+# move while still catching a throttled validation pass.
+UNIVERSE_MAX_SHRINK_PCT = 25.0
 
 # -- Reference / Benchmark Tickers ----------------------------------------
 # Always kept in OHLCV cache; used for RS calculations, never in scan results.
@@ -600,6 +774,25 @@ REFERENCE_TICKERS = [
 # -- Sector mapping --------------------------------------------------------
 SECTOR_MAP_PARQUET = DATA_DIR / "sector_map.parquet"
 EARNINGS_PARQUET = DATA_DIR / "earnings_dates.parquet"
+# Per-source date observations, keyed (ticker, source) — audit 2026-08-16, F4.
+# `earnings_dates.parquet` holds one row per ticker, so nasdaq / yahoo /
+# finviz's forward date all wrote into the SAME row and whichever fill ran last
+# won. The reconciler could only read that collapsed row back, so its documented
+# priority chain never applied to the date-backed sources. This store keeps each
+# source's observation separate; the reconciler still writes the one-row-per-
+# ticker consumer file above, so no reader changes.
+#
+# Deliberately a FUNCTION, not a module constant. F17 in this same audit found
+# that 7 of the 13 import-time DATA_DIR-derived constants weren't redirected by
+# the test fixtures, so tests wrote into the user's live tree — and adding this
+# one as a constant reproduced that within the hour. Resolving at call time
+# means patching DATA_DIR alone is sufficient, which every fixture already does.
+EARNINGS_SOURCE_FILENAME = "earnings_dates_by_source.parquet"
+
+
+def earnings_source_parquet() -> Path:
+    """Path to the per-source earnings-date store (resolved at call time)."""
+    return DATA_DIR / EARNINGS_SOURCE_FILENAME
 # Zacks-fork addition — per-quarter earnings history (EPS + revenue +
 # surprises). The legacy EARNINGS_PARQUET above keeps storing just
 # last/next earnings dates and continues to drive the Days Since /
@@ -646,6 +839,21 @@ YOY_SANITY_MAX_PCT = 10_000.0
 # snapshots of an ~8 MB file costs ~25 MB and covers the realistic window
 # (notice a problem within a few fills).
 HISTORY_BACKUP_COUNT = 3
+# Minimum age of the newest snapshot before another rotation is allowed.
+#
+# Audit 2026-08-16 (F9): the depth above is spaced by WRITE, not by time, and
+# canonical saves are far more frequent than "a few fills" assumed — the
+# launch-time smart refresh finalizes three sources, each of the four launch
+# migrations that finds work saves canonically, and (before this pass) every
+# single-ticker spot fill did too. One launch could therefore consume the whole
+# backup depth, leaving three snapshots of the same afternoon. Measured
+# 2026-08-15: autobak1/2/3 were 11.94 / 11.92 / 11.98 MB, all from one session.
+#
+# Skipping a rotation is safe by construction: it leaves the EXISTING snapshot
+# in place, and an older snapshot is strictly more useful for recovery than a
+# fresh one taken after the damage. 12h keeps roughly one per launch-day, so
+# the three slots span three days instead of three writes.
+HISTORY_BACKUP_MIN_INTERVAL_HOURS = 12
 # Cross-source EPS disagreement flagging (report-only diagnostics).
 # When two sources both carry a row for the same (ticker, period_ending)
 # slot, dedupe_history silently keeps the priority winner
@@ -699,6 +907,12 @@ FINNHUB_BULK_CHECKPOINT = DATA_DIR / ".finnhub_bulk_checkpoint.json"
 # Tickers that return [] from /stock/earnings get added here and skipped
 # on subsequent runs. Universe-level blacklist is unioned in at run start.
 FINNHUB_BLACKLIST_FILE = DATA_DIR / "finnhub_blacklist.txt"
+
+# Zacks bulk-run checkpoint (audit 2026-08-16, S1). The zacks fill was the one
+# source with NO resume: a killed bulk restarted from zero, and at 1.5 s pacing
+# a universe run is ~6.5 hours. finviz and finnhub have had this since the
+# fill_framework extraction; zacks was left behind with the rest of its loop.
+ZACKS_BULK_CHECKPOINT = DATA_DIR / ".zacks_bulk_checkpoint.json"
 
 # -- Finviz earnings source (highest priority — adjusted/non-GAAP) --------
 # Added 2026-05-31 as the top-priority per-quarter earnings source

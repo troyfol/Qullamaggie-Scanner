@@ -39,7 +39,14 @@ def _redirect_data_dir_derived_paths(config, tmp_path, monkeypatch) -> None:
     Path constants were already baked from the REAL scanner_data/ when
     config was imported, so any fixture that swaps DATA_DIR must swap
     them too or a fill/raw-layer code path under test silently writes
-    into the user's real tree."""
+    into the user's real tree.
+
+    Audit 2026-08-16: this list was covering 6 of the 13 DATA_DIR-derived
+    constants. `check_schema_version()` in a Pass 2 test wrote a real
+    `_schema_version.txt` into the source tree's scanner_data/ohlcv/ —
+    exactly the leak the paragraph above warns about. Every remaining
+    constant is now redirected, so the trap is closed rather than
+    re-documented."""
     monkeypatch.setattr(config, "EARNINGS_HISTORY_PARQUET",
                         tmp_path / "earnings_history.parquet")
     monkeypatch.setattr(config, "EARNINGS_PARQUET",
@@ -48,6 +55,19 @@ def _redirect_data_dir_derived_paths(config, tmp_path, monkeypatch) -> None:
                         tmp_path / ".finviz_bulk_checkpoint.json")
     monkeypatch.setattr(config, "FINNHUB_BULK_CHECKPOINT",
                         tmp_path / ".finnhub_bulk_checkpoint.json")
+    monkeypatch.setattr(config, "ZACKS_BULK_CHECKPOINT",
+                        tmp_path / ".zacks_bulk_checkpoint.json")
+    monkeypatch.setattr(config, "PARQUET_SCHEMA_FILE",
+                        tmp_path / "ohlcv" / "_schema_version.txt")
+    monkeypatch.setattr(config, "FINVIZ_BLACKLIST_FILE",
+                        tmp_path / "finviz_blacklist.txt")
+    monkeypatch.setattr(config, "FINNHUB_BLACKLIST_FILE",
+                        tmp_path / "finnhub_blacklist.txt")
+    monkeypatch.setattr(config, "TICKER_CSV", tmp_path / "universe.csv")
+    monkeypatch.setattr(config, "FAILED_TICKERS_LOG",
+                        tmp_path / "failed_tickers.log")
+    monkeypatch.setattr(config, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(config, "FTP_RAW_DIR", tmp_path / "ftp_raw")
     raw_root = tmp_path / "earnings_raw"
     monkeypatch.setattr(config, "RAW_EARNINGS_DIR", raw_root)
     # Pre-create the per-source folders (mirrors config.ensure_dirs and

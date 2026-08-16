@@ -112,10 +112,24 @@ def _record_to_history_dict(
         return None
 
     eps_actual = _to_float(entry.get("epsActual"))
+    sales_actual = _to_float(entry.get("salesActual"))
     earnings_date = entry.get("earningsDate")
     fiscal_end = entry.get("fiscalEndDate")
-    # Past quarters only: must have an actual EPS and a real report date.
-    if eps_actual is None or not earnings_date or not fiscal_end:
+    # Past quarters only: must carry at least one ACTUAL, plus a real report
+    # date and fiscal period.
+    #
+    # Audit 2026-08-16: this required an EPS specifically, which discarded
+    # revenue-only quarters — real reported revenue the source had already
+    # handed us. INT-7's concern was PLACEHOLDER rows (a scheduled quarter with
+    # no data at all) claiming a slot and suppressing the gap fill that would
+    # replace them; a row carrying revenue is not that. The safety property
+    # still holds because `find_smart_refresh_candidates` keys coverage on
+    # `reported_eps` — a revenue-only row is not counted as "captured", so it
+    # cannot suppress its own repair. `verify_integrity` check #14 already
+    # requires BOTH EPS and revenue to be null before calling a row a
+    # placeholder, so ingest and integrity now agree instead of contradicting.
+    if (eps_actual is None and sales_actual is None) or not earnings_date \
+            or not fiscal_end:
         return None
 
     period_ts = pd.to_datetime(fiscal_end, errors="coerce")
@@ -132,6 +146,20 @@ def _record_to_history_dict(
     report_time = _report_time_from_hour(int(report_dt.hour))
     report_date = report_dt.normalize()
 
+    # PAST quarters only, tested on the date rather than inferred from which
+    # field happens to be populated.
+    #
+    # Audit 2026-08-16: forward analyst-estimate rows used to be excluded as a
+    # side effect of requiring `epsActual`. Now that a revenue-only row is a
+    # legitimate row, that side effect is gone — a forward entry carrying a
+    # `salesActual` would be written as though the quarter had reported. Test
+    # the announcement date instead, which is what "past quarter" actually
+    # means, and which also stops us manufacturing exactly the rows
+    # `verify_integrity` check #12 exists to flag (a future report_date on a
+    # row that already has an actual).
+    if report_date > pd.Timestamp(now).normalize():
+        return None
+
     eps_est = _to_float(entry.get("epsEstimate"))
     surprise_eps = None
     surprise_eps_pct = None
@@ -140,7 +168,6 @@ def _record_to_history_dict(
         if abs(eps_est) > 0:
             surprise_eps_pct = surprise_eps / abs(eps_est) * 100.0
 
-    sales_actual = _to_float(entry.get("salesActual"))
     sales_est = _to_float(entry.get("salesEstimate"))
     surprise_rev = None
     surprise_rev_pct = None
@@ -342,7 +369,7 @@ def _flush_next_dates_to_cache(
     } for t, d in next_pending.items()]
     try:
         existing = ec.load_earnings_cache()
-        ec._merge_and_save(rows, existing)
+        ec._merge_and_save(rows, existing, source="finviz")
         return True
     except Exception as exc:
         log.warning("Finviz next-date cache write failed: %s", exc)
@@ -557,7 +584,12 @@ def spot_fill_finviz(
         return 0, "no_rows_in_window"
 
     run_id = earnings_raw.new_run_id()
-    _flush_pending_to_disk({sym: result.rows}, is_final=True)
+    # Audit 2026-08-16 (F9): `is_final=True` here was redundant — _finalize_fill
+    # below already does the canonical (sorted + deduped) save. Passing it made
+    # a ONE-TICKER lookup rewrite and re-sort the whole ~12 MB store twice and
+    # rotate the rolling backup set twice, which is a large part of why three
+    # backup slots only ever spanned a single session.
+    _flush_pending_to_disk({sym: result.rows})
     if result.raw_records:
         try:
             earnings_raw.append_finviz_rows(result.raw_records, run_id)

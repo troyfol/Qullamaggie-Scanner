@@ -7641,6 +7641,77 @@ def prompt_finnhub_key_if_missing(parent=None) -> None:
         log.info("Finnhub API key stored.")
 
 
+def _prompt_schema_mismatch(status, stamped, expected, parent=None) -> bool:
+    """Put a parquet schema-version mismatch in front of the user.
+
+    Returns True to continue launching, False to abort.
+
+    Audit 2026-08-16 (F11): a mismatch previously wrote one WARNING into
+    scanner_data/logs/ — a file the user never opens — and the app went on to
+    read, merge and WRITE the cache regardless.
+
+    The two directions are deliberately NOT treated the same. An OLDER cache is
+    a migration question and continuing is usually right. A NEWER one means a
+    build from the future already wrote this cache: today's code may not
+    understand its columns, and writing to it is how the newer data gets lost.
+    So the newer case defaults to Exit and has to be overridden explicitly.
+    """
+    from ..data_engine import SCHEMA_NEWER, SCHEMA_OK, stamp_schema_version
+
+    if status == SCHEMA_OK:
+        return True
+
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setWindowTitle("Price Cache Schema Mismatch")
+    box.setTextFormat(Qt.TextFormat.PlainText)
+    newer = status == SCHEMA_NEWER
+    box.setText(
+        f"The cached price data in scanner_data/ohlcv/ is stamped schema "
+        f"v{stamped}, but this build expects v{expected}."
+    )
+    if newer:
+        box.setInformativeText(
+            "That cache was written by a NEWER build of the scanner.\n\n"
+            "This version may not understand its columns, and continuing "
+            "could overwrite data the newer build wrote. Exiting and running "
+            "the newer build is the safe choice.\n\n"
+            "Exit  —  leave the cache untouched (recommended)\n"
+            "Continue  —  use it anyway, accepting the risk"
+        )
+    else:
+        box.setInformativeText(
+            "That cache was written by an OLDER build. Some tickers may need "
+            "a rebuild before their data is correct.\n\n"
+            "Continue  —  use the cache as-is; rebuild tickers later from\n"
+            "                Tools if anything looks wrong (recommended)\n"
+            "Accept  —  re-stamp the cache as v%d and stop asking\n"
+            "Exit  —  leave everything untouched" % expected
+        )
+
+    cont = box.addButton("Continue", QMessageBox.ButtonRole.AcceptRole)
+    accept = (None if newer
+              else box.addButton("Accept and re-stamp",
+                                 QMessageBox.ButtonRole.ApplyRole))
+    exit_btn = box.addButton("Exit", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(exit_btn if newer else cont)
+    box.exec()
+
+    clicked = box.clickedButton()
+    if clicked is exit_btn:
+        log.warning("Schema mismatch (v%s vs v%s) — user chose to exit",
+                    stamped, expected)
+        return False
+    if accept is not None and clicked is accept:
+        stamp_schema_version()
+        log.warning("Schema mismatch (v%s vs v%s) — user re-stamped the cache "
+                    "as v%s", stamped, expected, expected)
+        return True
+    log.warning("Schema mismatch (v%s vs v%s) — user chose to continue",
+                stamped, expected)
+    return True
+
+
 def main():
     # Suppress DPI awareness warning on Windows multi-monitor setups
     import os
@@ -7691,9 +7762,12 @@ def main():
     except Exception as exc:
         _startup_log.warning("sector_etf re-map skipped: %s", exc)
 
-    # Phase 4 R18: stamp / verify the parquet cache schema version. Logs a
-    # warning if a future build inherits an older or newer cache.
-    check_schema_version()
+    # Phase 4 R18: stamp / verify the parquet cache schema version.
+    # Audit 2026-08-16 (F11): the verdict is now surfaced to the user rather
+    # than only written to a log file nobody reads — see
+    # `_prompt_schema_mismatch`, called after QApplication exists (a modal
+    # can't be shown from here).
+    _schema_status, _schema_stamped, _schema_expected = check_schema_version()
 
     # Prune raw earnings audit files older than the retention window so
     # they don't accumulate forever. Cheap (mtime-only walk); failures
@@ -7760,6 +7834,12 @@ def main():
 
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_STYLESHEET)
+
+    # Audit 2026-08-16 (F11): a schema mismatch used to log a WARNING and let
+    # the app carry on reading, merging and WRITING the cache. Ask instead.
+    if not _prompt_schema_mismatch(
+            _schema_status, _schema_stamped, _schema_expected):
+        return
 
     # First-launch only: ask for the Finnhub API key, then the Zacks
     # cookie string. Both are silent if already set. Order: Finnhub first

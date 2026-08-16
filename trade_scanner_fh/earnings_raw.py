@@ -289,11 +289,12 @@ def prune_old_raw(
     """
     ref = now or datetime.now()
     deleted = 0
+    keep_newest = max(0, int(getattr(config, "RAW_MIN_RUNS_KEPT", 0)))
     for source in config.RAW_SOURCES:
         # Audit 2026-08-12 (INT-8): per-source retention. An explicit
         # `retention_days` argument still overrides everything (tests, and the
-        # caller who wants a uniform sweep); otherwise the small calendar
-        # sources keep a year and the bulky scrape sources keep the default.
+        # caller who wants a uniform sweep); otherwise the per-source table
+        # wins, falling back to the global default.
         if retention_days is not None:
             days = retention_days
         else:
@@ -303,7 +304,31 @@ def prune_old_raw(
         src_dir = _source_dir(source)
         if not src_dir.exists():
             continue
-        for f in src_dir.glob("*.parquet"):
+
+        # Audit 2026-08-16 (F10): an age-only rule empties the directory after
+        # any quiet stretch longer than the window — and the layer is at its
+        # least useful precisely when the store has sat untouched. Spare the
+        # newest N runs, then age-prune the rest.
+        #
+        # The floor applies to the DEFAULT policy only. An explicit
+        # `retention_days` is a caller asking for one specific sweep (tests, and
+        # any future "reclaim space now" action), and silently refusing to
+        # honour it would be the more surprising behaviour. The only production
+        # caller is the startup prune, which takes the default.
+        files = list(src_dir.glob("*.parquet"))
+        spared: set = set()
+        if keep_newest and files and retention_days is None:
+            try:
+                newest = sorted(
+                    files, key=lambda p: p.stat().st_mtime, reverse=True,
+                )[:keep_newest]
+                spared = {p.name for p in newest}
+            except OSError:
+                spared = set()      # can't stat — fall back to age-only
+
+        for f in files:
+            if f.name in spared:
+                continue
             try:
                 if f.stat().st_mtime < cut_ts:
                     f.unlink()

@@ -257,21 +257,64 @@ def test_read_raw_empty_dir_returns_empty_df(tmp_raw):
 # Pruning
 # ----------------------------------------------------------------------
 
+def _seed_zacks_runs(tmp_raw, n: int, *, age_days: float = 0.0) -> list:
+    """Create `n` zacks run files, all backdated by `age_days`. Returns paths
+    newest-first by mtime."""
+    paths = []
+    base = datetime.now() - timedelta(days=age_days)
+    for i in range(n):
+        rid = earnings_raw.new_run_id()
+        earnings_raw.append_zacks_rows([{"ticker": f"T{i}"}], rid)
+        p = tmp_raw / "zacks" / f"{rid}.parquet"
+        # Distinct mtimes so "newest N" is deterministic.
+        ts = (base - timedelta(minutes=i)).timestamp()
+        os.utime(p, (ts, ts))
+        paths.append(p)
+    return paths
+
+
 def test_prune_drops_old_files(tmp_raw):
+    """The age rule still deletes, once the keep-newest floor is satisfied."""
+    keep = config.RAW_MIN_RUNS_KEPT
+    # Enough recent runs to fill the floor, so the aged file is genuinely
+    # surplus rather than being spared by it.
+    _seed_zacks_runs(tmp_raw, keep)
+
     rid_old = earnings_raw.new_run_id()
     earnings_raw.append_zacks_rows([{"ticker": "OLD"}], rid_old)
-    rid_new = earnings_raw.new_run_id()
-    earnings_raw.append_zacks_rows([{"ticker": "NEW"}], rid_new)
-
-    # Backdate the OLD file 60 days; default retention is 30.
     old_path = tmp_raw / "zacks" / f"{rid_old}.parquet"
-    old_ts = (datetime.now() - timedelta(days=60)).timestamp()
+    old_ts = (datetime.now() - timedelta(days=400)).timestamp()
     os.utime(old_path, (old_ts, old_ts))
 
     deleted = earnings_raw.prune_old_raw()
     assert deleted == 1
     assert not old_path.exists()
-    assert (tmp_raw / "zacks" / f"{rid_new}.parquet").exists()
+    assert len(list((tmp_raw / "zacks").glob("*.parquet"))) == keep
+
+
+def test_prune_keeps_the_newest_runs_regardless_of_age(tmp_raw):
+    """Audit 2026-08-16 (F10): an age-only rule empties the directory after any
+    quiet stretch longer than the window — and the raw layer is the documented
+    recovery path for four destructive operations plus the F1 truncation guard.
+    The newest N runs survive however old they are."""
+    keep = config.RAW_MIN_RUNS_KEPT
+    paths = _seed_zacks_runs(tmp_raw, keep + 3, age_days=400)
+
+    deleted = earnings_raw.prune_old_raw()
+
+    assert deleted == 3, "only the surplus beyond the floor should go"
+    survivors = {p.name for p in (tmp_raw / "zacks").glob("*.parquet")}
+    assert survivors == {p.name for p in paths[:keep]}, (
+        "the floor must spare the NEWEST runs, not an arbitrary subset"
+    )
+
+
+def test_prune_floor_does_not_override_an_explicit_retention(tmp_raw):
+    """The floor guards the DEFAULT policy. A caller asking for a specific
+    sweep gets exactly that — silently refusing would be more surprising."""
+    _seed_zacks_runs(tmp_raw, 2, age_days=400)
+    assert earnings_raw.prune_old_raw(retention_days=30) == 2
+    assert not list((tmp_raw / "zacks").glob("*.parquet"))
 
 
 def test_prune_returns_zero_when_nothing_to_drop(tmp_raw):
@@ -307,20 +350,22 @@ def test_prune_walks_every_source(tmp_raw):
         path = tmp_raw / src / f"{rid}.parquet"
         os.utime(path, (cutoff_ts, cutoff_ts))
 
-    # Audit 2026-08-12 (INT-8): retention is now PER SOURCE. The bulky scrape
-    # sources (zacks, finviz) keep the 30-day default; the small calendar
-    # sources (nasdaq, yahoo, finnhub) keep a year, because four separate
-    # destructive operations cite this layer as their recovery path and a flat
-    # 30 days never delivered that against a ten-year store.
+    # Audit 2026-08-12 (INT-8) made retention per-source; audit 2026-08-16
+    # (F10) then raised EVERY source to a year, because the two the split had
+    # left on 30 days (finviz, zacks) are the ones carrying essentially all of
+    # the per-quarter history — i.e. exactly what F1's truncation guard falls
+    # back on. A 60-day-old file is now inside the window everywhere.
     deleted = earnings_raw.prune_old_raw()
-    long_lived = set(config.RAW_RETENTION_DAYS_BY_SOURCE)
-    short_lived = [s for s in config.RAW_SOURCES if s not in long_lived]
-    assert deleted == len(short_lived)
-    for src in long_lived:
+    assert deleted == 0
+    for src in config.RAW_SOURCES:
         assert list((tmp_raw / src).glob("*.parquet")), (
             f"{src} has 365-day retention but its 60-day-old file was pruned"
         )
-    for src in short_lived:
+
+    # An explicit sweep still reaches every source dir.
+    deleted = earnings_raw.prune_old_raw(retention_days=30)
+    assert deleted == len(config.RAW_SOURCES)
+    for src in config.RAW_SOURCES:
         assert not list((tmp_raw / src).glob("*.parquet"))
 
 

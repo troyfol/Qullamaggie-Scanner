@@ -1660,9 +1660,12 @@ def build_scan_context(params_list: list[ScanParams]) -> ScanContext:
         # (zacks + finnhub). Without this each fiscal quarter appeared twice in
         # the per-ticker slice, so the most-recent-quarter columns and the Q-i
         # beats display picked up the wrong source row and shifted by a
-        # quarter. `backfill_estimates=True` inherits the estimate/surprise
-        # fields the winner lacks from the same-slot lower-priority row.
-        history_df = dedupe_history(history_df, backfill_estimates=True)
+        # quarter. `merge_sources=True` fills any value the winner lacks from
+        # the highest-priority same-slot row that has it. On a store written by
+        # the current build this is a no-op — the canonical save already merged
+        # and collapsed each slot — but it still covers a frame read mid-fill,
+        # between a per-flush write and the finalize.
+        history_df = dedupe_history(history_df, merge_sources=True)
         # Recompute YoY on the deduped frame so EPS YoY derives from the
         # reported_eps actually displayed rather than the pre-dedup value.
         history_df = compute_yoy_columns(history_df)

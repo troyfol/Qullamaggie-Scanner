@@ -81,11 +81,35 @@ def test_record_mapping_uses_adjusted_fields():
     assert row["report_time"] == "Close"
 
 
-def test_record_skips_forward_estimate_rows():
-    # No epsActual → a forward analyst-estimate row → dropped.
+def test_record_skips_rows_with_no_actuals_at_all():
+    """A forward analyst-estimate row carries neither actual."""
     assert finviz_fill._record_to_history_dict(
-        _entry(eps_actual=None), queried_symbol="AAOI",
+        _entry(eps_actual=None, sales_actual=None), queried_symbol="AAOI",
         cutoff=_CUTOFF, now=datetime.now()) is None
+
+
+def test_record_skips_future_dated_rows():
+    """Audit 2026-08-16: forward rows used to be excluded as a SIDE EFFECT of
+    requiring `epsActual`. Now that a revenue-only row is legitimate, that side
+    effect is gone, so "past quarters only" is tested on the announcement date
+    — otherwise a forward entry carrying a `salesActual` would be written as a
+    reported quarter, which is exactly what verify_integrity check #12 flags."""
+    future = (pd.Timestamp.today().normalize()
+              + pd.DateOffset(days=30)).strftime("%Y-%m-%d")
+    assert finviz_fill._record_to_history_dict(
+        _entry(fiscal_end=future, eps_actual=None), queried_symbol="AAOI",
+        cutoff=_CUTOFF, now=datetime.now()) is None
+
+
+def test_record_keeps_a_past_revenue_only_quarter():
+    """Zacks' and finviz's sales coverage runs deeper than their EPS coverage;
+    that revenue was being fetched and discarded."""
+    row = finviz_fill._record_to_history_dict(
+        _entry(eps_actual=None), queried_symbol="AAOI",
+        cutoff=_CUTOFF, now=datetime.now())
+    assert row is not None
+    assert row["reported_rev"] == 151.1
+    assert row["reported_eps"] is None
 
 
 def test_record_skips_when_no_earnings_date():

@@ -108,7 +108,64 @@ COLUMNS: list[str] = [
     # row in this same parquet. NaN when the prior-year row is absent or
     # its denominator value is 0. See `compute_yoy_columns`.
     "yoy_eps_pct", "yoy_rev_pct",
+    # Provenance of the two REPORTED actuals (audit 2026-08-16, F13).
+    # `source` remains the row's winning source and is still the
+    # (ticker, source) flush key; these say where `reported_eps` and
+    # `reported_rev` actually came from, which can now differ from each other
+    # and from `source`. NA when the row has no such value.
+    #
+    # The estimate / surprise columns need no provenance column of their own:
+    # they are finviz-only by construction (see `strip_foreign_estimates`), so
+    # a non-null value there is always finviz.
+    #
+    # DELIBERATELY APPENDED at the end rather than placed next to `source`:
+    # the Morning Scanner repo reads this parquet, and appending leaves every
+    # existing column at its existing position.
+    "eps_source", "rev_source",
 ]
+
+# Reported actuals mix freely across sources, per column. All three quote the
+# same adjusted / non-GAAP basis (the GAAP EDGAR source was removed
+# 2026-05-31), so a quarter may legitimately carry a zacks `reported_eps`
+# alongside a finnhub `reported_rev`. Each value is taken from the
+# highest-priority row in the slot that actually has it.
+#
+# The estimate-derived columns are in this list too, but they can only ever
+# yield finviz values by the time it runs — `strip_foreign_estimates` has
+# already nulled everyone else's.
+_MERGEABLE_VALUE_COLS: tuple[str, ...] = (
+    "estimated_eps", "reported_eps", "surprise_eps", "surprise_eps_pct",
+    "estimated_rev", "reported_rev", "surprise_rev", "surprise_rev_pct",
+    "yoy_eps_pct", "yoy_rev_pct",
+)
+
+# (provenance column, the reported value it describes).
+_REPORTED_SOURCES: tuple[tuple[str, str], ...] = (
+    ("eps_source", "reported_eps"),
+    ("rev_source", "reported_rev"),
+)
+
+# The estimate and the surprise are ONE source's opinion and are inextricably
+# paired: the surprise is literally `actual − estimate`, and the surprise
+# percentage divides by that same estimate. Mixing providers across the pair
+# would state a relationship nobody computed, so the whole estimate-derived
+# cluster comes from a single source.
+#
+# finviz is the choice: it is the top-priority source, it derives its surprise
+# from its own actual and estimate, and it covers ~99% of slots. The other
+# sources' estimate/surprise values are still SCRAPED — still preserved
+# verbatim in the earnings_raw audit layer, and still compared by the
+# cross-source disagreement report — they are simply never persisted to the
+# consumer parquet. See `strip_foreign_estimates`.
+#
+# (This is the same six-column set the pre-F13 code called
+# `_ESTIMATE_BACKFILL_COLS`; the grouping was already recognised, it just
+# wasn't pinned to one provider.)
+ESTIMATE_SOURCE = "finviz"
+_ESTIMATE_COLUMNS: tuple[str, ...] = (
+    "estimated_eps", "surprise_eps", "surprise_eps_pct",
+    "estimated_rev", "surprise_rev", "surprise_rev_pct",
+)
 
 # Quarterly cadence is ~90 days; allow up to 135 days between consecutive
 # period_endings before treating the gap as a "missing quarter" that
@@ -270,6 +327,10 @@ def load_earnings_history() -> Optional[pd.DataFrame]:
                     df[col] = df[col].dt.tz_localize(None)
             except (AttributeError, TypeError):
                 pass
+    # Audit 2026-08-16 (F13): back-fill the per-group provenance from `source`
+    # on any row written before the columns existed — a pre-F13 row never took
+    # part in a cross-source merge, so it owns both of its metric groups.
+    df = ensure_group_sources(df)
     if "report_date_proxy" not in df.columns:
         df["report_date_proxy"] = False
     else:
@@ -343,6 +404,14 @@ def save_earnings_history(
             out[col] = pd.to_datetime(out[col], errors="coerce")
     # Drop rows that can't be addressed
     out = out.dropna(subset=["ticker", "period_ending"]).reset_index(drop=True)
+    # Audit 2026-08-16: normalise numeric dtypes before anything compares or
+    # concatenates them, so an all-None batch can't cement an object column.
+    out = coerce_value_dtypes(out)
+    # Audit 2026-08-16 (F13): materialise the per-group provenance before dedup
+    # so the merge has something to stamp and legacy / freshly-built rows carry
+    # it. Runs on EVERY save, canonical or not, so the columns are never absent
+    # from the on-disk schema once this build has written it.
+    out = ensure_group_sources(out)
     # Re-prune the rolling history cap on every canonical write. The fill
     # cutoff is evaluated once at fetch time, so a row fetched at the
     # boundary lingers as the daily-advancing cutoff overtakes it; re-pruning
@@ -373,7 +442,18 @@ def save_earnings_history(
             report_cross_source_disagreements(out)
         except Exception as exc:  # noqa: BLE001 — diagnostics must not block saves
             log.warning("Cross-source disagreement report failed: %s", exc)
-        out = dedupe_history(out)
+    # Audit 2026-08-16 (F14): estimate-derived columns are finviz-only.
+    # Ordering is load-bearing — AFTER the disagreement report, which
+    # legitimately compares every source's surprise figures and is the last
+    # consumer of the foreign ones, and BEFORE the merge, so a back-fill can
+    # only ever pull finviz values into those columns.
+    out = strip_foreign_estimates(out)
+    if dedup:
+        # Audit 2026-08-16 (F13): merge values onto the slot winner BEFORE the
+        # losers are dropped. This is the only moment the loser rows still
+        # exist, which is precisely why the read-side-only version could never
+        # fire.
+        out = dedupe_history(out, merge_sources=True)
     # Sanity guard: null EPS fields on rows whose reported_eps is an
     # impossible-magnitude reverse-split artifact. Absolute cap only here —
     # the write path has no share price; the eps-sanitize migration does the
@@ -393,7 +473,7 @@ def save_earnings_history(
     # path — is what makes the category dtype persist across fills. pyarrow
     # round-trips it cleanly and all downstream ops (`==`, `.str.*`,
     # `.astype(str)`) tolerate category, so no reader needs to change.
-    for col in ("source", "report_time"):
+    for col in ("source", "report_time", "eps_source", "rev_source"):
         if col in out.columns:
             out[col] = out[col].astype("category")
     # Audit 2026-08-12 (INT-6): snapshot the current file before a CANONICAL
@@ -437,6 +517,30 @@ def _rotate_history_backup() -> None:
     try:
         import shutil
 
+        # Audit 2026-08-16 (F9): space the snapshots by TIME, not by write.
+        # Canonical saves cluster — three sources finalize per smart refresh,
+        # plus the launch migrations — so a purely per-write rotation could burn
+        # all `keep` slots in one session and leave three snapshots of the same
+        # afternoon. Skipping is safe: it PRESERVES the existing (older, and
+        # therefore more useful) snapshot rather than overwriting it.
+        min_gap_h = float(getattr(
+            config, "HISTORY_BACKUP_MIN_INTERVAL_HOURS", 0) or 0)
+        if min_gap_h > 0:
+            newest = src.with_name(f"{src.name}{_BACKUP_SUFFIX}1")
+            try:
+                if newest.exists():
+                    age_h = (
+                        time.time() - newest.stat().st_mtime
+                    ) / 3600.0
+                    if age_h < min_gap_h:
+                        log.debug(
+                            "History backup skipped — newest snapshot is only "
+                            "%.1f h old (min gap %.1f h)", age_h, min_gap_h,
+                        )
+                        return
+            except OSError:
+                pass      # can't stat — fall through and take the snapshot
+
         # Shift older snapshots down: autobak2 → autobak3, autobak1 → autobak2.
         for n in range(keep - 1, 0, -1):
             older = src.with_name(f"{src.name}{_BACKUP_SUFFIX}{n}")
@@ -477,15 +581,98 @@ _SOURCE_PRIORITY: dict[str, int] = {
 _SOURCE_PRIORITY_FALLBACK = 99
 
 
-# Estimate / surprise columns a higher-priority winner row may be missing.
-# When ``backfill_estimates=True`` these are filled onto the winner from
-# the best available lower-priority same-slot row (always same adjusted
-# basis now that EDGAR/GAAP is gone). The reported actuals and source
-# label are never touched — only these estimate-derived fields inherit.
-_ESTIMATE_BACKFILL_COLS: tuple[str, ...] = (
-    "estimated_eps", "surprise_eps", "surprise_eps_pct",
-    "estimated_rev", "surprise_rev", "surprise_rev_pct",
-)
+def coerce_value_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Force the numeric value columns to a real numeric dtype.
+
+    Fill rows are built as dicts, so a column whose every value is ``None`` for
+    this batch — a finnhub-only fill has no revenue at all, ever — arrives as
+    OBJECT dtype. Concatenating that onto the float64 column already on disk is
+    what pandas 2.2 warns about ("concatenation with empty or all-NA entries is
+    deprecated ... this will no longer exclude all-NA columns when determining
+    the result dtypes"), and in pandas 3 it resolves to an object column on
+    disk. That is the exact drift ``verify_integrity`` check #6 was written to
+    report — "typically because every value is None" — so this fixes the cause
+    rather than waiting to detect the symptom.
+
+    Only object-dtype columns are touched, so a well-formed frame pays nothing.
+    """
+    for col in _MERGEABLE_VALUE_COLS:
+        if col in df.columns and df[col].dtype == object:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def strip_foreign_estimates(df: pd.DataFrame) -> pd.DataFrame:
+    """Null every estimate-derived column on rows whose ``source`` is not
+    ``ESTIMATE_SOURCE`` (audit 2026-08-16, F14).
+
+    The estimate and its surprise are one provider's opinion and are
+    inextricably paired, so the whole cluster comes from a single source and
+    the columns mean the same thing on every row of the store. Other sources
+    keep supplying these figures — they stay in the ``earnings_raw`` audit
+    layer and are still visible to the cross-source disagreement report — they
+    just never reach the consumer parquet.
+
+    Applied on EVERY save, canonical or not, so a single-source zacks row can't
+    smuggle one in either. Foreign values already on disk are cleaned by the
+    first save that touches them, so no migration is needed.
+
+    Mutates and returns ``df`` — callers already hold a copy.
+    """
+    import numpy as np
+
+    if "source" not in df.columns or df.empty:
+        return df
+    cols = [c for c in _ESTIMATE_COLUMNS if c in df.columns]
+    if not cols:
+        return df
+    foreign = df["source"].astype(str).str.lower() != ESTIMATE_SOURCE
+    if foreign.any():
+        df.loc[foreign, cols] = np.nan
+    return df
+
+
+def ensure_group_sources(df: pd.DataFrame) -> pd.DataFrame:
+    """Materialise ``eps_source`` / ``rev_source`` — the origin of this row's
+    ``reported_eps`` / ``reported_rev``.
+
+    Defaults to ``source``: a row that never took part in a cross-source merge
+    got its reported values from its own source. Rows written before the
+    columns existed are covered by the same rule. A row with no reported value
+    gets NA rather than a source, because there is no value to attribute.
+
+    Always leaves the columns as plain object dtype. They are coerced to
+    ``category`` once, at the single write path in ``save_earnings_history`` —
+    doing it here instead would make every later assignment a categorical
+    set-item, and a value outside the existing categories raises
+    (``TypeError: Cannot setitem on a Categorical with a new category``). That
+    is not hypothetical: it is exactly what a cross-source merge does.
+
+    Mutates and returns ``df`` — callers already hold a copy.
+    """
+    if "source" not in df.columns:
+        return df
+    base = df["source"].astype(str)
+    for col, anchor in _REPORTED_SOURCES:
+        if col not in df.columns:
+            cur = pd.Series(pd.NA, index=df.index, dtype="object")
+        else:
+            cur = df[col].astype("object")
+        # Plain masked assignment rather than `.where`: on object dtype the
+        # latter emits the Pandas 2.2 "Downcasting behavior in ... 'where'"
+        # FutureWarning, which this codebase already sidesteps elsewhere (see
+        # the report_date_proxy handling in load_earnings_history).
+        blank = cur.isna() | (cur.astype(str).str.strip() == "")
+        if blank.any():
+            cur = cur.copy()
+            cur[blank] = base[blank]
+        if anchor in df.columns:
+            absent = pd.to_numeric(df[anchor], errors="coerce").isna()
+            if absent.any():
+                cur = cur.copy()
+                cur[absent] = pd.NA
+        df[col] = cur
+    return df
 
 
 # Sources whose ``period_ending`` is the TRUE fiscal-quarter end (day-1 of
@@ -555,10 +742,96 @@ def _calendar_dup_drop_mask(df: pd.DataFrame) -> pd.Series:
     return (~accurate) & valid & cal_q.isin(covered_keys)
 
 
+def _merge_slot_values(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill each slot's winner from the best available same-slot value, one
+    COLUMN at a time (audit 2026-08-16, F13/F14).
+
+    ``df`` must already be sorted winner-first within each
+    ``(ticker, period_ending)`` group and carry a RangeIndex.
+
+    Reported actuals mix freely, per column. Every source quotes the same
+    adjusted / non-GAAP basis, so a quarter may legitimately end up with a
+    zacks ``reported_eps``, a finnhub ``reported_rev`` and finviz estimate /
+    surprise figures. Each value is taken from the highest-priority row in the
+    slot that has it — which is just a within-slot back-fill, because the rows
+    are already in priority order.
+
+    The estimate-derived columns are the exception: they fill only from a
+    finviz donor, so one source's estimate can never cross onto another row.
+    A row's OWN estimate is left alone here — removing a legacy non-finviz
+    estimate is ``strip_foreign_estimates``' job at save time, and doing it
+    here would also change what a scan displays relative to what is on disk.
+
+    ``eps_source`` / ``rev_source`` are computed from the PRE-merge nulls, so
+    they name the row that actually supplied each reported value.
+    """
+    keys = ["ticker", "period_ending"]
+    if not set(keys).issubset(df.columns) or df.empty:
+        return df
+
+    # Provenance first — from the pre-merge nulls, before the back-fill blurs
+    # which row held what.
+    #
+    # The donor contributes its own `<x>_source`, NOT its `source`. Those differ
+    # precisely when the donor already carries a value inherited from a third
+    # source, which is the steady state after the first merge: a row can sit on
+    # disk as source=finviz / rev_source=zacks, and re-deriving from `source`
+    # would relabel zacks' revenue as finviz on the very next save. Every save
+    # re-runs this, so that mislabelling would compound silently.
+    df = ensure_group_sources(df)
+    for src_col, anchor in _REPORTED_SOURCES:
+        if anchor not in df.columns or "source" not in df.columns:
+            continue
+        has = pd.to_numeric(df[anchor], errors="coerce").notna()
+        if not has.any():
+            df[src_col] = pd.NA
+            continue
+        donors = (
+            df.loc[has, keys + [src_col]]
+              .groupby(keys, sort=False).head(1)
+              .set_index(keys)
+        )
+        want = pd.MultiIndex.from_frame(df[keys])
+        df[src_col] = donors[src_col].astype("object").reindex(want).to_numpy()
+
+    # Values — highest-priority non-null per column within the slot.
+    est_cols = [c for c in _ESTIMATE_COLUMNS if c in df.columns]
+    plain_cols = [c for c in _MERGEABLE_VALUE_COLS
+                  if c in df.columns and c not in est_cols]
+
+    if plain_cols:
+        grp = df.groupby(keys, sort=False)
+        for c in plain_cols:
+            df[c] = grp[c].bfill()
+
+    if est_cols and "source" in df.columns:
+        # The estimate-derived columns fill only from a finviz DONOR. Stripping
+        # the whole frame here instead would be wrong in two ways: it is a
+        # write-time concern (save_earnings_history owns it), and this function
+        # also runs on the READ path, where nulling a legacy row's own zacks
+        # estimate would silently change what a scan shows versus what is
+        # actually on disk. Masking the donor pool gets the guarantee that
+        # matters — a foreign estimate can never CROSS onto another row, where
+        # the save-time strip would no longer recognise it as foreign because
+        # the receiving row's `source` is finviz.
+        import numpy as np  # noqa: F401 - Series.where uses NaN by default
+
+        finviz_only = df["source"].astype(str).str.lower() == ESTIMATE_SOURCE
+        visible = pd.DataFrame(
+            {c: df[c].where(finviz_only) for c in est_cols}, index=df.index,
+        )
+        donated = visible.groupby([df[k] for k in keys], sort=False).bfill()
+        for c in est_cols:
+            gap = df[c].isna()
+            if gap.any():
+                df.loc[gap, c] = donated.loc[gap, c]
+    return df
+
+
 def dedupe_history(
     history_df: Optional[pd.DataFrame],
     *,
-    backfill_estimates: bool = False,
+    merge_sources: bool = False,
 ) -> pd.DataFrame:
     """Per-(ticker, period_ending) priority dedup: for each fiscal-
     quarter slot the highest-priority source wins. Priority order is
@@ -574,12 +847,18 @@ def dedupe_history(
     non-GAAP basis (the GAAP EDGAR source was removed 2026-05-31), so
     there is no cross-basis mixing to reconcile.
 
-    ``backfill_estimates`` (read-side only — keep it False for the
-    write-time canonical dedup so on-disk source rows stay pure): when a
-    slot's winner lacks estimate / surprise values, inherit those
-    specific columns from the highest-priority lower same-slot row that
-    has them, before the loser is dropped. Same-basis throughout, so the
-    reported / estimated / surprise triple stays internally consistent.
+    ``merge_sources``: before the losing rows are dropped, fill each
+    value column on the slot winner from the highest-priority same-slot
+    row that has it, and stamp ``eps_source`` / ``rev_source`` with where
+    the reported actuals came from. See ``_merge_slot_values``.
+
+    Audit 2026-08-16 (F13): this is now ON for the write-time canonical
+    dedup too. It used to be read-side only, which made it dead code —
+    the canonical save deleted the loser rows before any reader could
+    inherit from them (measured: 0 of 215,469 on-disk slots carried more
+    than one source). The cost was 1,562 finviz quarters showing an EPS
+    and a blank revenue, 1,069 of which had revenue sitting unused in a
+    zacks row that the dedup was about to discard.
 
     Returns an empty COLUMNS-shaped frame on None / empty input.
     """
@@ -606,20 +885,10 @@ def dedupe_history(
         ascending = [True, True, True]
 
     df = df.sort_values(sort_cols, ascending=ascending, kind="stable")
+    df = df.reset_index(drop=True)
 
-    if backfill_estimates:
-        # Within each (ticker, period_ending) group the rows are already
-        # ordered winner-first (lowest _prio at the top). A backward fill
-        # pulls each missing estimate/surprise value UP from the nearest
-        # lower-priority row below it, so the winner (first row) inherits
-        # the best available estimate data before we drop the losers.
-        # All sources share the adjusted basis, so no basis correction is
-        # needed on the reported actuals.
-        present = [c for c in _ESTIMATE_BACKFILL_COLS if c in df.columns]
-        if present:
-            grp = df.groupby(["ticker", "period_ending"], sort=False)
-            for col in present:
-                df[col] = grp[col].bfill()
+    if merge_sources:
+        df = _merge_slot_values(df)
 
     df = (
         df.drop_duplicates(subset=["ticker", "period_ending"], keep="first")
@@ -1219,6 +1488,9 @@ def verify_integrity(
                                 → null the offending YoY column(s)
      14. placeholder_no_actual - past report_date with no reported EPS
                                 → drop the row so the gap fill re-queues it
+     15. missing_quarter    - >135-day hole between consecutive quarters
+                                inside the recent window → NOT auto-fixable
+                                (re-fetch required); this is F1's detector
 
     Checks 11-14 were added by the 2026-08-12 audit (INT-6 / INT-16): the live
     store passed all ten original checks while holding 3,500 placeholder rows
@@ -1565,7 +1837,84 @@ def verify_integrity(
                 ),
             ))
 
+    # 15 — missing quarters inside a ticker's own recent history.
+    #
+    # Audit 2026-08-16 (F6): none of the fourteen checks above asked whether a
+    # ticker's quarters are CONTIGUOUS, so the F1 truncation — which removes
+    # quarters one ticker at a time — could run for months without leaving a
+    # trace any tool would surface. This is F1's detector.
+    #
+    # Report-only by design: a missing quarter cannot be repaired by rewriting
+    # what is already here. The fix is to re-fill the affected tickers, which
+    # the gap/targeted fills already do.
+    gap_finding = _quarter_gap_finding(history_df)
+    if gap_finding is not None:
+        findings.append(gap_finding)
+
     return findings
+
+
+def _quarter_gap_finding(
+    history_df: pd.DataFrame, *, years: Optional[int] = None,
+) -> Optional[IntegrityFinding]:
+    """Flag tickers with a >135-day hole between consecutive quarters inside
+    the recent window. Returns None when clean.
+
+    Restricted to the last ``EARNINGS_GAP_CHECK_YEARS`` because legitimate gaps
+    dominate the deep history and would bury the signal: measured store-wide,
+    2,700 gap events across 1,262 of 4,858 tickers, most of them IPOs, dark
+    periods, fiscal-year changes, or the retention cap leaving one very old
+    quarter followed by nothing. Inside a 3-year window a hole bracketed by
+    real quarters on BOTH sides is a much stronger indication that something
+    was lost.
+    """
+    if history_df is None or history_df.empty:
+        return None
+    if not {"ticker", "period_ending"}.issubset(history_df.columns):
+        return None
+
+    span = years if years is not None else config.EARNINGS_GAP_CHECK_YEARS
+    cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(years=span)
+    pe = pd.to_datetime(history_df["period_ending"], errors="coerce")
+    recent = pd.DataFrame({
+        "ticker": history_df["ticker"].astype(str),
+        "period_ending": pe,
+    }).dropna()
+    recent = recent.loc[recent["period_ending"] >= cutoff]
+    if recent.empty:
+        return None
+
+    recent = (recent.drop_duplicates()
+                    .sort_values(["ticker", "period_ending"], kind="stable"))
+    gap_days = recent.groupby("ticker", sort=False)["period_ending"].diff().dt.days
+    holed = recent.loc[gap_days > _MAX_QUARTER_GAP_DAYS].copy()
+    if holed.empty:
+        return None
+
+    holed["gap_days"] = gap_days.loc[holed.index].astype(int)
+    tickers = sorted(holed["ticker"].unique())
+    sample = [
+        {"ticker": r.ticker,
+         "period_ending": r.period_ending.isoformat(),
+         "gap_days": int(r.gap_days)}
+        for r in holed.nlargest(5, "gap_days").itertuples(index=False)
+    ]
+    return IntegrityFinding(
+        check="missing_quarter",
+        severity="warning",
+        affected_rows=int(len(holed)),
+        sample=sample,
+        auto_fixable=False,
+        description=(
+            f"{len(tickers)} ticker(s) have a >{_MAX_QUARTER_GAP_DAYS}-day hole "
+            f"between consecutive quarters inside the last {span} year(s) — a "
+            f"quarter that should be there is missing. NOT auto-fixable: the "
+            f"data has to be re-fetched, so run a targeted/gap fill for these "
+            f"tickers. Some gaps are legitimate (a company that went dark, a "
+            f"fiscal-year change), so treat this as a list to investigate "
+            f"rather than a defect count."
+        ),
+    )
 
 
 def _placeholder_mask(
@@ -1796,6 +2145,238 @@ def _row_to_history_dict(row: dict, ticker: str, source: str, now: datetime) -> 
     return out
 
 
+def rows_superseded_by(
+    existing: Optional[pd.DataFrame],
+    new_df: Optional[pd.DataFrame],
+    source: str,
+) -> pd.Series:
+    """Boolean mask over ``existing``: which stored rows this fill response
+    is entitled to replace.
+
+    Audit 2026-08-16 (F1, CRITICAL). Both flush paths used to drop EVERY
+    ``(ticker, source)`` row and write whatever the current response returned,
+    with no comparison against what was already stored. A 200-OK-but-SHORT
+    response — a partially-rendered finviz page, a CDN-cached stub, a trimmed
+    finnhub array, a zacks page carrying fewer table rows — therefore truncated
+    that ticker's history permanently and silently. The INT-1 guard does not
+    cover this: it refuses to write when the store is UNREADABLE, which is a
+    different failure. Nothing compared row counts, nothing checked coverage,
+    and `verify_integrity` had no regression check, so this could run for months
+    without leaving a trace.
+
+    The rule
+    --------
+    **A response is authoritative over the span it covers, and only that span.**
+    Stored rows whose ``period_ending`` is strictly OLDER than the response's
+    oldest quarter are retained; everything from that quarter forward is
+    replaced.
+
+    That single rule handles both cases without branching:
+
+    * a full response (reaches at least as far back as the store) supersedes
+      everything, so a genuine RESTATEMENT that withdraws a quarter still
+      removes it — the behaviour the old replace-everything semantics existed
+      to provide, and the reason a naive merge-by-key would be wrong;
+    * a short response supersedes only the recent window it actually covers,
+      so the older quarters survive.
+
+    The rolling ``EARNINGS_HISTORY_YEARS`` cap still governs the retained rows:
+    ``save_earnings_history`` re-prunes on every canonical write, so this can
+    never grow the store past its configured window.
+
+    Fallbacks, both conservative:
+      * no ``period_ending`` column on either side → the historical
+        replace-by-``(ticker, source)`` behaviour, unchanged;
+      * a ticker whose response carries no usable ``period_ending`` at all →
+        supersede only EXACT ``(ticker, period_ending)`` matches, so an
+        unparseable response can't delete anything it didn't name.
+    """
+    import numpy as np
+
+    idx = getattr(existing, "index", pd.RangeIndex(0))
+    empty = pd.Series(False, index=idx)
+    if existing is None or existing.empty or new_df is None or new_df.empty:
+        return empty
+    if not {"ticker", "source"}.issubset(existing.columns):
+        return empty
+
+    # Scope first, convert second. `existing` is the WHOLE store (215k rows on
+    # the live tree) and this runs once per flush, so the string/datetime
+    # coercions are confined to the in-scope subset — at most this flush's
+    # tickers. `source` is category dtype on disk and `.isin` is hash-based, so
+    # neither comparison materialises a 215k-element string array.
+    inc_tickers = set(new_df["ticker"].dropna().astype(str).unique())
+    if not inc_tickers:
+        return empty
+    in_scope = (
+        existing["ticker"].isin(inc_tickers) & (existing["source"] == source)
+    )
+    in_scope = np.asarray(in_scope, dtype=bool)
+    scope_pos = np.flatnonzero(in_scope)
+    if scope_pos.size == 0:
+        return empty
+
+    if ("period_ending" not in existing.columns
+            or "period_ending" not in new_df.columns):
+        return pd.Series(in_scope, index=idx)
+
+    inc_t = new_df["ticker"].astype(str)
+    inc_pe = pd.to_datetime(new_df["period_ending"], errors="coerce")
+    # min() skips NaT, so a ticker whose rows are all unparseable yields NaT.
+    oldest = {
+        t: v for t, v in inc_pe.groupby(inc_t).min().items() if pd.notna(v)
+    }
+
+    sub = existing.iloc[scope_pos]
+    sub_t = sub["ticker"].astype(str).to_numpy()
+    sub_pe = pd.to_datetime(sub["period_ending"], errors="coerce").to_numpy()
+    nat = np.datetime64("NaT")
+    thr = np.array(
+        [oldest.get(t, nat) for t in sub_t], dtype="datetime64[ns]",
+    )
+
+    sup = np.zeros(scope_pos.size, dtype=bool)
+    has_thr = ~np.isnat(thr)
+    comparable = has_thr & ~np.isnat(sub_pe)
+    sup[comparable] = sub_pe[comparable] >= thr[comparable]
+
+    if (~has_thr).any():
+        pairs = set(zip(inc_t.to_numpy(), inc_pe.to_numpy()))
+        for j in np.flatnonzero(~has_thr):
+            sup[j] = (sub_t[j], sub_pe[j]) in pairs
+
+    retained = int(scope_pos.size - sup.sum())
+    if retained:
+        # This is F1 firing. Loud on purpose: under the old semantics these
+        # rows were deleted, so a steady stream here means a source is
+        # regularly serving less than it used to and wants investigating.
+        shrunk = sorted({
+            str(t) for t, keep in zip(sub_t, ~sup) if keep
+        })
+        log.warning(
+            "%s: response covered less history than the store for %d "
+            "ticker(s) — retaining %d older row(s) that the pre-F1 "
+            "replace-everything write would have deleted (%s%s)",
+            source, len(shrunk), retained, ", ".join(shrunk[:8]),
+            ", …" if len(shrunk) > 8 else "",
+        )
+
+    out = np.zeros(len(existing), dtype=bool)
+    out[scope_pos] = sup
+    return pd.Series(out, index=idx)
+
+
+def _slot_keys(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalised ``(ticker, period_ending)`` key frame, index-aligned to
+    ``df``. Fill rows arrive as dicts and can carry an object-dtype
+    ``period_ending``, so both sides are coerced before they are matched."""
+    return pd.DataFrame(
+        {
+            "ticker": df["ticker"].astype(str),
+            "period_ending": pd.to_datetime(df["period_ending"],
+                                            errors="coerce"),
+        },
+        index=df.index,
+    )
+
+
+def carry_forward_foreign_values(
+    existing: Optional[pd.DataFrame],
+    new_df: Optional[pd.DataFrame],
+    source: str,
+    superseded: Optional[pd.Series],
+) -> pd.DataFrame:
+    """Preserve reported values a superseded row was holding on ANOTHER
+    source's behalf (audit 2026-08-16, F15).
+
+    The problem this closes
+    -----------------------
+    ``source`` does two jobs, and after F13 they disagree. It names the row's
+    winning source AND it is the ``(ticker, source)`` key the flush supersedes
+    on — but a merged row's values may belong to a different source, recorded
+    in ``eps_source`` / ``rev_source``. So a row can sit on disk as
+    ``source=finviz`` while carrying zacks revenue, and the next finviz fill
+    supersedes it by ``source`` and takes the zacks revenue with it. The donor
+    zacks row is long gone: the merge that created the value deleted it.
+
+    Measured before the fix: finviz fill (EPS only) → zacks fill (revenue
+    merged in, ``reported_rev=1000``) → finviz fill again → ``reported_rev``
+    back to NaN. Since finviz is the primary and most frequently refreshed
+    source, every merged value would have eroded on its next refresh.
+
+    The rule
+    --------
+    A fill may only retract what it OWNS. When a superseded row holds a
+    reported value whose ``*_source`` is some other source, and the incoming
+    response has no value of its own for that slot, the value and its
+    provenance are carried onto the incoming row.
+
+    The two cases this deliberately does NOT cover:
+
+    * the incoming response HAS its own value — the priority chain applies
+      normally and the incoming (higher-priority) value wins;
+    * the superseded row's ``*_source`` equals this fill's source — the source
+      is retracting its own figure, which is a legitimate correction.
+    """
+    if (existing is None or new_df is None or new_df.empty
+            or superseded is None):
+        return new_df
+    if not bool(superseded.any()):
+        return new_df
+    keys = ["ticker", "period_ending"]
+    if not (set(keys) | {"source"}).issubset(existing.columns):
+        return new_df
+    if not set(keys).issubset(new_df.columns):
+        return new_df
+
+    dying = existing.loc[superseded]
+    if dying.empty:
+        return new_df
+
+    out = ensure_group_sources(new_df.copy())
+    dying = ensure_group_sources(dying.copy())
+    dying_keys = _slot_keys(dying)
+    out_keys = _slot_keys(out)
+    carried = 0
+
+    for src_col, anchor in _REPORTED_SOURCES:
+        if anchor not in dying.columns or anchor not in out.columns:
+            continue
+        owner = dying[src_col].astype("object")
+        foreign = (
+            pd.to_numeric(dying[anchor], errors="coerce").notna()
+            & owner.notna()
+            & (owner.astype(str) != str(source))
+        )
+        if not foreign.any():
+            continue
+        donors = (
+            pd.concat([dying_keys, dying[[anchor, src_col]]], axis=1)
+              .loc[foreign]
+              .groupby(keys, sort=False).head(1)
+              .set_index(keys)
+        )
+        gap = pd.to_numeric(out[anchor], errors="coerce").isna()
+        if not gap.any():
+            continue
+        want = pd.MultiIndex.from_frame(out_keys.loc[gap])
+        payload = donors.reindex(want)
+        got = payload[anchor].notna().to_numpy()
+        if not got.any():
+            continue
+        rows = out.index[gap][got]
+        out.loc[rows, anchor] = payload[anchor].to_numpy()[got]
+        out.loc[rows, src_col] = payload[src_col].to_numpy()[got]
+        carried += int(got.sum())
+
+    if carried:
+        log.info(
+            "%s: carried %d value(s) forward from superseded row(s) that were "
+            "holding them on another source's behalf", source, carried,
+        )
+    return out
+
+
 def _flush_pending_to_disk(
     pending: dict[str, list[dict]],
     affected_tickers_total: list[str],
@@ -1847,6 +2428,9 @@ def _flush_pending_to_disk(
         # nano-caps). Catches the $20-$100k band the absolute write-guard
         # misses, at the moment rows arrive.
         new_df = sanitize_eps_artifacts(new_df)
+        # Audit 2026-08-16: see fill_framework — coerce all-None value columns
+        # off object dtype before they reach the concat.
+        new_df = coerce_value_dtypes(new_df)
 
         # Audit 2026-08-12 (INT-1, CRITICAL): never mistake "could not read the
         # store" for "there is no store". Overwriting on a transient read error
@@ -1862,17 +2446,21 @@ def _flush_pending_to_disk(
             return False
 
         if existing is not None and not existing.empty:
-            # Drop only the (ticker, source) rows we're replacing. Other-
-            # source rows for these tickers stay. Other tickers stay.
-            # Phase 6.5 fix: key the replacement on new_df["ticker"] (the
-            # actual values being written) rather than pending.keys() (the
-            # queried symbol). They normally agree for Zacks, but using
-            # the row's own ticker is the robust invariant.
-            new_tickers = set(new_df["ticker"].dropna().astype(str).unique())
-            mask_replace = (
-                existing["ticker"].astype(str).isin(new_tickers)
-                & (existing["source"] == source)
-            )
+            # Drop only the (ticker, source) rows this response supersedes.
+            # Other-source rows for these tickers stay. Other tickers stay.
+            #
+            # Phase 6.5 fix: keyed on new_df["ticker"] (the actual values being
+            # written) rather than pending.keys() (the queried symbol). They
+            # normally agree for Zacks, but the row's own ticker is the robust
+            # invariant.
+            #
+            # Audit 2026-08-16 (F1): "supersedes" is no longer "every row for
+            # this (ticker, source)" — see rows_superseded_by. A short response
+            # used to delete the quarters it simply didn't mention.
+            mask_replace = rows_superseded_by(existing, new_df, source)
+            # Audit 2026-08-16 (F15): a fill may only retract what it owns.
+            new_df = carry_forward_foreign_values(
+                existing, new_df, source, mask_replace)
             keep = existing.loc[~mask_replace]
             combined = pd.concat([keep, new_df], ignore_index=True)
         else:
@@ -1911,6 +2499,41 @@ def _finalize_fill(affected_tickers: list[str]) -> None:
         )
 
 
+def _has_any_actual(row: dict) -> bool:
+    """True when a built row carries a reported EPS **or** a reported revenue.
+
+    The ingest gate for every source (audit 2026-08-16). A quarter with only
+    revenue is genuine reported data; a scheduled-but-unreported quarter has
+    neither and is still rejected, which is what INT-7 was actually protecting
+    against.
+    """
+    for col in ("reported_eps", "reported_rev"):
+        val = row.get(col)
+        if val is None:
+            continue
+        try:
+            if not pd.isna(val):
+                return True
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
+def _save_zacks_checkpoint(run_id: str, completed: set) -> None:
+    """Persist the zacks resume point. Never raises — a checkpoint failure
+    must not end a 6.5-hour fill (audit 2026-08-16, S1)."""
+    from . import fill_framework
+    fill_framework.save_checkpoint(
+        config.ZACKS_BULK_CHECKPOINT,
+        fill_framework.Checkpoint(
+            run_id=run_id,
+            started_at=datetime.now().isoformat(timespec="seconds"),
+            completed=sorted(completed),
+        ),
+        log,
+    )
+
+
 def _fill_via_zacks(
     tickers: list[str], blacklist: set[str],
     *,
@@ -1923,6 +2546,7 @@ def _fill_via_zacks(
     consec_error_limit: int = 5,
     on_block_callback=None,
     failed_cb=None,
+    resume_from_checkpoint: bool = False,
 ) -> tuple[int, int]:
     """Common loop body for both bulk_fill_zacks and targeted_fill_zacks.
     Walks `tickers`, fetches each via a single shared ZacksSession,
@@ -1939,6 +2563,7 @@ def _fill_via_zacks(
     during the block almost certainly failed for the block, not for
     its own sake. "stop" exits the loop cleanly.
     """
+    from . import fill_framework
     if years is None:
         # Resolved at CALL time (None sentinel, not a def-time default) so a
         # live Settings → Advanced… change to the earnings-history depth
@@ -1966,11 +2591,31 @@ def _fill_via_zacks(
     pending: dict[str, list[dict]] = {}
     raw_pending: list[dict] = []
     run_id = earnings_raw.new_run_id()
-    affected_total: list[str] = []
+
+    # Audit 2026-08-16 (S1): resume support. This was the one fill with no
+    # checkpoint at all — a killed bulk restarted from zero, and at the 1.5 s
+    # default pacing a universe run is ~6.5 hours. Uses the same generic
+    # helpers finviz/finnhub already share, including their staleness rejection
+    # (a checkpoint older than CHECKPOINT_MAX_AGE_HOURS is ignored rather than
+    # silently skipping most of the universe).
+    completed: set[str] = set()
+    if resume_from_checkpoint:
+        cp = fill_framework.load_checkpoint(config.ZACKS_BULK_CHECKPOINT, log)
+        if cp is not None and cp.completed:
+            completed = set(cp.completed)
+            run_id = cp.run_id or run_id
+            log.info("%s: resuming run %s with %d ticker(s) already complete",
+                     label, run_id, len(completed))
+
+    # Seed with tickers completed in a PRIOR session so the end-of-fill
+    # reconcile folds them in too — without this a kill+resume left session-1
+    # tickers' history on disk but never reconciled their dates.
+    affected_total: list[str] = list(completed)
     filled = 0
     errors = 0
     consec_errors = 0
     total = len(work)
+    spike_halted = False
     # Parse-failure spike alarm (B2): fetch attempts vs. parse_error
     # classifications across the run — see the halt check in the loop.
     spike_attempts = 0
@@ -1993,6 +2638,9 @@ def _fill_via_zacks(
                 break
 
             sym = work[i]
+            if sym in completed:
+                i += 1
+                continue
             try:
                 rows = session.fetch(sym, years=years)
             except Exception as exc:
@@ -2045,10 +2693,17 @@ def _fill_via_zacks(
                 # suppresses the gap fill that would replace it (the refresh
                 # selector counts any row as coverage). The raw layer keeps the
                 # original response, so nothing is lost for replay.
+                # Audit 2026-08-16: require at least one ACTUAL rather than an
+                # EPS specifically. Zacks' sales table runs deeper than its EPS
+                # table (12 revenue-only quarters for AAPL), and that revenue
+                # was being fetched and then discarded. INT-7's concern was
+                # placeholder rows with NO data suppressing their own repair;
+                # coverage is still keyed on `reported_eps` in
+                # find_smart_refresh_candidates, so a revenue-only row cannot
+                # do that.
                 pending[sym] = [
                     h for h in hist_rows
-                    if h.get("reported_eps") is not None
-                    and not pd.isna(h.get("reported_eps"))
+                    if _has_any_actual(h)
                     and (pd.isna(pd.to_datetime(h.get("period_ending"),
                                                 errors="coerce"))
                          or pd.to_datetime(h["period_ending"]) >= cutoff)
@@ -2059,6 +2714,7 @@ def _fill_via_zacks(
                 for r in rows:
                     raw_pending.append({"ticker": sym, **r})
                 affected_total.append(sym)
+                completed.add(sym)
                 filled += 1
                 consec_errors = 0
 
@@ -2084,6 +2740,7 @@ def _fill_via_zacks(
                     label, spike_parse_fails, spike_attempts,
                     spike_parse_fails * 100.0 / spike_attempts,
                 )
+                spike_halted = True
                 break
 
             if len(pending) >= flush_every:
@@ -2096,6 +2753,10 @@ def _fill_via_zacks(
                 # keeping them means the next flush retries with everything.
                 if _flush_pending_to_disk(pending, affected_total) is not False:
                     _flush_raw()
+                    # Checkpoint LAST, so it can never claim a ticker whose
+                    # rows aren't on disk yet — the same ordering contract
+                    # run_fill_loop documents (S1).
+                    _save_zacks_checkpoint(run_id, completed)
                     log.info(
                         "%s: flushed %d ticker(s) (%d/%d processed, "
                         "%d filled, %d errors so far)",
@@ -2152,6 +2813,13 @@ def _fill_via_zacks(
     if pending:
         _flush_pending_to_disk(pending, affected_total)
     _flush_raw()
+    _save_zacks_checkpoint(run_id, completed)
+
+    # A clean end clears the checkpoint so the next bulk starts fresh instead
+    # of resuming a finished run. A stop or a parse-spike halt KEEPS it — those
+    # are exactly the runs worth resuming (S1, mirroring run_fill_loop).
+    if not (stop_flag and stop_flag[0]) and not spike_halted:
+        fill_framework.clear_checkpoint(config.ZACKS_BULK_CHECKPOINT, log)
 
     # Audit H3 + L8: single sorted save + single reconcile at end of fill,
     # rather than per-flush. The Days-Since / Days-Until ER filters may
@@ -2174,12 +2842,19 @@ def bulk_fill_zacks(
     on_block_callback=None,
     consec_error_limit: int = 5,
     failed_cb=None,
+    resume_from_checkpoint: bool = True,
 ) -> tuple[int, int]:
     """Iterate every ticker in the universe and pull `years` of earnings
     history from Zacks. Returns (filled, errors). Long-running — at the
     1.5s default pacing this is ~6.5 hours for a 15k-ticker universe.
     Use the per-flush save so an interrupted run doesn't lose the
     quarters it already pulled.
+
+    Resumes from `config.ZACKS_BULK_CHECKPOINT` by default (audit 2026-08-16,
+    S1) — this was the only fill without one, so a kill meant restarting the
+    whole 6.5 hours. Pass ``resume_from_checkpoint=False`` for a forced fresh
+    start. A checkpoint older than a day is ignored, so an abandoned run can't
+    silently skip most of the universe.
 
     `on_block_callback`: optional Imperva auto-pause hook (see
     `_fill_via_zacks` for semantics).
@@ -2195,6 +2870,7 @@ def bulk_fill_zacks(
         consec_error_limit=consec_error_limit,
         on_block_callback=on_block_callback,
         failed_cb=failed_cb,
+        resume_from_checkpoint=resume_from_checkpoint,
     )
 
 

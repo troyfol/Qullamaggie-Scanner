@@ -119,7 +119,7 @@ def bulk_fill_nasdaq(
         })
 
     existing = ec.load_earnings_cache()
-    ec._merge_and_save(new_rows, existing)
+    ec._merge_and_save(new_rows, existing, source="nasdaq")
 
     # Reconcile so the freshly-written nasdaq-source rows get folded
     # into the priority chain alongside any existing Zacks/Finnhub

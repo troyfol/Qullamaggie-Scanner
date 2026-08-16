@@ -376,31 +376,87 @@ def _row_to_dict(row: list, *, kind: str) -> Optional[dict]:
 
 def _merge_and_filter(
     eps_rows: list[dict], rev_rows: list[dict], cutoff: pd.Timestamp,
+    stats: Optional[dict] = None,
 ) -> list[dict]:
-    """Merge EPS and Revenue rows on `report_date`, drop anything older
-    than `cutoff`, and emit one dict per quarter newest-first with all 11
-    spec fields populated (None for missing values)."""
-    by_date: dict[pd.Timestamp, dict] = {}
+    """Merge EPS and Revenue rows on `period_ending`, drop anything whose
+    `report_date` is older than `cutoff`, and emit one dict per quarter
+    newest-first with all 11 spec fields populated (None for missing values).
+
+    Audit 2026-08-16: the join key moved from ``report_date`` to
+    ``period_ending``. Two reasons:
+
+    * ``period_ending`` is the QUARTER'S identity everywhere else in this
+      codebase — ``dedupe_history``, ``verify_integrity`` and every scan lookup
+      key on ``(ticker, period_ending)``, and the other two sources normalise
+      to it explicitly. Zacks was the one place where an announcement date was
+      load-bearing for identity rather than for display.
+    * Keying on ``report_date`` silently LOST a quarter whenever two were
+      announced on the same day — a catch-up filing after a delinquency, which
+      does happen — because ``by_date[rd] = dict(r)`` overwrote the first with
+      the second.
+
+    Verified safe against the cached real AAPL page before making the change:
+    both tables carry ``period_ending`` in cell[1] (55/55 EPS rows and 67/67
+    SALES rows non-null) and they agree on it for all 55 shared report dates.
+    Zacks emits the period as ``"12/2025"``, which is why every parsed value
+    already lands on day 1 — the cross-source day-1 convention comes from the
+    source format, not from normalisation code.
+
+    The ``report_date`` cutoff is deliberately UNCHANGED, so which rows survive
+    is exactly what it was; only the identity key moved.
+
+    ``stats``: optional dict the caller can pass to collect drop counts
+    (``no_period`` / ``no_report_date`` / ``pre_cutoff`` / ``collisions``).
+    Populated in place; the return value is unchanged so existing callers and
+    tests are unaffected.
+    """
+    counts = {"no_period": 0, "no_report_date": 0,
+              "pre_cutoff": 0, "collisions": 0}
+    by_period: dict[pd.Timestamp, dict] = {}
+
+    def _keep(r: dict) -> Optional[pd.Timestamp]:
+        """Return the row's merge key, or None when it must be dropped."""
+        rd = r.get("report_date")
+        if rd is None:
+            # A row parsed by _row_to_dict on the strength of its
+            # period_ending alone. Historically dropped here silently; now
+            # counted so we can tell whether the permissive branch in
+            # _row_to_dict ever actually fires on live pages.
+            counts["no_report_date"] += 1
+            return None
+        if rd < cutoff:
+            counts["pre_cutoff"] += 1
+            return None
+        pe = r.get("period_ending")
+        if pe is None:
+            counts["no_period"] += 1
+            return None
+        return pe
 
     for r in eps_rows:
-        rd = r.get("report_date")
-        if rd is None or rd < cutoff:
+        pe = _keep(r)
+        if pe is None:
             continue
-        by_date[rd] = dict(r)
+        if pe in by_period:
+            counts["collisions"] += 1
+        by_period[pe] = dict(r)
 
     for r in rev_rows:
-        rd = r.get("report_date")
-        if rd is None or rd < cutoff:
+        pe = _keep(r)
+        if pe is None:
             continue
-        if rd in by_date:
+        if pe in by_period:
             for k in ("estimated_rev", "reported_rev",
                       "surprise_rev", "surprise_rev_pct"):
                 if k in r:
-                    by_date[rd][k] = r[k]
-            if by_date[rd].get("period_ending") is None and r.get("period_ending"):
-                by_date[rd]["period_ending"] = r["period_ending"]
+                    by_period[pe][k] = r[k]
+            if by_period[pe].get("report_date") is None and r.get("report_date"):
+                by_period[pe]["report_date"] = r["report_date"]
         else:
-            by_date[rd] = dict(r)
+            by_period[pe] = dict(r)
+
+    if stats is not None:
+        stats.update(counts)
 
     fields = (
         "period_ending", "report_date", "report_time",
@@ -408,8 +464,8 @@ def _merge_and_filter(
         "estimated_rev", "reported_rev", "surprise_rev", "surprise_rev_pct",
     )
     return [
-        {k: by_date[rd].get(k) for k in fields}
-        for rd in sorted(by_date.keys(), reverse=True)
+        {k: by_period[pe].get(k) for k in fields}
+        for pe in sorted(by_period.keys(), reverse=True)
     ]
 
 
@@ -997,6 +1053,9 @@ class ZacksSession:
         # the failure was a real Imperva block, not "ticker not on Zacks"
         # / network glitch / parse hiccup. None when last fetch succeeded.
         self.last_failure_kind: Optional[str] = None
+        # Audit 2026-08-16: per-fetch merge drop counts (see
+        # _merge_and_filter's `stats`). Volatile — read it after each fetch().
+        self.last_merge_stats: dict = {}
 
     def __enter__(self) -> "ZacksSession":
         # impersonate=<chrome version> is the secret sauce — libcurl
@@ -1158,7 +1217,17 @@ class ZacksSession:
         eps_rows = [d for r in eps_raw if (d := _row_to_dict(r, kind="eps")) is not None]
         rev_rows = [d for r in rev_raw if (d := _row_to_dict(r, kind="rev")) is not None]
 
-        merged = _merge_and_filter(eps_rows, rev_rows, cutoff)
+        merge_stats: dict = {}
+        merged = _merge_and_filter(eps_rows, rev_rows, cutoff, merge_stats)
+        self.last_merge_stats = merge_stats
+        # Anything other than the ordinary pre-cutoff trim is worth surfacing:
+        # a row dropped for a missing date is invisible everywhere else (it
+        # doesn't reach failed_cb and doesn't feed the parse-spike alarm), so
+        # it would look exactly like the F1 truncation it is not.
+        odd = {k: v for k, v in merge_stats.items()
+               if k != "pre_cutoff" and v}
+        if odd:
+            log.warning("[%s] merge dropped/collided rows: %s", symbol, odd)
         log.debug("[%s] fetched %d quarters (within %d-yr window)",
                   symbol, len(merged), years)
         self.last_failure_kind = None

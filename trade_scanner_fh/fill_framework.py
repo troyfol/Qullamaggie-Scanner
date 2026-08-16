@@ -199,6 +199,10 @@ def flush_pending_to_disk(
         # nano-caps): source EPS actuals can carry pre-split / total-NI
         # values for sub-$5 tickers; null them before they hit disk.
         new_df = eh.sanitize_eps_artifacts(new_df)
+        # Audit 2026-08-16: a batch whose revenue is entirely None arrives as
+        # an OBJECT column and would drag the on-disk float64 column to object
+        # on concat (pandas 2.2 warns; pandas 3 does it). Coerce at the origin.
+        new_df = eh.coerce_value_dtypes(new_df)
 
         # Defensive: if any caller violates the (ticker, period_ending)
         # invariant within a single batch, dedup here keeping last.
@@ -228,11 +232,21 @@ def flush_pending_to_disk(
             return False
 
         if existing is not None and not existing.empty:
-            new_tickers = set(new_df["ticker"].dropna().astype(str).unique())
-            mask_replace = (
-                existing["ticker"].astype(str).isin(new_tickers)
-                & (existing["source"] == source)
-            )
+            # Audit 2026-08-16 (F1, CRITICAL): this used to drop EVERY
+            # (ticker, source) row and write whatever this response returned,
+            # so a 200-OK-but-short response silently truncated the ticker's
+            # history. `rows_superseded_by` scopes the deletion to the span the
+            # response actually covers — while still letting a full response
+            # withdraw a restated quarter. Single implementation shared with
+            # earnings_history._flush_pending_to_disk (the zacks path).
+            mask_replace = eh.rows_superseded_by(existing, new_df, source)
+            # Audit 2026-08-16 (F15): a superseded row may be holding a value
+            # for ANOTHER source (source=finviz carrying zacks revenue, say),
+            # and the donor row was deleted by the merge that created it. A
+            # fill may only retract what it owns, so foreign values ride
+            # across onto the incoming row.
+            new_df = eh.carry_forward_foreign_values(
+                existing, new_df, source, mask_replace)
             keep = existing.loc[~mask_replace]
             combined = pd.concat([keep, new_df], ignore_index=True)
         else:
