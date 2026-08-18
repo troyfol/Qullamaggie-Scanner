@@ -492,6 +492,7 @@ def _compute_ticker(
     sector_lookup: dict[str, str] | None = None,
     earnings_lookup: dict[str, tuple] | None = None,
     earnings_history_lookup: dict[str, pd.DataFrame] | None = None,
+    split_anchors: dict[str, pd.Timestamp] | None = None,
 ) -> Optional[dict]:
     """
     Load OHLCV, slice to the date window, compute all indicators.
@@ -541,6 +542,27 @@ def _compute_ticker(
         "pct_gain": pct,
         "gain_start_date": gain_start,
     }
+
+    # Post-split-anchored momentum (additive — `pct_gain` above is untouched).
+    #
+    # Part of the ALWAYS-ON bundle, paired with `pct_gain` exactly as
+    # `gain_start_date` is. RESULT_COLUMNS renders a column only when the key is
+    # present in the frame, so gating these behind a toggle would make them
+    # vanish from a filterless scan — and the whole point of carrying both
+    # measurements is being able to see them side by side without configuring
+    # anything. The cost is a dict lookup and, only for the ~18% of tickers that
+    # actually have an anchor, one extra slice.
+    split_anchor = (split_anchors or {}).get(symbol.upper())
+    if split_anchor is None:
+        # No anchor: reuse the values already computed rather than recomputing
+        # an identical result. Makes "identical when there is no split"
+        # structural instead of merely arithmetic.
+        row["pct_gain_post_split"] = pct
+        row["post_split_start_date"] = gain_start
+    else:
+        ps_pct, ps_start = indicators.pct_gain_post_split(window, split_anchor)
+        row["pct_gain_post_split"] = ps_pct
+        row["post_split_start_date"] = ps_start
 
     # Phase 3 I2 + Phase 8 §8.5: every indicator below is gated on
     # `_enabled OR _display_only`. Display-only computes the value
@@ -705,6 +727,10 @@ def _compute_ticker(
             and benchmark_data and "SPY" in benchmark_data:
         row["rs_market"] = indicators.relative_strength_ratio(
             full_to_end, benchmark_data["SPY"],
+            lookback=params.rs_market_lookback,
+        )
+        row["rs_market_post_split"] = indicators.relative_strength_post_split(
+            full_to_end, benchmark_data["SPY"], split_anchor,
             lookback=params.rs_market_lookback,
         )
 
@@ -1603,6 +1629,14 @@ class ScanContext:
     earnings_lookup: dict[str, tuple] = field(default_factory=dict)
     earnings_history_lookup: dict[str, pd.DataFrame] = field(
         default_factory=dict)
+    # Tickers whose cached series is discontinuous at a split ex-date. Loaded
+    # here rather than in `run_scan` so a sequenced run reads the file once
+    # instead of once per chunk. See config.SPLIT_SEAM_SKIP_FILE.
+    seam_skip: frozenset[str] = field(default_factory=frozenset)
+    # {ticker -> most recent qualifying split ex-date}, for the post-split
+    # momentum columns. Precomputed so the scan path never widens its parquet
+    # read (EFF-5). See config.SPLIT_ANCHORS_PARQUET.
+    split_anchors: dict[str, pd.Timestamp] = field(default_factory=dict)
 
 
 def _needs_sector(params_list: list[ScanParams]) -> bool:
@@ -1628,6 +1662,24 @@ def build_scan_context(params_list: list[ScanParams]) -> ScanContext:
     satisfies every timeframe in it, not just the first.
     """
     ctx = ScanContext()
+
+    # ── Split-adjustment seam quarantine ──
+    # Cheap (one small text file) and unconditional: the exclusion is a data
+    # -integrity guard, not a filter the user opted into.
+    from .data_engine import load_split_anchors, load_split_seam_skip
+    ctx.seam_skip = load_split_seam_skip()
+    if ctx.seam_skip:
+        log.info("Split-seam quarantine: %d ticker(s) will be excluded",
+                 len(ctx.seam_skip))
+
+    # ── Split anchors for the post-split momentum columns ──
+    ctx.split_anchors = load_split_anchors()
+    if ctx.split_anchors:
+        log.info("Split anchors loaded for %d ticker(s)",
+                 len(ctx.split_anchors))
+    else:
+        log.info("No split_anchors.parquet — post-split columns will mirror "
+                 "their un-anchored counterparts")
 
     # ── Sector map → O(1) ticker → sector-ETF ──
     if _needs_sector(params_list):
@@ -1758,6 +1810,21 @@ def run_scan(
     earnings_lookup = context.earnings_lookup
     earnings_history_lookup = context.earnings_history_lookup
 
+    # ── Split-seam quarantine ──
+    # Dropped BEFORE compute so the excluded tickers never reach an indicator,
+    # and recorded as a funnel stage so the exclusion is visible rather than
+    # silent. Their series steps by the split ratio at the ex-date, which pins
+    # any window spanning it at roughly -100%.
+    if context.seam_skip:
+        before = len(symbols)
+        symbols = [s for s in symbols if s.upper() not in context.seam_skip]
+        dropped = before - len(symbols)
+        if dropped:
+            result.funnel.append(
+                FunnelStage("Split-seam quarantine", len(symbols), before))
+            log.info("Split-seam quarantine dropped %d/%d ticker(s)",
+                     dropped, before)
+
     # ── Phase A: Compute indicators for all tickers ──
     #
     # Audit 2026-08-12 (EFF-1): this loop was strictly single-threaded over the
@@ -1788,7 +1855,7 @@ def run_scan(
         try:
             return (i, _compute_ticker(
                 sym, params, benchmark_data, sector_lookup, earnings_lookup,
-                earnings_history_lookup,
+                earnings_history_lookup, context.split_anchors,
             ), None)
         except Exception as exc:
             log.debug("Error computing %s: %s", sym, exc)

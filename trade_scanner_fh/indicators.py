@@ -130,6 +130,104 @@ def pct_gain_over_period(df: pd.DataFrame) -> tuple[float, "_date | None"]:
 # individual-ticker indicator.
 
 
+# ============================================================================
+# Post-split-anchored momentum (ADDITIVE — the originals are untouched)
+# ============================================================================
+#
+# `pct_gain_over_period` and `relative_strength_ratio` measure from the first
+# bar of the window. Across a reverse split that is the TRUE buy-and-hold
+# return, and it is not wrong — a holder of ACON really did lose 99.9993%.
+# But a breakout scan is asking a different question: how far has the stock run
+# off the base it trades on NOW. Measured over the cached window, 205 tickers
+# moved >+30% since their last split while the full-window figure read < -50%,
+# and 111 of those moved >+100% (BESS +5,386% reading as -88%).
+#
+# These are therefore a DIFFERENT MEASUREMENT, not a correction, and they live
+# in their own columns so every saved preset keeps its exact current meaning.
+#
+# Minimum post-anchor bars before a figure is reported at all. Below this the
+# base is a single price with no context, which is noise rather than a signal.
+MIN_POST_SPLIT_BARS = 3
+
+
+def anchor_after_split(df: pd.DataFrame, anchor):
+    """Slice ``df`` to the split-anchored sub-window.
+
+    Returns ``(frame, anchored)``. ``anchored`` is False — and the frame is
+    returned unchanged — when there is no anchor, the anchor predates the
+    window, or too few bars follow it. Callers then report the un-anchored
+    value, so a ticker with no split reads identically in both columns.
+
+    The ex-date bar is EXCLUDED. It "should" already be quoted on the
+    post-split basis, but empirically it is not always: GTIC's 1-for-100 on
+    2025-04-25 leaves that bar at 1.70 on the OLD basis and only steps to 0.21
+    the following session. Anchoring on it therefore picks a base price from
+    the wrong regime — GTIC read -14.7% where the true post-split move is
+    +590%. Skipping one bar costs nothing over a window of a hundred-plus and
+    is robust to the boundary landing on either side of the stamped date.
+    """
+    if df is None or df.empty or anchor is None:
+        return df, False
+    try:
+        ts = pd.Timestamp(anchor)
+    except (TypeError, ValueError):
+        return df, False
+    if pd.isna(ts):
+        return df, False
+    idx = df.index
+    if getattr(idx, "tz", None) is not None:
+        ts = ts.tz_localize(idx.tz) if ts.tzinfo is None else ts
+    if ts <= idx[0]:
+        return df, False          # split predates the window: nothing to anchor
+    sub = df.loc[idx > ts]
+    if len(sub) < MIN_POST_SPLIT_BARS:
+        return df, False
+    return sub, True
+
+
+def pct_gain_post_split(df: pd.DataFrame, anchor) -> tuple[float, "_date | None"]:
+    """#4b  % gain measured from the most recent split ex-date.
+
+    Identical to `pct_gain_over_period` when the ticker has no qualifying split
+    inside the window, so the two columns only diverge where a split exists.
+    """
+    sub, anchored = anchor_after_split(df, anchor)
+    if not anchored:
+        return pct_gain_over_period(df)
+    return pct_gain_over_period(sub)
+
+
+def relative_strength_post_split(
+    stock_df: pd.DataFrame,
+    bench_df: pd.DataFrame,
+    anchor,
+    *,
+    lookback: int,
+) -> float:
+    """#RS-b  Relative strength measured from the most recent split ex-date.
+
+    The benchmark is sliced by DATE to the stock's anchored range rather than
+    by position: a thin ticker can be missing bars the benchmark has, and
+    positional slicing would then silently compare two different periods.
+    """
+    sub, anchored = anchor_after_split(stock_df, anchor)
+    if not anchored:
+        return relative_strength_ratio(stock_df, bench_df, lookback=lookback)
+    if bench_df is None or bench_df.empty or len(sub) < 2:
+        return np.nan
+    bench = bench_df.loc[sub.index[0]:sub.index[-1]]
+    if len(bench) < 2:
+        return np.nan
+    s_first, s_last = sub["Close"].iloc[0], sub["Close"].iloc[-1]
+    b_first, b_last = bench["Close"].iloc[0], bench["Close"].iloc[-1]
+    if s_first == 0 or b_first == 0:
+        return np.nan
+    bench_ret = b_last / b_first
+    if abs(bench_ret) < 1e-10:
+        return np.nan
+    return min((s_last / s_first) / bench_ret, 10.0)
+
+
 def _trailing_true_count(mask: np.ndarray) -> int:
     """Return the length of the trailing True run in a boolean array.
     Vectorized helper shared by consecutive_gaps up/down."""

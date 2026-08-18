@@ -1144,6 +1144,13 @@ RESULT_COLUMNS = [
     ("Close",             "close",               lambda x: f"${x:.2f}"),
     ("% Gain",            "pct_gain",            lambda x: f"{x:.1f}%"),
     ("Gain Start",        "gain_start_date",     _fmt_date),
+    # Post-split-anchored momentum. A DIFFERENT MEASUREMENT, not a correction:
+    # `% Gain` is the true buy-and-hold return over the window, while these
+    # measure from the most recent split ex-date — the base the stock actually
+    # trades on now. Identical to their neighbours for any ticker without a
+    # split in the window, which is ~89% of the universe.
+    ("% Gain P/S",        "pct_gain_post_split", lambda x: f"{x:.1f}%"),
+    ("P/S Start",         "post_split_start_date", _fmt_date),
     ("STI",               "sti",                 lambda x: f"{x:.3f}"),
     ("Dist High %",       "dist_high_pct",       lambda x: f"{x:.1f}%"),
     ("ADR%",              "adr_pct",             lambda x: f"{x:.2f}%"),
@@ -1170,6 +1177,7 @@ RESULT_COLUMNS = [
     ("Avg Vol",           "avg_vol",             lambda x: f"{x:,.0f}"),
     ("$ Vol",             "dollar_vol",          lambda x: f"${x:,.0f}"),
     ("RS S&P",            "rs_market",           lambda x: f"{x:.2f}"),
+    ("RS S&P P/S",        "rs_market_post_split", lambda x: f"{x:.2f}"),
     ("RS Nas",            "rs_nasdaq",           lambda x: f"{x:.2f}"),
     ("RS Sec",            "rs_sector",           lambda x: f"{x:.2f}"),
     ("Days Since ER",     "days_since_er",       lambda x: str(int(x))),

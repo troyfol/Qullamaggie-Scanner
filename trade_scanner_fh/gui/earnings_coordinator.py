@@ -29,6 +29,7 @@ Design notes (load-bearing for the test suite — do not "simplify"):
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime
 
 from PyQt6.QtCore import QObject
@@ -288,6 +289,11 @@ class EarningsRefreshCoordinator(QObject):
         refresh disabled, or a stopped/partial OHLCV update) while still
         letting the Nasdaq sweep run on its own cadence.
         """
+        # Split artifacts are rebuilt BEFORE the earnings work is triggered, so
+        # the seam quarantine and the momentum anchors reflect the OHLCV update
+        # that just finished rather than the previous launch's.
+        self._kick_off_split_artifacts_rebuild()
+
         self._pending_smart_refresh = want_smart
         swept = self.win._maybe_run_nasdaq_refresh()
         if not swept:
@@ -296,6 +302,48 @@ class EarningsRefreshCoordinator(QObject):
             self._pending_smart_refresh = False
             if want_smart:
                 self.win._kick_off_smart_refresh()
+
+    def _kick_off_split_artifacts_rebuild(self) -> None:
+        """Rebuild the split seam skip-list and the momentum anchor sidecar.
+
+        Runs on a DAEMON THREAD, not the GUI thread: the sweep touches every
+        cached parquet and measured ~50 s over 14.6k files, which would freeze
+        the window for that whole time. Nothing downstream blocks on it — the
+        artifacts are consumed later by `build_scan_context`, and the earnings
+        refresh that follows runs for minutes, so in practice the rebuild is
+        finished well before the first scan.
+
+        Both readers degrade cleanly if a scan somehow beats it: an absent or
+        stale skip-list scans more tickers, and absent anchors make the
+        post-split columns mirror their un-anchored counterparts. Both writes
+        are atomic, so a scan running mid-rebuild cannot see a torn file.
+
+        Failures are logged and swallowed — a broken sweep must never stop the
+        earnings refresh from being triggered.
+        """
+        if getattr(self, "_split_rebuild_thread", None) is not None:
+            if self._split_rebuild_thread.is_alive():
+                log.debug("Split-artifact rebuild already running — skipping")
+                return
+
+        def _run():
+            try:
+                from ..data_engine import rebuild_split_artifacts
+                summary = rebuild_split_artifacts()
+                log.info(
+                    "Split artifacts ready: %d anchor(s), %d quarantined "
+                    "ticker(s) (%.1fs)",
+                    summary.get("anchors", 0),
+                    summary.get("seam_tickers", 0),
+                    summary.get("elapsed_sec", 0.0),
+                )
+            except Exception as exc:
+                log.warning("Split-artifact rebuild failed: %s", exc)
+
+        self._split_rebuild_thread = threading.Thread(
+            target=_run, name="split-artifacts", daemon=True)
+        self._split_rebuild_thread.start()
+        log.info("Split-artifact rebuild started (background)")
 
     def _maybe_run_nasdaq_refresh(self) -> bool:
         """Kick off the daily Nasdaq calendar sweep if enabled and due.

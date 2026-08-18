@@ -70,6 +70,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from . import config
@@ -122,6 +123,10 @@ COLUMNS: list[str] = [
     # the Morning Scanner repo reads this parquet, and appending leaves every
     # existing column at its existing position.
     "eps_source", "rev_source",
+    # Why a row's EPS looked implausible, "" when it did not. Replaces the old
+    # behaviour of NULLING those rows — see `flag_eps_basis`. Appended at the
+    # end for the same Morning Scanner reason as the two above.
+    "eps_flag",
 ]
 
 # Reported actuals mix freely across sources, per column. All three quote the
@@ -173,12 +178,46 @@ _ESTIMATE_COLUMNS: tuple[str, ...] = (
 _MAX_QUARTER_GAP_DAYS = 135
 
 
-# EPS columns nulled together when a row's reported_eps is an implausible
-# reverse-split artifact (see _implausible_eps_mask).
+# EPS columns that move together when a row's reported_eps is implausible.
 _EPS_FIELDS: tuple[str, ...] = (
     "estimated_eps", "reported_eps", "surprise_eps",
     "surprise_eps_pct", "yoy_eps_pct",
 )
+
+# ── EPS plausibility flags ─────────────────────────────────────────────
+#
+# WHY THESE ARE FLAGS AND NOT DELETIONS
+#
+# A heavily reverse-split nano-cap stores an enormous per-share EPS, and that
+# value is ARITHMETICALLY CORRECT: it is the as-reported figure restated onto
+# the current share basis. ABTC's 2019 quarter reads -7800 because -$0.26 was
+# restated through a cumulative 30,000x of subsequent reverse splits, and the
+# cached price for that same quarter reads $96,000 — the identical factor.
+# Nulling those rows destroys real data, and de-adjusting them back to the
+# as-reported basis would BREAK YoY, which is only comparable because every
+# quarter is restated onto one common basis.
+#
+# THE BASIS BUG THIS REPLACES
+#
+# The previous guard compared a restated EPS against `_load_current_prices` —
+# TODAY's close. EPS at factor F(t) against a price at factor 1 is not a
+# comparison at all, and it fails toward destroying data: ABTC scored
+# 7800 / 7.12 = 1096x and was judged an artifact.
+#
+# Because EPS and price carry the SAME factor, |eps| / price is basis-INVARIANT
+# when both are taken at the same date. Comparing against the close on the
+# row's own period_ending therefore needs no magnitude threshold to work, and
+# it spares the two populations a size cut-off cannot tell apart:
+#   * ABTC 2019   -7800 vs a $96,000 restated close -> 0.08x, sane
+#   * BRK-A       ~9,000 EPS on a ~$700,000 share   -> 0.01x, sane
+# while still catching a genuine artifact (a $600 EPS on a $5 stock).
+EPS_FLAG_NONE = ""
+EPS_FLAG_PRICE = "price"      # |eps| >> the close on this row's period_ending
+EPS_FLAG_ABS = "abs"          # beyond MAX_PLAUSIBLE_EPS and unverifiable
+
+# OHLCV covers OHLCV_HISTORY_YEARS; earnings run far deeper, so most rows have
+# no contemporaneous close. Those are left UNFLAGGED rather than judged against
+# a price from the wrong era — "cannot verify" is not "implausible".
 
 
 def _implausible_eps_mask(
@@ -194,58 +233,135 @@ def _implausible_eps_mask(
         stock's quarterly EPS is a small fraction of its price; a sub-$5
         nano-cap "earning" $600/share is impossible).
 
-    ``price_by_ticker``: optional ``{ticker: current_close}``. Omit it (the
-    write-time path, where price isn't available) to apply the absolute cap
-    only.
+    ``price_by_ticker``: optional ``{ticker: close}``. Omit it to apply the
+    absolute cap only.
+
+    Retained as the boolean view over ``flag_eps_basis`` for callers that only
+    need "is this row suspect". NOTE that a flagged row is no longer emptied —
+    see the module note above ``EPS_FLAG_NONE``.
     """
     if df is None or df.empty or "reported_eps" not in df.columns:
         return pd.Series(False, index=getattr(df, "index", pd.RangeIndex(0)))
-    ae = pd.to_numeric(df["reported_eps"], errors="coerce").abs()
-    mask = ae > config.MAX_PLAUSIBLE_EPS
+    prices = None
     if price_by_ticker:
-        price = pd.to_numeric(
+        prices = pd.to_numeric(
             df["ticker"].astype(str).map(price_by_ticker), errors="coerce",
         )
-        rel = price.notna() & (price > 0) & (
-            ae > config.EPS_PRICE_IMPLAUSIBLE_MULT * price
-        )
-        mask = mask | rel
-    return mask.fillna(False)
+    return flag_eps_basis(df, prices=prices) != EPS_FLAG_NONE
 
 
-def _null_eps_fields(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
-    """Return a copy of ``df`` with the EPS columns set to NaN on ``mask``
-    rows. Revenue + dates are kept — only the per-share EPS is untrusted, so
-    the row still carries a real report_date for the calendar."""
-    import numpy as np
+def _period_prices(df: pd.DataFrame) -> pd.Series:
+    """Close on each row's ``period_ending``, aligned to ``df.index``.
+
+    NaN where the ticker has no cached OHLCV or the period predates it. One
+    parquet read per candidate TICKER, not per row.
+
+    ``Series.asof`` takes the last close at or before the period end, which is
+    the price basis in force for that quarter — and, crucially, one carrying the
+    same cumulative split factor as the EPS it will be compared against.
+    """
+    empty = pd.Series(np.nan, index=df.index, dtype="float64")
+    if df.empty or "ticker" not in df.columns or "period_ending" not in df.columns:
+        return empty
+    ends = pd.to_datetime(df["period_ending"], errors="coerce")
+    if getattr(ends.dtype, "tz", None) is not None:
+        ends = ends.dt.tz_localize(None)
+    out = empty.copy()
+    for ticker, idx in df.groupby(df["ticker"].astype(str)).groups.items():
+        path = config.PARQUET_DIR / f"{ticker}.parquet"
+        if not path.exists():
+            continue
+        try:
+            close = pd.read_parquet(path, columns=["Close"])["Close"]
+        except Exception:
+            continue
+        if close.empty:
+            continue
+        if getattr(close.index, "tz", None) is not None:
+            close.index = close.index.tz_localize(None)
+        # A cache file with a non-datetime index cannot be asked "what was the
+        # price on this date". Leave those rows unpriced rather than raising —
+        # this runs on the ingest path, and one odd parquet must not take a
+        # whole flush down with it.
+        if not isinstance(close.index, pd.DatetimeIndex):
+            continue
+        close = close.sort_index()
+        want = ends.loc[idx].dropna()
+        if want.empty:
+            continue
+        got = close.asof(pd.DatetimeIndex(want.to_numpy()))
+        out.loc[want.index] = np.asarray(got, dtype="float64")
+    return out
+
+
+def flag_eps_basis(
+    df: pd.DataFrame, *, prices: Optional[pd.Series] = None,
+) -> pd.Series:
+    """Per-row EPS plausibility flag: ``""``, ``"price"`` or ``"abs"``.
+
+    ``prices`` is a per-row close aligned to ``df.index`` (from
+    ``_period_prices``). Rows without one are judged by the absolute cap alone,
+    and rows within it are left unflagged — see the note above on why "cannot
+    verify" must not read as "implausible".
+    """
+    if df is None or df.empty or "reported_eps" not in df.columns:
+        idx = getattr(df, "index", pd.RangeIndex(0))
+        return pd.Series(EPS_FLAG_NONE, index=idx, dtype="object")
+
+    ae = pd.to_numeric(df["reported_eps"], errors="coerce").abs()
+    flags = pd.Series(EPS_FLAG_NONE, index=df.index, dtype="object")
+
+    if prices is not None:
+        px = pd.to_numeric(prices, errors="coerce")
+        usable = px.notna() & (px > 0) & ae.notna()
+        # Basis-invariant: both sides carry the same cumulative split factor.
+        flags[usable & (ae > config.EPS_PRICE_IMPLAUSIBLE_MULT * px)] = \
+            EPS_FLAG_PRICE
+    else:
+        usable = pd.Series(False, index=df.index)
+
+    # Absolute cap only where the precise test could not run. A priced row has
+    # already been judged on the basis-invariant comparison, and overriding
+    # that with a magnitude rule would reintroduce exactly the false positives
+    # this replaces (BRK-A's real thousands-per-share among them).
+    flags[~usable & ae.notna() & (ae > config.MAX_PLAUSIBLE_EPS)] = EPS_FLAG_ABS
+    return flags
+
+
+def apply_eps_flags(
+    df: pd.DataFrame, *, prices: Optional[pd.Series] = None,
+) -> pd.DataFrame:
+    """Return a copy of ``df`` with ``eps_flag`` set. Values are NEVER altered:
+    revenue, dates and every EPS field are left exactly as supplied."""
+    if df is None or df.empty:
+        return df
     out = df.copy()
-    cols = [c for c in _EPS_FIELDS if c in out.columns]
-    if cols and mask.any():
-        out.loc[mask, cols] = np.nan
+    out["eps_flag"] = flag_eps_basis(out, prices=prices)
     return out
 
 
 def sanitize_eps_artifacts(df: pd.DataFrame) -> pd.DataFrame:
-    """INGEST-time, price-relative EPS artifact guard for the fill flush
-    paths (finviz / zacks / finnhub). Nulls the EPS columns on freshly-
-    fetched rows whose ``reported_eps`` is a reverse-split artifact —
-    ``|eps|`` exceeding the absolute cap OR ``EPS_PRICE_IMPLAUSIBLE_MULT`` ×
-    the ticker's current close.
+    """INGEST-time EPS plausibility STAMP for the fill flush paths
+    (finviz / zacks / finnhub). Sets ``eps_flag``; changes no value.
 
-    This is the WRITE-PATH counterpart to ``migrate_sanitize_absurd_eps``
-    (the one-time historical migration): incremental fills would otherwise
-    re-introduce nano-cap artifacts the absolute write-guard alone can't
-    catch (the $20-$100k band). Loads OHLCV only for candidate tickers
-    (|eps| > 20) in the supplied (small, freshly-fetched) ``df``, so a normal
-    flush with no large-EPS rows does zero OHLCV reads.
+    Compares each row against the close on its OWN ``period_ending`` rather
+    than today's, so the EPS and the price carry the same cumulative split
+    factor and the ratio means something. Reads OHLCV only for candidate
+    tickers (|eps| > 20), so an ordinary flush with no large-EPS rows does zero
+    parquet reads.
+
+    Name kept for its callers; it no longer sanitizes in the destructive sense.
     """
     if df is None or df.empty or "reported_eps" not in df.columns:
         return df
     ae = pd.to_numeric(df["reported_eps"], errors="coerce").abs()
-    cand = sorted(set(df.loc[ae > 20, "ticker"].astype(str)))
-    prices = _load_current_prices(cand) if cand else {}
-    mask = _implausible_eps_mask(df, price_by_ticker=prices)
-    return _null_eps_fields(df, mask) if mask.any() else df
+    cand = ae > 20
+    prices = _period_prices(df.loc[cand]) if cand.any() else None
+    if prices is not None:
+        full = pd.Series(np.nan, index=df.index, dtype="float64")
+        full.loc[prices.index] = prices
+        prices = full
+    return apply_eps_flags(df, prices=prices)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -331,6 +447,14 @@ def load_earnings_history() -> Optional[pd.DataFrame]:
     # on any row written before the columns existed — a pre-F13 row never took
     # part in a cross-source merge, so it owns both of its metric groups.
     df = ensure_group_sources(df)
+    # Rows written before `eps_flag` existed are simply unjudged, which is "" —
+    # NOT "implausible". Every consumer therefore sees a real column whether or
+    # not the store predates it.
+    if "eps_flag" not in df.columns:
+        df["eps_flag"] = EPS_FLAG_NONE
+    else:
+        flag = df["eps_flag"].astype("object")
+        df["eps_flag"] = flag.where(flag.notna(), EPS_FLAG_NONE)
     if "report_date_proxy" not in df.columns:
         df["report_date_proxy"] = False
     else:
@@ -454,13 +578,22 @@ def save_earnings_history(
         # exist, which is precisely why the read-side-only version could never
         # fire.
         out = dedupe_history(out, merge_sources=True)
-    # Sanity guard: null EPS fields on rows whose reported_eps is an
-    # impossible-magnitude reverse-split artifact. Absolute cap only here —
-    # the write path has no share price; the eps-sanitize migration does the
-    # precise price-relative pass. Cheap (a single abs comparison).
-    bad_eps = _implausible_eps_mask(out)
-    if bad_eps.any():
-        out = _null_eps_fields(out, bad_eps)
+    # Sanity STAMP: mark rows whose reported_eps is beyond any verifiable
+    # magnitude. Absolute cap only here, and deliberately so — this path runs on
+    # every flush, and pricing each row would put an OHLCV read on it. The
+    # precise, basis-invariant comparison belongs to the ingest guard
+    # (`sanitize_eps_artifacts`) and the whole-store pass
+    # (`migrate_sanitize_absurd_eps`), both of which price by period_ending.
+    #
+    # Rows arriving with a flag already set keep it: this only ever ADDS the
+    # absolute-cap verdict to rows nobody has judged yet, so a precise "price"
+    # verdict from ingest is never overwritten by the coarse rule here.
+    stamped = flag_eps_basis(out)
+    if "eps_flag" in out.columns:
+        prior = out["eps_flag"].astype("object").fillna(EPS_FLAG_NONE)
+        out["eps_flag"] = prior.where(prior != EPS_FLAG_NONE, stamped)
+    else:
+        out["eps_flag"] = stamped
     if sort:
         out = out.sort_values(["ticker", "period_ending"], ascending=[True, False])
     # Ensure the canonical column order even if caller passed extras
@@ -473,7 +606,8 @@ def save_earnings_history(
     # path — is what makes the category dtype persist across fills. pyarrow
     # round-trips it cleanly and all downstream ops (`==`, `.str.*`,
     # `.astype(str)`) tolerate category, so no reader needs to change.
-    for col in ("source", "report_time", "eps_source", "rev_source"):
+    for col in ("source", "report_time", "eps_source", "rev_source",
+                "eps_flag"):
         if col in out.columns:
             out[col] = out[col].astype("category")
     # Audit 2026-08-12 (INT-6): snapshot the current file before a CANONICAL
@@ -3333,6 +3467,17 @@ def migrate_backfill_finviz_history_from_raw(*, force: bool = False) -> tuple[in
         return (before, before)
 
     new_df = pd.DataFrame(rebuilt, columns=COLUMNS)
+    # Stamp the replayed rows exactly as a live fill would.
+    #
+    # This path used to bypass the EPS guard entirely, and that is precisely how
+    # ABTC's artifacts came back: the eps_sanitize pass cleaned the store, then
+    # a later launch replayed these same raw rows straight past it, through a
+    # save that applied only the absolute cap. Because both were one-shot
+    # sentinel-gated migrations that stamp independently, a backfill deferred to
+    # a later launch (it bails unstamped when no raw captures exist yet) landed
+    # AFTER sanitize had permanently retired — and `updated_at` is carried from
+    # the raw row, so the result looked like a row an earlier fill had blessed.
+    new_df = sanitize_eps_artifacts(new_df)
     if existing is not None and not existing.empty:
         combined = pd.concat([existing, new_df], ignore_index=True)
     else:
@@ -3362,51 +3507,49 @@ def _eps_sanitize_flag_path() -> Path:
     return config.DATA_DIR / _EPS_SANITIZE_FLAG_NAME
 
 
-def _load_current_prices(tickers) -> dict:
-    """Return ``{ticker: latest close}`` from the per-ticker OHLCV cache
-    (``config.PARQUET_DIR``) for the given tickers. Missing / unreadable /
-    empty parquets are omitted. Reads only the Close column for speed."""
-    prices: dict = {}
-    for t in tickers:
-        path = config.PARQUET_DIR / f"{t}.parquet"
-        if not path.exists():
-            continue
-        try:
-            d = pd.read_parquet(path, columns=["Close"])
-        except Exception:
-            try:
-                d = pd.read_parquet(path)
-            except Exception:
-                continue
-        if "Close" not in d.columns or d.empty:
-            continue
-        close = pd.to_numeric(d["Close"], errors="coerce").dropna()
-        if not close.empty:
-            prices[str(t)] = float(close.iloc[-1])
-    return prices
+# NOTE: a `_load_current_prices` helper used to live here, returning each
+# ticker's LATEST close. It was the input to the old EPS guard and is the exact
+# shape of the basis bug described above `EPS_FLAG_NONE` — a restated historical
+# EPS judged against a present-day price. It is deliberately gone rather than
+# left unused, so it cannot be reached for again. Use `_period_prices`.
 
 
 def migrate_sanitize_absurd_eps(*, force: bool = False) -> tuple[int, int]:
-    """Null EPS fields on rows whose ``reported_eps`` is a reverse-split
-    adjustment artifact, once (price-relative). Returns
-    ``(rows_nulled, candidate_tickers_priced)``.
+    """Stamp ``eps_flag`` across the WHOLE store, price-relative. Returns
+    ``(rows_flagged, candidate_tickers_priced)``.
 
-    Background: heavily-reverse-split nano-caps store nonsensical per-share
-    EPS (observed up to ~-4e11/share) from both finviz and zacks — split-
-    adjustment artifacts, not a source-correctness issue. The absolute write
-    guard in ``save_earnings_history`` catches the impossible-magnitude ones,
-    but the precise filter is price-relative (``_implausible_eps_mask`` with
-    the current close): an |EPS| far exceeding the share price can't be real.
-    This migration loads the current close for candidate tickers (any
-    |reported_eps| > a low pre-screen, to bound OHLCV reads) and nulls the
-    EPS columns on artifact rows. Revenue + dates are kept.
+    Each candidate row is compared against the close on its own
+    ``period_ending``, so EPS and price carry the same cumulative split factor
+    and the ratio is basis-invariant. Rows with no contemporaneous close fall
+    back to the absolute cap alone; rows inside it are left unflagged.
 
-    Dropped EPS values are recoverable from ``earnings_raw/`` if the policy
-    changes. ``force=True`` bypasses the flag (tests / manual re-run).
+    NO VALUE IS ALTERED. This previously nulled the EPS columns on every row it
+    judged, which destroyed correct data — a heavily reverse-split nano-cap's
+    enormous per-share EPS is the real as-reported figure restated onto the
+    current share basis, and its cached price for the same quarter carries the
+    identical factor. See the module note above ``EPS_FLAG_NONE``.
+
+    RUNS EVERY LAUNCH — this is no longer a one-shot migration, and that is the
+    structural fix for how ABTC's artifacts came back.
+
+    Two sentinel-gated one-shot migrations, where one's output is the other's
+    input, only stay correctly ordered WITHIN a single launch. The finviz
+    backfill bails without stamping when no raw captures exist yet, so it can
+    land on a later launch — after this pass has permanently retired. That is
+    exactly what happened: `.eps_sanitize_v1.done` is stamped 19:23 and
+    `.finviz_backfill_v1.done` 19:24, in the opposite order to the source, which
+    can only mean two different launches.
+
+    Making this recurring removes the hazard outright: whatever any other writer
+    reintroduces, the next launch re-stamps it. That is only safe because
+    flagging is idempotent and alters no value — it could never have been done
+    while this nulled rows. Cost is one OHLCV read per candidate ticker (~537 on
+    the current store), not per row.
+
+    The sentinel is still written, as a last-run marker only. ``force`` is
+    retained for callers and no longer gates anything.
     """
     flag_path = _eps_sanitize_flag_path()
-    if not force and flag_path.exists():
-        return (0, 0)
     df = load_earnings_history()
     if df is None or df.empty:
         # Audit 2026-08-12 (INT-9): do NOT stamp on the no-data path — that
@@ -3418,25 +3561,42 @@ def migrate_sanitize_absurd_eps(*, force: bool = False) -> tuple[int, int]:
         )
         return (0, 0)
 
-    # Pre-screen candidate tickers (any |reported_eps| above a low bar) so we
-    # only read OHLCV for names that could possibly be artifacts. Legit EPS
-    # rarely exceeds ~$20/share except high-priced stocks, which the price-
-    # relative rule then spares. The absolute cap still fires on any row
-    # regardless of whether its ticker got priced.
+    # Pre-screen candidates (any |reported_eps| above a low bar) so OHLCV is
+    # read only for names that could possibly be implausible. Legit EPS rarely
+    # exceeds ~$20/share except high-priced stocks, which the price-relative
+    # rule then spares.
     ae = pd.to_numeric(df["reported_eps"], errors="coerce").abs()
-    cand_tickers = sorted(set(df.loc[ae > 20, "ticker"].astype(str)))
-    prices = _load_current_prices(cand_tickers)
+    cand = ae > 20
+    cand_tickers = sorted(set(df.loc[cand, "ticker"].astype(str)))
+    prices = pd.Series(np.nan, index=df.index, dtype="float64")
+    if cand.any():
+        got = _period_prices(df.loc[cand])
+        prices.loc[got.index] = got
 
-    mask = _implausible_eps_mask(df, price_by_ticker=prices)
-    n = int(mask.sum())
-    if n:
-        df = _null_eps_fields(df, mask)
+    before = (
+        df["eps_flag"].astype("object").fillna(EPS_FLAG_NONE)
+        if "eps_flag" in df.columns
+        else pd.Series(EPS_FLAG_NONE, index=df.index, dtype="object")
+    )
+    df = apply_eps_flags(df, prices=prices)
+    n = int((df["eps_flag"] != EPS_FLAG_NONE).sum())
+
+    # Write only on an actual verdict change. Two reasons this matters now the
+    # pass is recurring: an unchanged store must not rewrite 12 MB and rotate a
+    # backup on every launch, and a row whose verdict CLEARS (its price moved)
+    # has to be persisted too — keying the write on "anything is flagged" would
+    # silently strand stale flags forever.
+    changed = int((before.to_numpy() != df["eps_flag"].to_numpy()).sum())
+    if changed:
         df = compute_yoy_columns(df)
         save_earnings_history(df, sort=True, dedup=False)
         log.info(
-            "eps_sanitize migration: nulled EPS on %d reverse-split artifact "
-            "row(s) across %d candidate ticker(s).", n, len(cand_tickers),
+            "eps_flag pass: %d verdict(s) changed; %d row(s) now flagged "
+            "across %d candidate ticker(s). No values were altered.",
+            changed, n, len(cand_tickers),
         )
+    else:
+        log.debug("eps_flag pass: no verdict changed (%d flagged)", n)
     try:
         config.atomic_write_text(flag_path, "ok\n")
     except OSError as exc:

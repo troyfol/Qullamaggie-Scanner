@@ -76,6 +76,55 @@ _STORED_COLUMNS = ["Open", "High", "Low", "Close", "Volume", "Stock Splits"]
 # 1.9 ms per file (155 s → 28 s across the universe).
 _SCAN_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
+# Relative tolerance for the whole-number test in `is_share_split`.
+SPLIT_INVERSE_TOL = 0.01
+
+
+def is_share_split(ratio) -> bool:
+    """True when a yfinance ``Stock Splits`` value describes a real SHARE
+    split rather than a spinoff / special distribution.
+
+    yfinance files several kinds of corporate action in the one `Stock Splits`
+    column. A genuine split exchanges N shares for 1 (or 1 for N), so either
+    the ratio or its inverse lands on a whole number:
+
+        1-for-20 reverse -> 0.05   (1/r = 20)      -> True
+        2-for-1 forward  -> 2.0    (r   = 2)       -> True
+
+    A spinoff carries the price-adjustment factor of the distribution, which
+    lands nowhere near a whole number. Measured over the cached 5-year window
+    (2,420 reverse events), 69 fail this test — every one a distribution
+    rather than a split:
+
+        GSK  0.8000 (1/r = 1.250)  Haleon demerger
+        UL   0.8880 (1/r = 1.126)  Unilever demerger
+        HON  0.9535 (1/r = 1.049)  Solstice separation
+        SLG  0.9700 (1/r = 1.031)  share count flat across the date
+        OUT  0.9760 (1/r = 1.025)  share count flat across the date
+
+    A magnitude cut-off cannot substitute for this: only 11 of the 69 have a
+    ratio >= 0.9, so thresholding on size misses most of them.
+
+    KNOWN LIMITATION — an N-for-M split with M > 1 (a 3-for-2 forward, or the
+    rare 2-for-3 reverse) also fails, because neither 1.5 nor 0.667 is a whole
+    number. That is deliberately conservative: a rejected event simply isn't
+    used as an anchor, which is safe. ALM's 2025-07-07/08 pair looks like exactly
+    this case, so treat a rejection as "needs review", not "proven not a split".
+    """
+    try:
+        r = float(ratio)
+    except (TypeError, ValueError):
+        return False
+    if not np.isfinite(r) or r <= 0.0 or r == 1.0:
+        return False
+    for cand in (r, 1.0 / r):
+        if cand < 1.0:
+            continue
+        nearest = round(cand)
+        if nearest >= 2 and abs(cand - nearest) / nearest <= SPLIT_INVERSE_TOL:
+            return True
+    return False
+
 
 def _parquet_path(symbol: str) -> Path:
     """Return the canonical parquet path for a ticker symbol.
@@ -1274,3 +1323,352 @@ def rebuild_ticker(symbol: str) -> ScrapeResult:
                     "Could not restore %s after a failed rebuild: %s", p, exc,
                 )
     return result
+
+
+# ── Split-adjustment seam detection ─────────────────────────────────────
+#
+# A back-adjusted series is CONTINUOUS across a split ex-date: close[ex] /
+# close[ex-1] reflects only that day's ordinary move. When that step instead
+# equals the split ratio, the pre-split bars were never adjusted and the file
+# carries a raw discontinuity — a false ~-100% move for any window spanning it.
+#
+# Measured over the cached 5-year window: 2,140 of 2,420 reverse events (88.4%)
+# are properly adjusted; 57 events across 55 tickers carry a seam. See
+# config.SPLIT_SEAM_SKIP_FILE for why those are a source defect and must not be
+# rebuilt.
+
+
+class SeamFinding(NamedTuple):
+    symbol: str
+    ex_date: pd.Timestamp
+    ratio: float
+    step: float
+    verdict: str
+
+
+def _seam_verdict(step: float, ratio: float) -> str:
+    """Classify one ex-date's price step. ``UNADJUSTED`` when the step tracks
+    the split ratio, ``adjusted`` when it tracks 1.0, ``ambiguous`` when it is
+    near neither."""
+    if not (np.isfinite(step) and np.isfinite(ratio)) or step <= 0 or ratio <= 0:
+        return "bad_price"
+    tol = np.log(config.SPLIT_SEAM_TOL)
+    near_ratio = abs(np.log(step / ratio)) <= tol
+    near_one = abs(np.log(step)) <= tol
+    if near_ratio and near_one:
+        # The two hypotheses' tolerance bands OVERLAP whenever the ratio sits
+        # within SPLIT_SEAM_TOL**2 of 1.0 — i.e. for a 2-for-1 or a 1-for-2,
+        # where "stepped by the ratio" and "stepped by an ordinary day's move"
+        # are only a factor of two apart. Letting the closer hypothesis win
+        # would decide such a call on noise: BDPT stepped x1.43 across a
+        # 2-for-1, equally consistent with an unadjusted split and with a
+        # routine nano-cap move. Refuse to decide instead — the cost of an
+        # "ambiguous" is that a ticker stays scannable, which is the safe
+        # direction for an exclusion list.
+        return "ambiguous"
+    if near_ratio:
+        return "UNADJUSTED"
+    if near_one:
+        return "adjusted"
+    return "ambiguous"
+
+
+def find_seams_in_frame(symbol: str, df: pd.DataFrame) -> list[SeamFinding]:
+    """Seam findings for one already-loaded OHLCV frame.
+
+    Only events that pass ``is_share_split`` are tested: a spinoff's
+    distribution factor is not a share ratio, and for factors near 1.0 the
+    "stepped by the ratio" and "stepped by 1.0" hypotheses are not separable
+    anyway.
+    """
+    if df is None or df.empty or "Stock Splits" not in df.columns:
+        return []
+    if "Close" not in df.columns:
+        return []
+    close = pd.to_numeric(df["Close"], errors="coerce")
+    splits = pd.to_numeric(df["Stock Splits"], errors="coerce").fillna(0.0)
+    n = len(df)
+    out: list[SeamFinding] = []
+
+    def _step(a: int, b: int) -> float:
+        """Close ratio between bar ``a`` and bar ``b``, or NaN if unusable."""
+        if a < 0 or b >= n:
+            return float("nan")
+        lo, hi = close.iloc[a], close.iloc[b]
+        if not np.isfinite(lo) or not np.isfinite(hi) or lo <= 0 or hi <= 0:
+            return float("nan")
+        return float(hi) / float(lo)
+
+    for pos, (ts, ratio) in enumerate(zip(df.index, splits.to_numpy())):
+        if not is_share_split(ratio):
+            continue
+        if pos == 0:
+            continue          # no prior bar to compare against
+        r = float(ratio)
+        # BOTH boundaries are tested. The adjustment does not always change
+        # basis exactly on the stamped ex-date: GTIC's 1-for-100 leaves the
+        # ex-date bar on the old basis and steps the session after. Checking
+        # only pos-1 -> pos would read that file as cleanly adjusted.
+        candidates = [_step(pos - 1, pos), _step(pos, pos + 1)]
+        verdicts = [(_seam_verdict(s, r), s) for s in candidates
+                    if np.isfinite(s)]
+        if not verdicts:
+            out.append(SeamFinding(symbol, ts, r, float("nan"), "bad_price"))
+            continue
+        for want in ("UNADJUSTED", "adjusted"):
+            hit = next((v for v in verdicts if v[0] == want), None)
+            if hit is not None:
+                out.append(SeamFinding(symbol, ts, r, hit[1], hit[0]))
+                break
+        else:
+            out.append(SeamFinding(symbol, ts, r, verdicts[0][1], "ambiguous"))
+    return out
+
+
+class SplitAnchor(NamedTuple):
+    symbol: str
+    last_ex_date: pd.Timestamp
+    cum_factor: float
+    n_events: int
+
+
+class SplitSweep(NamedTuple):
+    seams: list[SeamFinding]
+    anchors: list[SplitAnchor]
+    scanned: int
+
+
+def find_split_anchors_in_frame(
+    symbol: str, df: pd.DataFrame,
+) -> Optional[SplitAnchor]:
+    """The momentum anchor for one frame: the most recent qualifying split
+    ex-date, plus the cumulative factor across every qualifying event.
+
+    The anchor is the ex-date bar ITSELF, not the bar after it — that bar is
+    already quoted on the post-split share basis, so it is the first price a
+    "% gain since the split" should measure from.
+
+    Returns None when the ticker has no qualifying event, which is how ~82% of
+    the universe stays out of the sidecar entirely.
+    """
+    if df is None or df.empty or "Stock Splits" not in df.columns:
+        return None
+    splits = pd.to_numeric(df["Stock Splits"], errors="coerce").fillna(0.0)
+    keep = [(ts, float(r)) for ts, r in zip(df.index, splits.to_numpy())
+            if is_share_split(r)]
+    if not keep:
+        return None
+    cum = 1.0
+    for _, r in keep:
+        cum *= r
+    return SplitAnchor(symbol, pd.Timestamp(keep[-1][0]), cum, len(keep))
+
+
+def sweep_split_artifacts(
+    symbols: Optional[list[str]] = None,
+    *,
+    max_workers: int = 16,
+) -> SplitSweep:
+    """ONE pass over the cache producing both split artifacts.
+
+    Reads only Close and Stock Splits per file. Deliberately combined: the seam
+    audit and the anchor sidecar need the same two columns from the same 14.6k
+    files, and that sweep measured ~50 s — doing it twice would double the cost
+    of the launch hook for no benefit.
+    """
+    if symbols is None:
+        symbols = sorted(cached_symbols())
+
+    def _one(sym: str):
+        p = _parquet_path(sym)
+        if not p.exists():
+            return ([], None)
+        try:
+            df = pd.read_parquet(p, columns=["Close", "Stock Splits"])
+        except Exception:
+            return ([], None)
+        if df.empty:
+            return ([], None)
+        if getattr(df.index, "tz", None) is not None:
+            df.index = df.index.tz_localize(None)
+        df = df.sort_index()
+        return (find_seams_in_frame(sym, df),
+                find_split_anchors_in_frame(sym, df))
+
+    seams: list[SeamFinding] = []
+    anchors: list[SplitAnchor] = []
+    scanned = 0
+    with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
+        for found, anchor in ex.map(_one, symbols):
+            scanned += 1
+            seams.extend(found)
+            if anchor is not None:
+                anchors.append(anchor)
+    return SplitSweep(seams, anchors, scanned)
+
+
+def find_adjustment_seams(
+    symbols: Optional[list[str]] = None,
+    *,
+    max_workers: int = 16,
+) -> list[SeamFinding]:
+    """Seam findings only. Prefer ``sweep_split_artifacts`` when the anchors
+    are wanted too, so the cache is read once rather than twice."""
+    return sweep_split_artifacts(symbols, max_workers=max_workers).seams
+
+
+def rebuild_split_seam_skip(
+    symbols: Optional[list[str]] = None,
+    *,
+    findings: Optional[list[SeamFinding]] = None,
+) -> tuple[int, int]:
+    """Regenerate ``config.SPLIT_SEAM_SKIP_FILE`` from the cache.
+
+    Returns ``(tickers_written, events_found)``. Written one ticker per line
+    with a header comment; the file is GENERATED, so it is safe to delete and
+    is rewritten wholesale rather than merged.
+
+    ``findings`` lets a caller that already swept the cache
+    (``sweep_split_artifacts``) hand the results in rather than paying for a
+    second full pass.
+    """
+    if findings is None:
+        findings = find_adjustment_seams(symbols)
+    bad = [f for f in findings if f.verdict == "UNADJUSTED"]
+    tickers = sorted({f.symbol for f in bad})
+
+    lines = [
+        "# GENERATED by data_engine.rebuild_split_seam_skip() — do not hand-edit.",
+        "# Tickers whose cached price series is discontinuous at a split ex-date.",
+        "# Source defect (a fresh pull reproduces it) — DO NOT REBUILD THESE.",
+        "# Excluded at scan time only; downloads keep refreshing them.",
+        "# events=" + str(len(bad)) + "  tickers=" + str(len(tickers)),
+    ]
+    lines.extend(tickers)
+    try:
+        config.SPLIT_SEAM_SKIP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic: the scan path reads this file, and the rebuild runs on a
+        # background thread at launch, so a torn read is otherwise reachable.
+        config.atomic_write_text(
+            config.SPLIT_SEAM_SKIP_FILE, "\n".join(lines) + "\n")
+    except OSError as exc:
+        log.error("Could not write %s: %s", config.SPLIT_SEAM_SKIP_FILE, exc)
+        return (0, len(bad))
+
+    log.info("split-seam skip list rebuilt: %d ticker(s), %d event(s)",
+             len(tickers), len(bad))
+    return (len(tickers), len(bad))
+
+
+def load_split_seam_skip() -> frozenset[str]:
+    """Tickers to exclude from scan results. Empty when the file is absent, so
+    a store that has never run the builder simply scans everything."""
+    path = config.SPLIT_SEAM_SKIP_FILE
+    if not path.exists():
+        return frozenset()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        log.warning("Could not read %s: %s", path, exc)
+        return frozenset()
+    out = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # tolerate a comma-separated line, matching blacklist.txt's shape
+        for tok in line.split(","):
+            tok = tok.strip().upper()
+            if tok:
+                out.add(tok)
+    return frozenset(out)
+
+
+# ── Split anchor sidecar ────────────────────────────────────────────────
+#
+# The scan path CANNOT read `Stock Splits` itself: `_read_scan_frame` projects
+# to five columns precisely because carrying the sixth measured 10.4 ms → 1.9 ms
+# per file, i.e. ~155 s → ~28 s across the universe (EFF-5). Re-widening that
+# read to find split dates would hand back the entire saving on every scan.
+#
+# So the dates are precomputed ONCE per launch into a small parquet — ~2.7k
+# rows, one per ticker that actually has a split — and the scan path does a
+# dict lookup instead of a wider read.
+
+_ANCHOR_COLUMNS = ["ticker", "last_ex_date", "cum_factor", "n_events"]
+
+
+def write_split_anchors(anchors: list[SplitAnchor]) -> int:
+    """Persist the anchor sidecar. Returns the row count written."""
+    df = pd.DataFrame(
+        [(a.symbol, a.last_ex_date, a.cum_factor, a.n_events)
+         for a in anchors],
+        columns=_ANCHOR_COLUMNS,
+    )
+    if not df.empty:
+        df = df.sort_values("ticker").reset_index(drop=True)
+    try:
+        config.SPLIT_ANCHORS_PARQUET.parent.mkdir(parents=True, exist_ok=True)
+        config.atomic_write_parquet(
+            df, config.SPLIT_ANCHORS_PARQUET, engine="pyarrow")
+    except Exception as exc:
+        log.error("Could not write %s: %s", config.SPLIT_ANCHORS_PARQUET, exc)
+        return 0
+    return len(df)
+
+
+def load_split_anchors() -> dict[str, pd.Timestamp]:
+    """``{ticker: last qualifying split ex-date}``.
+
+    Empty when the sidecar is absent — a store that has never run the launch
+    hook simply gets the un-anchored columns, which is the documented fallback
+    rather than an error.
+    """
+    path = config.SPLIT_ANCHORS_PARQUET
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_parquet(path, columns=["ticker", "last_ex_date"])
+    except Exception as exc:
+        log.warning("Could not read %s: %s", path, exc)
+        return {}
+    if df.empty:
+        return {}
+    dates = pd.to_datetime(df["last_ex_date"], errors="coerce")
+    if getattr(dates.dtype, "tz", None) is not None:
+        dates = dates.dt.tz_localize(None)
+    out: dict[str, pd.Timestamp] = {}
+    for t, d in zip(df["ticker"].astype(str), dates):
+        if pd.notna(d):
+            out[t.upper()] = pd.Timestamp(d)
+    return out
+
+
+def rebuild_split_artifacts(
+    symbols: Optional[list[str]] = None,
+) -> dict:
+    """Rebuild BOTH split artifacts from one sweep of the cache.
+
+    This is the launch hook's entry point. Returns a summary dict for logging.
+    Full rebuild rather than incremental: the sweep is seconds, it runs once per
+    launch, and an incremental path would need a staleness story for every
+    interrupted run.
+    """
+    t0 = time.time()
+    sweep = sweep_split_artifacts(symbols)
+    tickers, events = rebuild_split_seam_skip(symbols, findings=sweep.seams)
+    rows = write_split_anchors(sweep.anchors)
+    elapsed = time.time() - t0
+    summary = {
+        "scanned": sweep.scanned,
+        "anchors": rows,
+        "seam_tickers": tickers,
+        "seam_events": events,
+        "elapsed_sec": round(elapsed, 1),
+    }
+    log.info(
+        "Split artifacts rebuilt: %d file(s) swept, %d anchor(s), "
+        "%d seam ticker(s)/%d event(s), %.1fs",
+        sweep.scanned, rows, tickers, events, elapsed,
+    )
+    return summary

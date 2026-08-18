@@ -1238,6 +1238,13 @@ def test_migrate_backfill_finviz_recovers_old_quarters_from_raw(tmp_parquets, mo
 # EPS sanitization — reverse-split artifact filtering
 # ----------------------------------------------------------------------
 
+def _ohlcv(dirpath, ticker, close, *, start="2021-01-04", periods=520):
+    """Write a cache-shaped OHLCV parquet: DatetimeIndex, flat close."""
+    idx = pd.bdate_range(start, periods=periods)
+    pd.DataFrame({"Close": [close] * len(idx)}, index=idx).to_parquet(
+        dirpath / f"{ticker}.parquet")
+
+
 def test_implausible_eps_mask_absolute_and_price_relative():
     df = pd.DataFrame([
         _row("ADTX", "2021-01-01", "2021-03-01", source="finviz", eps_rep=-4.3e11),
@@ -1247,17 +1254,17 @@ def test_implausible_eps_mask_absolute_and_price_relative():
     ])
     # Absolute cap only (no price): only the impossible-magnitude ADTX row.
     assert list(eh._implausible_eps_mask(df)) == [True, False, False, False]
-    # Price-relative: CETX $615 on a $0.50 stock is an artifact; NVR $120 on
+    # Price-relative: CETX $615 on a $0.50 stock is implausible; NVR $120 on
     # a $5,000 stock is legit; AAPL normal.
     prices = {"ADTX": 1.0, "CETX": 0.5, "NVR": 5000.0, "AAPL": 180.0}
     assert list(eh._implausible_eps_mask(df, price_by_ticker=prices)) == \
         [True, True, False, False]
 
 
-def test_save_nulls_absurd_eps_write_guard(tmp_parquets):
-    """save_earnings_history nulls the EPS columns on impossible-magnitude
-    rows (absolute cap), keeping the row's date + revenue; normal rows are
-    untouched."""
+def test_save_flags_absurd_eps_but_keeps_the_value(tmp_parquets):
+    """The canonical write path STAMPS eps_flag on an unverifiable magnitude.
+    It must not empty the row: nulling destroyed correct data, which is the
+    whole reason this changed."""
     eh.save_earnings_history(pd.DataFrame([
         _row("ADTX", "2021-01-01", "2021-03-01", source="finviz",
              eps_rep=-4.3e11, eps_est=-4.0e11, eps_surp=-3e10, eps_pct=12.0,
@@ -1266,72 +1273,260 @@ def test_save_nulls_absurd_eps_write_guard(tmp_parquets):
     ]))
     df = eh.load_earnings_history()
     adtx = df.loc[df["ticker"] == "ADTX"].iloc[0]
-    assert pd.isna(adtx["reported_eps"])
-    assert pd.isna(adtx["estimated_eps"])
-    assert pd.isna(adtx["surprise_eps"])
-    assert adtx["reported_rev"] == 5.0          # revenue kept
-    assert pd.notna(adtx["report_date"])        # date kept
+    assert adtx["eps_flag"] == eh.EPS_FLAG_ABS
+    assert adtx["reported_eps"] == -4.3e11      # VALUE KEPT
+    assert adtx["estimated_eps"] == -4.0e11
+    assert adtx["reported_rev"] == 5.0
+    assert pd.notna(adtx["report_date"])
     aapl = df.loc[df["ticker"] == "AAPL"].iloc[0]
-    assert aapl["reported_eps"] == 1.5          # normal row untouched
+    assert aapl["reported_eps"] == 1.5
+    assert aapl["eps_flag"] == eh.EPS_FLAG_NONE
 
 
-def test_migrate_sanitize_absurd_eps_price_relative(tmp_parquets, monkeypatch):
-    """The price-relative cleanup nulls a nano-cap artifact (|EPS| >> price)
-    and spares a legit high-priced stock, then is idempotent."""
+def test_eps_judged_against_its_own_period_not_todays_price(
+        tmp_parquets, monkeypatch):
+    """THE BUG THIS REPLACES. A restated historical EPS carries the cumulative
+    split factor; so does the price for that same quarter. Judging it against
+    TODAY's post-split price is a basis mismatch that condemns correct data.
+
+    ABTC's real shape: -7800 EPS for a 2019 quarter whose restated close was
+    ~$96,000, against a present-day close of $7.12.
+    """
     ohlcv = tmp_parquets / "ohlcv"
     ohlcv.mkdir()
     monkeypatch.setattr(eh.config, "PARQUET_DIR", ohlcv)
 
-    def _write_ohlcv(t, close):
-        pd.DataFrame({"Close": [close * 0.9, close]}).to_parquet(
-            ohlcv / f"{t}.parquet")
+    idx = pd.bdate_range("2019-01-01", periods=1500)
+    close = pd.Series(96_000.0, index=idx)
+    close.iloc[-260:] = 7.12          # post-split era
+    pd.DataFrame({"Close": close}).to_parquet(ohlcv / "ABTC.parquet")
 
-    _write_ohlcv("CETX", 0.5)      # nano-cap
-    _write_ohlcv("NVR", 5000.0)    # legit high-priced
+    df = pd.DataFrame([
+        _row("ABTC", "2019-09-30", "2019-11-15", source="finviz", eps_rep=-7800.0),
+    ])
+    out = eh.sanitize_eps_artifacts(df)
+    assert out.iloc[0]["eps_flag"] == eh.EPS_FLAG_NONE   # 7800 / 96000 -> sane
+    assert out.iloc[0]["reported_eps"] == -7800.0
+
+    # Against today's close the same row scores 7800/7.12 = 1096x and would
+    # have been condemned — the behaviour being removed.
+    assert eh._implausible_eps_mask(df, price_by_ticker={"ABTC": 7.12}).iloc[0]
+
+
+def test_high_priced_stock_with_huge_eps_is_not_flagged(
+        tmp_parquets, monkeypatch):
+    """BRK-A earns thousands per share on a ~$700k share. Large EPS is not
+    evidence of anything on its own."""
+    ohlcv = tmp_parquets / "ohlcv"
+    ohlcv.mkdir()
+    monkeypatch.setattr(eh.config, "PARQUET_DIR", ohlcv)
+    _ohlcv(ohlcv, "BRK-A", 700_000.0, start="2024-01-01", periods=600)
+
+    out = eh.sanitize_eps_artifacts(pd.DataFrame([
+        _row("BRK-A", "2025-06-30", "2025-08-02", source="finviz",
+             eps_rep=9030.0),
+    ]))
+    assert out.iloc[0]["eps_flag"] == eh.EPS_FLAG_NONE
+    assert out.iloc[0]["reported_eps"] == 9030.0
+
+
+def test_unpriced_row_within_the_cap_is_left_unjudged(tmp_parquets, monkeypatch):
+    """Earnings run far deeper than OHLCV. A quarter with no contemporaneous
+    close must read as "cannot verify", not "implausible"."""
+    ohlcv = tmp_parquets / "ohlcv"
+    ohlcv.mkdir()
+    monkeypatch.setattr(eh.config, "PARQUET_DIR", ohlcv)
+    _ohlcv(ohlcv, "OLD", 5.0, start="2024-01-01", periods=300)
+
+    out = eh.sanitize_eps_artifacts(pd.DataFrame([
+        _row("OLD", "2005-03-31", "2005-05-02", source="finviz", eps_rep=615.0),
+    ]))
+    assert out.iloc[0]["eps_flag"] == eh.EPS_FLAG_NONE
+    assert out.iloc[0]["reported_eps"] == 615.0
+
+
+def test_migrate_sanitize_absurd_eps_flags_without_destroying(
+        tmp_parquets, monkeypatch):
+    """The whole-store pass flags a genuine artifact, spares a legit
+    high-priced stock, alters no value, and is re-runnable."""
+    ohlcv = tmp_parquets / "ohlcv"
+    ohlcv.mkdir()
+    monkeypatch.setattr(eh.config, "PARQUET_DIR", ohlcv)
+    _ohlcv(ohlcv, "CETX", 0.5, start="2022-01-03", periods=300)
+    _ohlcv(ohlcv, "NVR", 5000.0, start="2022-01-03", periods=300)
 
     eh.save_earnings_history(pd.DataFrame([
-        _row("CETX", "2022-03-01", "2022-05-15", source="finviz", eps_rep=615.0),
-        _row("NVR",  "2022-03-01", "2022-04-20", source="finviz", eps_rep=120.0),
+        _row("CETX", "2022-03-31", "2022-05-15", source="finviz", eps_rep=615.0),
+        _row("NVR",  "2022-03-31", "2022-04-20", source="finviz", eps_rep=120.0),
     ]), dedup=False, sort=False)
 
-    nulled, n_priced = eh.migrate_sanitize_absurd_eps()
-    assert nulled == 1
+    flagged, n_priced = eh.migrate_sanitize_absurd_eps()
+    assert flagged == 1
     df = eh.load_earnings_history()
     cetx = df.loc[df["ticker"] == "CETX"].iloc[0]
     nvr = df.loc[df["ticker"] == "NVR"].iloc[0]
-    assert pd.isna(cetx["reported_eps"])   # 615 > 10*0.5 → artifact, nulled
-    assert nvr["reported_eps"] == 120.0    # 120 < 10*5000 → legit, kept
-    # Idempotent (sentinel gates a second run).
+    assert cetx["eps_flag"] == eh.EPS_FLAG_PRICE   # 615 > 10*0.5
+    assert cetx["reported_eps"] == 615.0           # VALUE KEPT
+    assert nvr["eps_flag"] == eh.EPS_FLAG_NONE     # 120 < 10*5000
+    assert nvr["reported_eps"] == 120.0
+    # Sentinel is written as a last-run marker but no longer GATES the pass:
+    # it is recurring now, so a second call reaches the same verdict rather
+    # than short-circuiting to (0, 0).
     assert eh._eps_sanitize_flag_path().exists()
-    assert eh.migrate_sanitize_absurd_eps() == (0, 0)
+    assert eh.migrate_sanitize_absurd_eps() == (flagged, n_priced)
 
 
-def test_sanitize_eps_artifacts_ingest_guard(tmp_parquets, monkeypatch):
-    """The ingest-time guard (used in the fill flush paths) nulls a nano-cap
-    artifact via price-relative check, nulls an impossible-magnitude row via
-    the absolute cap (no price needed), and leaves legit / normal rows."""
+def test_migrate_sanitize_is_idempotent_under_force(tmp_parquets, monkeypatch):
+    """Flagging no longer has to be one-shot. Re-running must reach the same
+    answer rather than compounding — the old nulling version could not be
+    re-run at all, which is how a later backfill silently undid it."""
     ohlcv = tmp_parquets / "ohlcv"
     ohlcv.mkdir()
     monkeypatch.setattr(eh.config, "PARQUET_DIR", ohlcv)
+    _ohlcv(ohlcv, "CETX", 0.5, start="2022-01-03", periods=300)
 
-    def _w(t, close):
-        pd.DataFrame({"Close": [close * 0.9, close]}).to_parquet(
-            ohlcv / f"{t}.parquet")
+    eh.save_earnings_history(pd.DataFrame([
+        _row("CETX", "2022-03-31", "2022-05-15", source="finviz", eps_rep=615.0),
+    ]), dedup=False, sort=False)
 
-    _w("CETX", 0.5)        # nano-cap with price
-    _w("NVR", 5000.0)      # legit high-priced
+    first = eh.migrate_sanitize_absurd_eps(force=True)
+    again = eh.migrate_sanitize_absurd_eps(force=True)
+    assert first[0] == again[0] == 1
+    df = eh.load_earnings_history()
+    assert df.iloc[0]["reported_eps"] == 615.0
+    assert df.iloc[0]["eps_flag"] == eh.EPS_FLAG_PRICE
+
+
+def test_sanitize_eps_artifacts_ingest_guard(tmp_parquets, monkeypatch):
+    """The ingest stamp: price-relative where a contemporaneous close exists,
+    absolute cap where it does not, nothing emptied."""
+    ohlcv = tmp_parquets / "ohlcv"
+    ohlcv.mkdir()
+    monkeypatch.setattr(eh.config, "PARQUET_DIR", ohlcv)
+    _ohlcv(ohlcv, "CETX", 0.5, start="2022-01-03", periods=300)
+    _ohlcv(ohlcv, "NVR", 5000.0, start="2022-01-03", periods=300)
+
     df = pd.DataFrame([
-        _row("CETX", "2022-03-01", "2022-05-15", source="finviz", eps_rep=615.0),
-        _row("NVR",  "2022-03-01", "2022-04-20", source="finviz", eps_rep=120.0),
-        _row("AAPL", "2022-03-01", "2022-04-28", source="finviz", eps_rep=1.5),
-        _row("ADTX", "2021-01-01", "2021-03-01", source="finnhub", eps_rep=-4.3e11),
+        _row("CETX", "2022-03-31", "2022-05-15", source="finviz", eps_rep=615.0),
+        _row("NVR",  "2022-03-31", "2022-04-20", source="finviz", eps_rep=120.0),
+        _row("AAPL", "2022-03-31", "2022-04-28", source="finviz", eps_rep=1.5),
+        _row("ADTX", "2021-01-31", "2021-03-01", source="finnhub", eps_rep=-4.3e11),
     ])
     out = eh.sanitize_eps_artifacts(df)
     by = {r.ticker: r for r in out.itertuples(index=False)}
-    assert pd.isna(by["CETX"].reported_eps)   # 615 > 10*0.5 → price-relative null
-    assert by["NVR"].reported_eps == 120.0    # 120 < 10*5000 → kept
-    assert by["AAPL"].reported_eps == 1.5     # <20 → not a candidate, kept
-    assert pd.isna(by["ADTX"].reported_eps)   # absolute cap (no OHLCV needed)
+    assert by["CETX"].eps_flag == eh.EPS_FLAG_PRICE
+    assert by["CETX"].reported_eps == 615.0        # kept
+    assert by["NVR"].eps_flag == eh.EPS_FLAG_NONE
+    assert by["AAPL"].eps_flag == eh.EPS_FLAG_NONE  # <20, never a candidate
+    assert by["ADTX"].eps_flag == eh.EPS_FLAG_ABS   # no OHLCV -> absolute cap
+    assert by["ADTX"].reported_eps == -4.3e11       # kept
+
+
+def test_odd_ohlcv_index_does_not_break_the_ingest_path(
+        tmp_parquets, monkeypatch):
+    """A cache file with a non-datetime index cannot answer "price on this
+    date". It must leave the row unpriced, not take the flush down."""
+    ohlcv = tmp_parquets / "ohlcv"
+    ohlcv.mkdir()
+    monkeypatch.setattr(eh.config, "PARQUET_DIR", ohlcv)
+    pd.DataFrame({"Close": [1.0, 2.0]}).to_parquet(ohlcv / "ODD.parquet")
+
+    out = eh.sanitize_eps_artifacts(pd.DataFrame([
+        _row("ODD", "2022-03-31", "2022-05-15", source="finviz", eps_rep=615.0),
+    ]))
+    assert out.iloc[0]["eps_flag"] == eh.EPS_FLAG_NONE
+    assert out.iloc[0]["reported_eps"] == 615.0
+
+
+def test_precise_price_verdict_survives_the_canonical_write(
+        tmp_parquets, monkeypatch):
+    """save_earnings_history applies only the coarse absolute rule. It must not
+    overwrite a "price" verdict the ingest guard already reached."""
+    ohlcv = tmp_parquets / "ohlcv"
+    ohlcv.mkdir()
+    monkeypatch.setattr(eh.config, "PARQUET_DIR", ohlcv)
+    _ohlcv(ohlcv, "CETX", 0.5, start="2022-01-03", periods=300)
+
+    stamped = eh.sanitize_eps_artifacts(pd.DataFrame([
+        _row("CETX", "2022-03-31", "2022-05-15", source="finviz", eps_rep=615.0),
+    ]))
+    eh.save_earnings_history(stamped, dedup=False, sort=False)
+    df = eh.load_earnings_history()
+    assert df.iloc[0]["eps_flag"] == eh.EPS_FLAG_PRICE
+
+
+def test_eps_pass_is_recurring_so_a_later_writer_cannot_win(
+        tmp_parquets, monkeypatch):
+    """THE ORDERING HAZARD. Two sentinel-gated one-shots, where one's output is
+    the other's input, only stay ordered within a single launch — and the
+    backfill can defer to a later one. Whatever a subsequent writer reintroduces
+    must be re-judged on the next pass, not permanently.
+    """
+    ohlcv = tmp_parquets / "ohlcv"
+    ohlcv.mkdir()
+    monkeypatch.setattr(eh.config, "PARQUET_DIR", ohlcv)
+    _ohlcv(ohlcv, "CETX", 0.5, start="2022-01-03", periods=300)
+
+    eh.save_earnings_history(pd.DataFrame([
+        _row("CETX", "2022-03-31", "2022-05-15", source="finviz", eps_rep=615.0),
+    ]), dedup=False, sort=False)
+    assert eh.migrate_sanitize_absurd_eps()[0] == 1
+
+    # A later writer reinstates the row with no verdict on it at all.
+    stale = eh.load_earnings_history()
+    stale["eps_flag"] = eh.EPS_FLAG_NONE
+    eh.save_earnings_history(stale, dedup=False, sort=False)
+    assert eh.load_earnings_history().iloc[0]["eps_flag"] == eh.EPS_FLAG_NONE
+
+    # The pass is recurring, so the next launch re-judges it.
+    assert eh.migrate_sanitize_absurd_eps()[0] == 1
+    assert eh.load_earnings_history().iloc[0]["eps_flag"] == eh.EPS_FLAG_PRICE
+
+
+def test_eps_pass_clears_a_verdict_that_no_longer_holds(
+        tmp_parquets, monkeypatch):
+    """A stale flag must be able to CLEAR. Keying the write on "anything is
+    flagged" would strand it forever."""
+    ohlcv = tmp_parquets / "ohlcv"
+    ohlcv.mkdir()
+    monkeypatch.setattr(eh.config, "PARQUET_DIR", ohlcv)
+    _ohlcv(ohlcv, "AAA", 0.5, start="2022-01-03", periods=300)
+
+    eh.save_earnings_history(pd.DataFrame([
+        _row("AAA", "2022-03-31", "2022-05-15", source="finviz", eps_rep=615.0),
+    ]), dedup=False, sort=False)
+    assert eh.migrate_sanitize_absurd_eps()[0] == 1
+    assert eh.load_earnings_history().iloc[0]["eps_flag"] == eh.EPS_FLAG_PRICE
+
+    # Re-price the ticker so the row is comfortably plausible.
+    _ohlcv(ohlcv, "AAA", 5000.0, start="2022-01-03", periods=300)
+    assert eh.migrate_sanitize_absurd_eps()[0] == 0
+    assert eh.load_earnings_history().iloc[0]["eps_flag"] == eh.EPS_FLAG_NONE
+
+
+def test_backfill_from_raw_is_stamped_like_a_live_fill(
+        tmp_parquets, monkeypatch):
+    """The replay path used to bypass the guard entirely — that is how ABTC's
+    artifacts returned after the cleanup pass had already run."""
+    import inspect
+    src = inspect.getsource(eh.migrate_backfill_finviz_history_from_raw)
+    assert "sanitize_eps_artifacts" in src, (
+        "the raw replay must stamp its rows like any other ingest path"
+    )
+
+
+def test_legacy_store_without_the_column_loads_unflagged(tmp_parquets):
+    """A parquet written before eps_flag existed is UNJUDGED, not implausible."""
+    eh.save_earnings_history(pd.DataFrame([
+        _row("AAPL", "2022-03-31", "2022-04-28", source="finviz", eps_rep=1.5),
+    ]), dedup=False, sort=False)
+    raw = pd.read_parquet(eh.config.EARNINGS_HISTORY_PARQUET)
+    raw = raw.drop(columns=["eps_flag"])
+    raw.to_parquet(eh.config.EARNINGS_HISTORY_PARQUET, index=False)
+
+    df = eh.load_earnings_history()
+    assert "eps_flag" in df.columns
+    assert df.iloc[0]["eps_flag"] == eh.EPS_FLAG_NONE
 
 
 # ----------------------------------------------------------------------

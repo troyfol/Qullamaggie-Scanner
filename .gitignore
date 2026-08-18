@@ -53,6 +53,9 @@ _bbcp_dump.py
 # Cross-repo review of the author's full personal tool stack — profiles
 # private sibling projects; keep local-only.
 TRADING_TOOLS_CODE_REVIEW.md
+# Internal investigation / audit notes. Reference live upstream data
+# quirks and sibling-repo paths; keep local-only.
+AUDIT_*.md
 # Live-session page captures written by tests/_zacks_diag.py. Past
 # captures embedded the client's real public IP in Imperva iframe
 # params (cip=...), so a re-run must never be committable.

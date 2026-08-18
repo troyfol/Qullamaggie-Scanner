@@ -646,6 +646,45 @@ PARQUET_SCHEMA_FILE = PARQUET_DIR / "_schema_version.txt"
 PRICE_JUMP_PCT = 50.0            # flag if single-day % change exceeds this
 MAX_MISSING_DAYS_FLAG = 5        # flag if > N trading days missing in a row
 
+# Tickers whose cached price series is NOT continuous across a split ex-date:
+# close[ex] / close[ex-1] equals the split ratio itself, so the series carries a
+# raw discontinuity where a back-adjusted series should be smooth.
+#
+# This is a defect AT THE SOURCE, not in the cache. A completely fresh
+# yfinance pull reproduces the seam byte-for-byte (verified on BESS, PRKA, SILO
+# and LAAI), and EDGAR independently confirms the split is real and of the
+# claimed magnitude on APRE (x19.98 vs x20 expected), SILO (x52.7 vs x50),
+# SIGY (x41 vs x40), HLTC (x4.0 vs x4) and AREB (x39,999.9 vs x40,000). The
+# direction is inverted: a reverse split RAISES price, and these series fall by
+# the ratio. Re-anchoring in download_one is working correctly and has nothing
+# to fix; recency is ruled out too (median 345 bars after the ex-date, none
+# within 5, so the refetch-overlap window is not the mechanism).
+#
+# DO NOT REBUILD THESE TICKERS — it cannot help, exactly as with the four
+# already-known bad-at-source names. They are excluded at SCAN time only, so
+# downloads keep refreshing them and the exclusion reverses itself for free if
+# the upstream ever fixes the series.
+#
+# Deliberately NOT folded into blacklist.txt: that file is hand-maintained, and
+# it suppresses DOWNLOADS rather than scan rows.
+SPLIT_SEAM_SKIP_FILE = DATA_DIR / "split_seam_skip.txt"
+
+# Precomputed {ticker -> most recent qualifying split ex-date}, written once per
+# launch by data_engine.rebuild_split_artifacts().
+#
+# Exists purely so the scan path never has to widen its parquet read. EFF-5
+# projects `Stock Splits` away because carrying it measured 10.4 ms -> 1.9 ms
+# per file (~155 s -> ~28 s across the universe); reading split dates at scan
+# time would hand that entire saving back on every scan. ~2.7k rows — only
+# tickers that actually have a split appear.
+SPLIT_ANCHORS_PARQUET = DATA_DIR / "split_anchors.parquet"
+
+# How far close[ex]/close[ex-1] may sit from the split ratio (or from 1.0)
+# before the seam test calls the result ambiguous rather than deciding. A
+# genuine reverse split of any consequence puts the two hypotheses orders of
+# magnitude apart, so this is generous on purpose.
+SPLIT_SEAM_TOL = 1.5
+
 # Relative tolerance (% of the bar's own price level) before an OHLC bound
 # violation — High below Open/Low/Close, or Low above Open/Close — is treated
 # as real rather than provider rounding. The upstream's split/dividend-adjusted

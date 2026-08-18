@@ -133,9 +133,26 @@ def test_compute_ticker_all_disabled_produces_always_on_keys_only(tmp_path, monk
     assert row is not None
     # Exact set — neither more nor less. gain_start_date is part of the
     # always-on bundle (paired with pct_gain) for results display.
+    #
+    # pct_gain_post_split / post_split_start_date joined that bundle with the
+    # split-anchor work: RESULT_COLUMNS only renders a key that is present in
+    # the frame, so gating them behind a toggle would hide them on exactly the
+    # filterless scan where comparing the two measurements is most useful.
     assert set(row.keys()) == {
         "symbol", "close", "price", "pct_gain", "gain_start_date",
+        "pct_gain_post_split", "post_split_start_date",
     }
+
+
+def test_always_on_post_split_keys_mirror_the_originals_without_an_anchor(
+        tmp_path, monkeypatch):
+    """The two added always-on keys must be exactly the un-anchored values when
+    the ticker has no split, so adding them changed nothing for ~89% of the
+    universe."""
+    _make_fake_parquet(tmp_path, monkeypatch, "TEST", days=80)
+    row = scanner._compute_ticker("TEST", _all_disabled_params())
+    assert row["pct_gain_post_split"] == row["pct_gain"]
+    assert row["post_split_start_date"] == row["gain_start_date"]
 
 
 def test_compute_ticker_enabled_indicators_included(tmp_path, monkeypatch):

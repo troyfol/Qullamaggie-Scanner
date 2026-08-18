@@ -7821,15 +7821,22 @@ def main():
             "finviz_backfill migration skipped: %s", exc,
         )
 
-    # One-time migration: null reverse-split EPS artifacts (price-relative).
-    # Runs after the backfill so it also cleans the recovered older quarters.
+    # RECURRING (not one-shot): stamp `eps_flag` on rows whose EPS is
+    # implausible against the price on their OWN period_ending. Alters no value
+    # and writes only when a verdict changes.
+    #
+    # Still placed after the backfill so a single launch flags the recovered
+    # quarters too — but correctness no longer DEPENDS on that ordering, which
+    # is the point. When these were two sentinel-gated one-shots, a backfill
+    # that deferred to a later launch landed after this pass had permanently
+    # retired, and silently reinstated everything it had just cleaned.
     try:
         from .. import earnings_history
         earnings_history.migrate_sanitize_absurd_eps()
     except Exception as exc:
         import logging
         logging.getLogger("scanner.startup").warning(
-            "eps_sanitize migration skipped: %s", exc,
+            "eps_flag pass skipped: %s", exc,
         )
 
     app = QApplication(sys.argv)

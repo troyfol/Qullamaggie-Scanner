@@ -45,6 +45,13 @@ features at a live order-entry platform.
   supersede the range they cover, reported values merge across sources with
   per-column provenance, interior OHLCV gaps are detected and repaired, and
   every atomic write is `fsync`'d.
+- **Reverse splits handled by corporate action, not by threshold** (v6.1.0):
+  splits are told apart from spinoffs structurally (is `1/ratio` a whole
+  number?), post-split momentum is reported in its own columns beside the
+  buy-and-hold ones, price series that are discontinuous at an ex-date are
+  quarantined, and an implausible EPS is judged against the close on its **own**
+  period rather than today's — so a correctly restated figure is flagged, never
+  deleted.
 - **Local-first**: everything lives in `scanner_data/` beside the executable.
   No account, no telemetry, no cloud dependency.
 
@@ -700,11 +707,45 @@ The `consec_*_beats_quarter_cap` spinbox (label "Q Cap" in the panel) is an **op
 
 The number of Q-i columns rendered is **based on populated data**, not capped by the streak count. A ticker with a streak that broke at Q-3 still shows Q-3..Q-N (up to MAX_BEATS_QUARTERS=20 quarters of history, or the user's quarter_cap if smaller). The streak count drives only the in-streak green-text coloring inside `_populate_row`; display gating is decoupled. Rationale: post-streak earnings cells must remain eligible for match-coloring against non-earnings indicator dates — a `max_gap_date` that lands on Q-4's earnings day should color the Q-4 unit even though Q-4 isn't part of an active streak.
 
+### Post-split momentum columns (v6.1.0)
+
+`% Gain` and `RS S&P` measure from the first bar of the window. Across a reverse
+split that is the **true buy-and-hold return**, and it is not wrong — a holder of
+ACON really did lose 99.9993%. But a breakout scan is asking a different
+question: how far has this stock run off the base it trades on *now*?
+
+Measured over the cached universe, **205 tickers moved >+30% since their last
+split while the full-window figure read < -50%**, and 111 of those moved >+100%
+— BESS ran +5,386% off its post-split base and reported as an 88% loser. The RS
+cap clips only the upside, so all of them sort to maximum weakness and are
+silently invisible to a momentum scan.
+
+`% Gain P/S`, `P/S Start` and `RS S&P P/S` therefore sit **beside** the originals
+rather than replacing them. This is a different measurement, not a correction:
+`pct_gain_over_period` and `relative_strength_ratio` are untouched, so every
+saved preset keeps its exact current meaning. For the ~87% of tickers with no
+qualifying split in the window the two columns are identical by construction —
+`_compute_ticker` reuses the already-computed value rather than recomputing it.
+
+The anchor **excludes** the ex-date bar. That bar *should* already be on the
+post-split basis but empirically is not always: GTIC's 1-for-100 leaves it at
+`$1.70` on the old basis and only steps to `$0.21` the following session, so
+anchoring on it took the base price from the wrong regime and reported -14.7%
+where the true post-split move is +590%. Skipping one bar costs nothing over a
+window of a hundred-plus and is robust to the boundary landing on either side.
+
+The benchmark is sliced by **date**, not position — a thin ticker can be missing
+bars the benchmark has, and positional slicing would compare two different
+periods. Fewer than `MIN_POST_SPLIT_BARS` (3) after the anchor falls back to the
+un-anchored figure.
+
 ### Result DataFrame schema (built by `run_scan`)
 
 | Column | Always present? | Source |
 |--------|-----------------|--------|
 | `symbol`, `close`, `price`, `pct_gain`, `gain_start_date` | Yes (per-ticker baseline) | `_compute_ticker` |
+| `pct_gain_post_split`, `post_split_start_date` | Yes (v6.1.0 — joined the always-on bundle, paired with `pct_gain`) | `indicators.pct_gain_post_split` |
+| `rs_market_post_split` | Iff RS-vs-S&P enabled-or-display | `indicators.relative_strength_post_split` |
 | `sma{period}` | Iff sma1/sma2 enabled-or-display | `indicators.price_above_sma` |
 | `sti`, `dist_high_pct`, `consec_gaps`, ... | Iff matching filter active | `indicators.*` |
 | `rvol` | Iff rvol enabled-or-display | `indicators.relative_volume` (last bar's volume ÷ mean of the prior `rvol_lookback` bars) |
@@ -763,6 +804,12 @@ eps_source         category         v6.0.0. Origin of reported_eps. NA when
                                     the row has no reported EPS.
 rev_source         category         v6.0.0. Origin of reported_rev. NA when
                                     the row has no reported revenue.
+eps_flag           category         v6.1.0. Why this row's EPS looked
+                                    implausible: "" (fine / not judged),
+                                    "price" (|eps| >> the close on its own
+                                    period_ending), "abs" (beyond
+                                    MAX_PLAUSIBLE_EPS and unverifiable).
+                                    A FLAG ONLY — no value is ever altered.
 ```
 
 **Reported actuals mix across sources (v6.0.0).** `reported_eps` and
@@ -824,9 +871,102 @@ surprise or estimate read from a zacks- or finnhub-sourced row is now NaN.
 Anything that needs every source's estimate figures should read the
 `earnings_raw/` layer, which still preserves them verbatim.
 
+**Reverse-split EPS is no longer deleted (v6.1.0).** A heavily reverse-split
+nano-cap stores an enormous per-share EPS, and that value is *arithmetically
+correct*: it is the as-reported figure restated onto the current share basis.
+ABTC's 2019 quarter reads `-7800` because `-$0.26` was restated through a
+cumulative 30,000× of later reverse splits — and the cached price for that same
+quarter reads `$96,000`, carrying the identical factor.
+
+The old guard compared such a row against **today's** close. EPS at factor F(t)
+against a price at factor 1 is not a comparison, and it failed toward destroying
+data: ABTC scored `7800 / 7.12 = 1096×` and had its EPS columns nulled. Measured
+over the whole store, **2,478 of that rule's 2,503 verdicts were false
+positives (99%)**.
+
+Because EPS and price carry the same factor, `|eps| / price` is basis-invariant
+when both are taken at the same date. Rows are now judged against the close on
+their own `period_ending`, and the verdict is recorded in `eps_flag` rather than
+applied destructively. That spares the two populations a magnitude cut-off
+cannot tell apart — a restated nano-cap, and a genuinely high-priced stock like
+BRK-A earning ~$9,000/share on a ~$700,000 share — while still catching a real
+artifact such as a $600 EPS on a $5 stock.
+
+*For readers*: `eps_flag` is appended at the END, so every pre-existing column
+keeps its position, and a store written before v6.1.0 loads with `""`
+throughout. The value-level change is that EPS fields which would previously
+have been NaN on these rows now carry their real figures; filter on
+`eps_flag == ""` to restore the old view.
+
+**Do not de-adjust these values.** Converting them back to the as-reported basis
+would break YoY, which is only comparable *because* every quarter is restated
+onto one common basis: a pre-split quarter earning `$2M / 20M shares = $0.10`
+restates to `$2.00` against a post-split `$2M / 1M = $2.00`, i.e. 0% YoY — the
+truth. On raw values the same pair reads +1900%.
+
+**The pass is recurring, not a one-shot migration.** `migrate_sanitize_absurd_eps`
+runs every launch. When it was sentinel-gated, it and the finviz raw backfill
+were two one-shot migrations where one's output is the other's input — an
+ordering that only holds *within* a launch. The backfill bails without stamping
+when no raw captures exist yet, so it can land on a later launch, after the
+cleanup pass has permanently retired; that is exactly how ABTC's artifacts came
+back (`.eps_sanitize_v1.done` is stamped 19:23, `.finviz_backfill_v1.done`
+19:24 — the reverse of the source order). Making the pass recurring removes the
+hazard outright, and is only safe because flagging is idempotent and alters
+nothing. The backfill now also stamps its replayed rows like any other ingest
+path. The sentinel is still written, as a last-run marker only.
+
 ### Per-ticker OHLCV parquet (data_engine.py)
 
-`scanner_data/ohlcv/{TICKER}.parquet` — DatetimeIndex, columns: `Open`, `High`, `Low`, `Close`, `Volume`. Up to `OHLCV_HISTORY_YEARS` (default 5, user-tunable via Settings → Advanced…) years of daily bars. Loaded lazily via `data_engine.load_ohlcv(symbol)` which returns a tz-naive DataFrame. An opt-in launch-time prefetch (`data_engine.prefetch_ohlcv` on a `PrefetchWorker` thread; `config.PREFETCH_OHLCV_AT_LAUNCH`, default off) can warm the parquet LRU after the startup OHLCV update finishes — one-shot per launch, stoppable, and sequenced so it never contends with the updater.
+`scanner_data/ohlcv/{TICKER}.parquet` — DatetimeIndex, columns: `Open`, `High`, `Low`, `Close`, `Volume`, `Stock Splits`. Up to `OHLCV_HISTORY_YEARS` (default 5, user-tunable via Settings → Advanced…) years of daily bars. Loaded lazily via `data_engine.load_ohlcv(symbol)` which returns a tz-naive DataFrame. An opt-in launch-time prefetch (`data_engine.prefetch_ohlcv` on a `PrefetchWorker` thread; `config.PREFETCH_OHLCV_AT_LAUNCH`, default off) can warm the parquet LRU after the startup OHLCV update finishes — one-shot per launch, stoppable, and sequenced so it never contends with the updater.
+
+`Stock Splits` is stored but deliberately projected away at scan time (EFF-5:
+carrying it measured 10.4 ms → 1.9 ms per file, ~155 s → ~28 s across the
+universe). Everything below therefore reads it **once per launch**, never on the
+scan path.
+
+### Split artifacts (v6.1.0)
+
+`data_engine.rebuild_split_artifacts()` sweeps every cached parquet **once**
+(~68 s over 14.6k files, `Close` + `Stock Splits` only) and writes two files. It
+runs on a background daemon thread at launch, kicked off *before* the earnings
+smart refresh — never on the GUI thread, and nothing downstream blocks on it.
+
+**`scanner_data/split_seam_skip.txt`** — generated, one ticker per line.
+Tickers whose price series is *discontinuous* at a split ex-date:
+`close[ex] / close[ex-1]` (or `close[ex+1] / close[ex]` — the basis does not
+always change on the stamped date; GTIC's 1-for-100 steps the session after)
+equals the split ratio itself, where a back-adjusted series should be smooth.
+**This is a defect at the SOURCE — a fresh yfinance pull reproduces it exactly,
+so do not rebuild these tickers.** EDGAR independently confirms the split is
+real and of the claimed magnitude on APRE (×19.98 vs ×20 expected), SILO,
+SIGY, HLTC and AREB; the direction is simply inverted. 63 tickers on the current
+store. Excluded at **scan time only**, recorded as a funnel stage, so downloads
+keep refreshing them and the exclusion reverses itself for free if the upstream
+ever fixes the series. Deliberately *not* folded into `blacklist.txt`, which is
+hand-maintained and suppresses downloads rather than scan rows.
+
+**`scanner_data/split_anchors.parquet`** — `ticker`, `last_ex_date`,
+`cum_factor`, `n_events`. Only tickers that actually have a qualifying split
+appear (~1,900 of 14.6k). Feeds the post-split momentum columns.
+
+Both readers degrade cleanly when a file is absent — an empty skip list scans
+everything, and absent anchors make the post-split columns mirror their
+un-anchored counterparts — so the first launch after an install is never wrong,
+only unfiltered. Both writes are atomic, so a scan running mid-rebuild cannot
+see a torn file.
+
+**`data_engine.is_share_split(ratio)`** is the structural gate in front of both.
+yfinance files several kinds of corporate action in the one `Stock Splits`
+column; a genuine split exchanges N shares for 1, so either the ratio or its
+inverse is a whole number. A spinoff carries the distribution's price factor and
+lands nowhere near one — GSK 0.8000 (Haleon), UL 0.8880 (Unilever), HON 0.9535
+(Solstice), SLG 0.9700 and OUT 0.9760 (share count flat across the date).
+**69 of 2,420 reverse events and 240 of 627 forward events fail this test**, and
+a magnitude cut-off cannot substitute: only 11 of the 69 have a ratio ≥ 0.9.
+Known limitation — an N-for-M split with M > 1 (a 3-for-2, or the rare 2-for-3
+reverse) also fails, which is deliberately conservative: a rejected event is
+simply not used as an anchor.
 
 ---
 
