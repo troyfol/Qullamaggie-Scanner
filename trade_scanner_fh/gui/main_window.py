@@ -39,6 +39,7 @@ from .. import __version__, config, finnhub_client, scan_history
 from .. import hotkey as hotkey_mod
 from ..data_engine import (
     cached_symbols, check_schema_version, load_ohlcv, rebuild_ticker,
+    reference_sessions, trading_days_back,
 )
 from ..hotkey import HotkeyConfig
 from ..scanner import ScanResult, chunk_periods
@@ -428,6 +429,18 @@ class MainWindow(QMainWindow):
         )
         act_refresh_ohlcv.triggered.connect(self._force_ohlcv_refresh)
         data_menu.addAction(act_refresh_ohlcv)
+
+        # 2026-08-29: the only in-app way to re-pull a bar that is PRESENT but
+        # wrong. Force OHLCV Refresh cannot — it re-checks staleness, which
+        # passes on any file whose last date is current however bad its values.
+        act_deep_refresh = QAction("Deep OHLCV Refresh...", self)
+        act_deep_refresh.setToolTip(
+            "Re-download the last N market days for EVERY cached ticker, "
+            "ignoring the staleness check. Use when cached bars are present "
+            "but wrong (null prices, understated volume)."
+        )
+        act_deep_refresh.triggered.connect(self._deep_ohlcv_refresh_dialog)
+        data_menu.addAction(act_deep_refresh)
 
         act_missing_only = QAction("Download Missing Tickers Only", self)
         act_missing_only.setToolTip(
@@ -2252,6 +2265,141 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Force refreshing OHLCV data...")
         self.log_panel.write_line("Force OHLCV refresh requested by user.")
         self._load_universe_and_update(force=True)
+
+    def _deep_ohlcv_refresh_dialog(self):
+        """Re-pull the last N MARKET days for every cached ticker, ignoring
+        the per-ticker staleness check (2026-08-29).
+
+        Exists because no other action in the app can replace a bar that is
+        present but wrong. Staleness compares a file's last DATE to the most
+        recent session, so a null-priced or provisional bar carrying the right
+        date is treated as current forever — Force OHLCV Refresh skipped 12,737
+        of 14,747 tickers on 2026-08-29 for that reason, with every scan
+        returning nothing.
+
+        Deliberately offers ONLY a trading-days-back count, never an arbitrary
+        start/end window. `download_one`'s window is what decides whether a
+        merge or a REPLACE happens, and a user-supplied range is the one input
+        that could route a narrow window into the replace path and truncate
+        five years of history per ticker. A days-back count cannot express that.
+        """
+        if self._update_worker and self._update_worker.isRunning():
+            QMessageBox.information(self, "In Progress",
+                                    "An OHLCV update is already running.")
+            return
+
+        syms = sorted(cached_symbols())
+        if not syms:
+            QMessageBox.warning(self, "No Cached Data",
+                                "No tickers have cached OHLCV data yet.")
+            return
+
+        # One calendar read, reused by every spinbox change below.
+        sessions = reference_sessions()
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Deep OHLCV Refresh")
+        dlg.setMinimumWidth(560)
+        layout = QVBoxLayout(dlg)
+
+        layout.addWidget(QLabel(
+            "Re-download recent bars for <b>every cached ticker</b>, ignoring "
+            "the staleness check.<br>Use when cached bars are present but "
+            "wrong — null prices, or volume left provisional by a refresh that "
+            "ran before the session settled."
+        ))
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Market days back:"))
+        spin = QSpinBox()
+        spin.setRange(1, config.OHLCV_DEEP_REFRESH_MAX_DAYS)
+        spin.setValue(config.OHLCV_DEEP_REFRESH_DEFAULT_DAYS)
+        spin.setToolTip(
+            "Trading days, not calendar days. 1 = the most recent session."
+        )
+        row.addWidget(spin)
+        row.addStretch()
+        layout.addLayout(row)
+
+        chk_overwrite = QCheckBox(
+            "Overwrite cached bars that disagree with the incoming data"
+        )
+        chk_overwrite.setChecked(True)
+        chk_overwrite.setToolTip(
+            "On by default: the guard that normally protects cached bars from "
+            "provisional re-sends resolves every disagreement in favour of the "
+            "cache, which would silently discard the repair you are asking for."
+        )
+        layout.addWidget(chk_overwrite)
+
+        info = QLabel()
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #9e9e9e; font-size: 11px;")
+        layout.addWidget(info)
+
+        def _refresh_info():
+            n = spin.value()
+            start = trading_days_back(n, sessions=sessions)
+            est_sec = len(syms) * config.YFINANCE_PAUSE_SEC
+            when = (f"from <b>{start}</b> forward" if start is not None
+                    else "over a calendar-day fallback window "
+                         "(no session calendar cached)")
+            info.setText(
+                f"Will re-request {n} market day(s) {when} for "
+                f"<b>{len(syms):,}</b> ticker(s).<br>"
+                f"Estimated runtime at least "
+                f"<b>{est_sec / 3600:.1f} h</b> — cost is one request per "
+                f"ticker, so a wider window is nearly free but a bigger "
+                f"universe is not.<br>"
+                f"History is never shortened: bars are merged into each "
+                f"existing file, never replacing it."
+            )
+
+        spin.valueChanged.connect(_refresh_info)
+        _refresh_info()
+
+        btn_row = QHBoxLayout()
+        btn_ok = QPushButton("Start Deep Refresh")
+        btn_ok.setStyleSheet(
+            "QPushButton { background: #2e7d32; color: white; "
+            "font-weight: bold; padding: 6px 18px; border-radius: 3px; }"
+        )
+        btn_cancel = QPushButton("Cancel")
+        btn_row.addStretch()
+        btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        days = spin.value()
+        overwrite = chk_overwrite.isChecked()
+        self.log_panel.write_line(
+            f"Deep OHLCV refresh requested: {days} market day(s) back across "
+            f"{len(syms):,} cached ticker(s)"
+            + (", overwriting conflicting bars" if overwrite else "")
+        )
+        self._update_label.setText(f"Deep refresh: 0/{len(syms)}")
+        self._update_label.setStyleSheet(
+            "color: #4a90d9; font-size: 11px; padding: 0 8px;"
+        )
+        self._update_worker = self._start_worker(
+            UpdateWorker(
+                syms,
+                backoff_enabled_ref=self._backoff_enabled_ref,
+                backoff_threshold=self._backoff_threshold,
+                backoff_wait=self._backoff_wait,
+                max_retries=self._max_retries,
+                force_days_back=days,
+                overwrite=overwrite,
+            ),
+            progress=self._on_update_progress,
+            error_tickers=self._on_ohlcv_error_tickers,
+            finished=self._on_update_done,
+        )
 
     def _stop_ohlcv_refresh(self):
         """Menu action: stop the running OHLCV update."""

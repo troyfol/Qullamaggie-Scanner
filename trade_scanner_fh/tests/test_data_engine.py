@@ -119,7 +119,10 @@ def test_rate_limiter_is_thread_safe():
 def test_download_many_calls_download_one_for_each_symbol():
     """download_many invokes download_one once per input symbol and
     returns one ScrapeResult per symbol."""
-    def fake_download(sym):
+    forwarded = []
+
+    def fake_download(sym, *, force_start=None, overwrite=False):
+        forwarded.append((force_start, overwrite))
         return ScrapeResult(symbol=sym, status="ok", rows_received=1)
 
     with patch("trade_scanner_fh.data_engine.download_one", side_effect=fake_download):
@@ -129,6 +132,9 @@ def test_download_many_calls_download_one_for_each_symbol():
     assert len(results) == 10
     assert {r.symbol for r in results} == set(syms)
     assert all(r.status == "ok" for r in results)
+    # The deep-refresh knobs must stay off unless a caller asks for them, so an
+    # ordinary update keeps the incremental window and the cache-wins guard.
+    assert forwarded == [(None, False)] * 10
 
 
 def test_download_many_parallel_faster_than_serial():

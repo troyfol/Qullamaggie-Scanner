@@ -728,6 +728,44 @@ OHLCV_REFETCH_OVERLAP_DAYS = 5
 # re-download path (last_date is reset to None), so they never reach this guard.
 OHLCV_VOLUME_REGRESSION_PCT = 10.0
 
+# -- Null last-bar detection (2026-08-29) ----------------------------------
+# What fraction of a refresh's most-recent-session bars may arrive with NaN
+# prices before the run is reported as suspect.
+#
+# On 2026-08-29 a Saturday refill (13:00-15:24 ET) wrote a NaN Open/High/Low/
+# Close bar dated 2026-08-28 for 12,450 of 14,747 cached tickers — 99.9% of
+# every ticker that had a bar for that session. Yahoo was still consolidating
+# Friday's session and served it with a null adjusted close; `auto_adjust=True`
+# computes ratio = AdjClose/Close and multiplies Open/High/Low by it, so a null
+# AdjClose nulls all four price fields in one step while leaving Volume and
+# Stock Splits populated. The cached Volumes were 0.02-1.77% BELOW the settled
+# figures on 12/12 sampled tickers — every one short, never over — confirming
+# an unsettled bar rather than anything this code did.
+#
+# Nothing caught it. `validate_ticker` counted the NaNs but is advisory-only,
+# and the staleness check judges a file by its last DATE, which was correct —
+# so the poisoned tickers were classed "up to date" and could not be re-fetched
+# even by Force OHLCV Refresh. Every scan returned zero results, because
+# `NaN >= min_price` is False and the funnel drops the ticker at stage one.
+#
+# 50% is far above any legitimate rate (a normal session leaves a handful of
+# halted names null) and far below the ~100% a systemic source failure
+# produces, so it fires on the failure and stays silent otherwise.
+OHLCV_NAN_LAST_BAR_WARN_PCT = 50.0
+
+# -- Deep refresh (2026-08-29) ---------------------------------------------
+# `Deep OHLCV Refresh` re-pulls the last N MARKET days for every cached ticker,
+# ignoring the per-ticker staleness check that made the incident above
+# unrecoverable. Expressed in trading days (not calendar days) and resolved
+# against the reference ticker's own session index, so "1" always means "the
+# most recent session" regardless of weekends or holidays.
+OHLCV_DEEP_REFRESH_DEFAULT_DAYS = 1
+# Ceiling on the spinbox. A deep refresh costs one HTTP request per ticker
+# regardless of window width — the full store measured ~2.5 h on 2026-08-29 —
+# so a wider window is nearly free once the run is underway. The cap exists to
+# keep the request off the full-history path, not to bound runtime.
+OHLCV_DEEP_REFRESH_MAX_DAYS = 30
+
 # -- OHLCV interior gap detection (audit 2026-08-16, F2) -------------------
 # Staleness was judged ONLY by a file's last bar, so a ticker whose most recent
 # bar is current was never re-fetched no matter what its interior looked like —

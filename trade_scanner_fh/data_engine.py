@@ -20,7 +20,7 @@ import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional
 
@@ -44,6 +44,16 @@ class ScrapeResult:
     anomalies: list[str] = field(default_factory=list)
     error_msg: str = ""
     was_incremental: bool = False
+    # Health of the LAST bar actually written, captured while the merged frame
+    # is still in memory so the end-of-run report costs no extra I/O (2026-08-29).
+    # `last_bar_nan` means every one of Open/High/Low/Close is null on that bar —
+    # the auto_adjust signature described in config.OHLCV_NAN_LAST_BAR_WARN_PCT,
+    # which renders the ticker invisible to every scan filter.
+    last_bar_date: Optional[pd.Timestamp] = None
+    last_bar_nan: bool = False
+    # Bars whose cached value was replaced because the caller asked for an
+    # explicit overwrite (deep refresh). 0 on every normal incremental update.
+    bars_overwritten: int = 0
 
 
 @dataclass
@@ -274,6 +284,66 @@ def reference_sessions(
     if getattr(idx, "tz", None) is not None:
         idx = idx.tz_localize(None)
     return pd.DatetimeIndex(idx).normalize().sort_values()
+
+
+def trading_days_back(n: int, *, sessions: Optional[pd.DatetimeIndex] = None) -> Optional[date]:
+    """Calendar date of the session ``n`` TRADING days back. ``n=1`` is the most
+    recent session, ``n=5`` the fifth-most-recent (2026-08-29).
+
+    Reads the calendar from the reference ticker's own index for the same
+    reason the gap sweep does — `config._NYSE_HOLIDAYS` starts at 2024, so a
+    table-derived walk would drift on any longer window. Returns None when the
+    reference isn't cached, letting the caller fall back rather than guess.
+
+    Pass ``sessions`` to reuse one calendar read across a whole universe; the
+    deep refresh resolves the window ONCE and hands every ticker the same date.
+    """
+    if n < 1:
+        raise ValueError(f"n must be >= 1, got {n}")
+    idx = sessions if sessions is not None else reference_sessions()
+    if idx is None or len(idx) == 0:
+        return None
+    # Clamp rather than raise: asking for more history than the reference holds
+    # should widen the window to everything available, not fail the refresh.
+    pos = max(0, len(idx) - n)
+    return idx[pos].date()
+
+
+class LastBarHealth(NamedTuple):
+    """Null-price rate on the most recent session covered by a set of results."""
+    session: Optional[pd.Timestamp]
+    null_count: int
+    total: int
+    pct: float
+
+
+def summarize_last_bar_health(results, session=None) -> LastBarHealth:
+    """How many of ``results`` ended with a null-priced bar on ``session``.
+
+    Denominator is deliberately "tickers whose last bar falls ON that session",
+    not "all tickers refreshed": thousands of cached names are delisted or
+    illiquid and legitimately have no bar for any given day. Counting those as
+    healthy would dilute the rate toward zero and mask exactly the systemic
+    failure this exists to catch.
+
+    ``session`` defaults to the most recent bar date seen across the results.
+    """
+    considered = [
+        r for r in results if getattr(r, "last_bar_date", None) is not None
+    ]
+    if not considered:
+        return LastBarHealth(None, 0, 0, 0.0)
+    sess = (
+        max(r.last_bar_date for r in considered)
+        if session is None else _naive_day(session)
+    )
+    on_session = [r for r in considered if r.last_bar_date == sess]
+    if not on_session:
+        return LastBarHealth(sess, 0, 0, 0.0)
+    nulls = sum(1 for r in on_session if getattr(r, "last_bar_nan", False))
+    return LastBarHealth(
+        sess, nulls, len(on_session), nulls / len(on_session) * 100.0
+    )
 
 
 def cached_spans(symbols: list[str]) -> dict:
@@ -632,10 +702,33 @@ def _reject_conflicting_bars(
 
 # ── Single-ticker download ─────────────────────────────────────────────
 
-def download_one(symbol: str) -> ScrapeResult:
+def download_one(
+    symbol: str,
+    *,
+    force_start: Optional[date] = None,
+    overwrite: bool = False,
+) -> ScrapeResult:
     """
     Download (or incrementally update) OHLCV for one ticker.
     Saves/appends to a parquet file. Returns a ScrapeResult.
+
+    ``force_start`` (deep refresh, 2026-08-29) re-requests every bar from that
+    date forward regardless of what is already cached, replacing the usual
+    ``last_date - OHLCV_REFETCH_OVERLAP_DAYS`` window. It exists because
+    staleness is judged by a file's last DATE: when a bar is present but its
+    prices are null, the ticker looks current and no ordinary refresh — not
+    even Force OHLCV Refresh — will ever re-fetch it.
+
+    ``overwrite`` bypasses `_reject_conflicting_bars` so a cached bar loses to
+    the incoming one. That guard exists to protect settled bars from
+    provisional re-sends, which is the right default; but it resolves every
+    disagreement in favour of the cache, so a deliberate repair of a bad cached
+    bar would be silently discarded without it. Only ever set by an explicit
+    user-initiated deep refresh, and the count of replaced bars is reported.
+
+    A forced window NEVER shrinks a file: the merge branch is taken whenever a
+    cached file exists, and the write is refused outright if the merged frame
+    somehow came out shorter than what was already on disk.
     """
     result = ScrapeResult(symbol=symbol)
     pq = _parquet_path(symbol)
@@ -643,7 +736,14 @@ def download_one(symbol: str) -> ScrapeResult:
     try:
         last_date = _last_cached_date(symbol)
 
-        if last_date is not None:
+        if force_start is not None and last_date is not None:
+            # Deep refresh over an existing file. `last_date` stays non-None so
+            # the merge branch below is the one that runs — this must never
+            # reach the `combined = new_df` replace path, which would truncate
+            # the ticker's history to the requested window.
+            start = pd.Timestamp(force_start).strftime("%Y-%m-%d")
+            result.was_incremental = True
+        elif last_date is not None:
             # Incremental: re-request a short tail of already-cached bars along
             # with the new ones.
             #
@@ -739,8 +839,10 @@ def download_one(symbol: str) -> ScrapeResult:
             result.was_incremental = False
 
         # Merge with existing cache if incremental
+        prior_rows = None
         if last_date is not None and pq.exists():
             old_df = pd.read_parquet(pq)
+            prior_rows = len(old_df)
             if not new_df.empty:
                 # Audit 2026-08-12 (INT-11): gate the MERGE, not just the log.
                 # `keep="last"` meant a bad yfinance response silently
@@ -752,7 +854,15 @@ def download_one(symbol: str) -> ScrapeResult:
                 # by more than PRICE_JUMP_PCT, keep the CACHED bar and warn.
                 # Genuine corrections arrive via the split/dividend re-anchor
                 # above, which replaces the whole file rather than one bar.
-                new_df = _reject_conflicting_bars(symbol, old_df, new_df)
+                if overwrite:
+                    # Explicit user-initiated repair: the incoming bar wins.
+                    # Counted (not just allowed) so the run can report how much
+                    # cached data it actually displaced.
+                    result.bars_overwritten = int(
+                        len(new_df.index.intersection(old_df.index))
+                    )
+                else:
+                    new_df = _reject_conflicting_bars(symbol, old_df, new_df)
                 combined = pd.concat([old_df, new_df])
                 combined = combined[~combined.index.duplicated(keep="last")]
                 combined.sort_index(inplace=True)
@@ -786,6 +896,32 @@ def download_one(symbol: str) -> ScrapeResult:
         # Drop the corporate-action helper column before persisting so the
         # on-disk schema is exactly what it has always been (audit INT-3).
         combined = combined[[c for c in _STORED_COLUMNS if c in combined.columns]]
+
+        # Never shrink a file (2026-08-29). `prior_rows` is set only on the
+        # merge path, where `concat` + dedup cannot produce fewer rows than the
+        # frame it started from — so this can only fire if a future change
+        # routes a windowed pull into the replace path, which would truncate
+        # five years of history to whatever window was requested. The
+        # corporate-action re-anchor legitimately rewrites a file and is
+        # exempt: it resets `last_date` to None, so `prior_rows` stays None.
+        if prior_rows is not None and len(combined) < prior_rows:
+            result.status = "error"
+            result.error_msg = (
+                f"refusing write: merge produced {len(combined)} rows from a "
+                f"cached {prior_rows} — would truncate history"
+            )
+            log.error("%s — %s", symbol, result.error_msg)
+            return result
+
+        # Last-bar health, captured here because the merged frame is already in
+        # memory — the end-of-run null-bar report costs no extra I/O. Keyed on
+        # Close specifically: that is the field every scan reads for the
+        # min-price filter, so a null one makes the ticker invisible to the
+        # whole funnel regardless of what the other three hold.
+        if len(combined):
+            result.last_bar_date = _naive_day(combined.index[-1])
+            if "Close" in combined.columns:
+                result.last_bar_nan = bool(pd.isna(combined["Close"].iloc[-1]))
 
         # Validate
         result.anomalies = validate_ticker(symbol, combined)
@@ -881,10 +1017,16 @@ def download_many(
     min_interval_sec: Optional[float] = None,
     progress_cb: Optional[Callable[[ScrapeResult], None]] = None,
     stop_flag: Optional[Callable[[], bool]] = None,
+    force_start: Optional[date] = None,
+    overwrite: bool = False,
 ) -> list[ScrapeResult]:
     """Download OHLCV for multiple tickers in parallel with a shared rate
     limit. progress_cb is invoked in completion order as each result
     arrives; the returned list is also in completion order.
+
+    ``force_start`` / ``overwrite`` are forwarded verbatim to download_one —
+    see its docstring. Both default off, so every existing caller keeps the
+    ordinary incremental behaviour.
 
     max_workers threads each call download_one; a shared rate limiter
     enforces ≤ 1 request per min_interval_sec (defaults to
@@ -906,7 +1048,7 @@ def download_many(
         limiter.acquire()
         if stop_flag and stop_flag():
             return ScrapeResult(symbol=sym, status="stopped")
-        return download_one(sym)
+        return download_one(sym, force_start=force_start, overwrite=overwrite)
 
     results: list[ScrapeResult] = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:

@@ -18,7 +18,7 @@ from ..data_engine import (
     _last_cached_date, cached_spans, clear_ohlcv_cache, download_many,
     download_one, find_interior_gaps, prefetch_ohlcv, rebuild_ticker,
     record_gap_attempts, reference_sessions, select_gap_rebuilds,
-    write_anomaly_report,
+    summarize_last_bar_health, trading_days_back, write_anomaly_report,
 )
 from ..scanner import ScanParams, ScanResult, build_scan_context, run_scan
 from ..ticker_universe import refresh_universe
@@ -294,9 +294,19 @@ class UpdateWorker(QThread):
                  backoff_enabled_ref: list | None = None,
                  backoff_threshold: int = 10,
                  backoff_wait: int = 30,
-                 max_retries: int = 3):
+                 max_retries: int = 3,
+                 force_days_back: int | None = None,
+                 overwrite: bool = False):
         super().__init__()
         self.symbols = symbols
+        # Deep refresh (2026-08-29). When set, the per-ticker staleness check
+        # is skipped entirely and EVERY symbol is re-pulled over a window of
+        # this many trading days. Staleness is judged by a file's last DATE, so
+        # a bar that is present but null-priced looks current forever — that is
+        # what made the 2026-08-28 null-bar incident unrecoverable from inside
+        # the app. None keeps the ordinary incremental behaviour.
+        self.force_days_back = force_days_back
+        self.overwrite = overwrite
         # Mutable container so the GUI toggle takes effect immediately
         self._backoff_enabled_ref = backoff_enabled_ref or [True]
         self.backoff_threshold = backoff_threshold
@@ -322,6 +332,8 @@ class UpdateWorker(QThread):
             self.finished.emit(0, 0)
 
     def _do_update(self):
+        if self.force_days_back is not None:
+            return self._do_deep_refresh()
         now_et = datetime.now(ZoneInfo("America/New_York"))
         today_et = now_et.date()
         market_closed = now_et.hour >= 17  # 5 PM ET (buffer past 4 PM close)
@@ -381,6 +393,67 @@ class UpdateWorker(QThread):
         self.log_msg.emit(msg)
         log.info(msg)
 
+        updated, errors = self._download_pass(to_update)
+        self._finish(updated, errors)
+
+    def _do_deep_refresh(self):
+        """Re-pull the last N TRADING days for every cached ticker (2026-08-29).
+
+        Deliberately runs no staleness test. That check compares a file's last
+        DATE against the most recent session, so a bar that exists but carries
+        null prices is indistinguishable from a healthy one — on 2026-08-29,
+        Force OHLCV Refresh re-checked all 14,747 tickers and skipped 12,737 of
+        them for exactly that reason, leaving every scan empty with no in-app
+        way to recover.
+
+        Scope is always the full cached universe. A narrower "only the tickers
+        that look damaged" scope was considered and rejected: null prices are
+        only the visible failure: the same provisional responses also carry
+        understated Volume on bars whose prices look perfectly fine, and those
+        tickers would be skipped by any damage-detecting filter.
+        """
+        n = max(1, int(self.force_days_back))
+        force_start = trading_days_back(n, sessions=reference_sessions())
+        if force_start is None:
+            # No reference calendar (fresh install, or SPY not yet cached).
+            # Widen to calendar days rather than refuse: the merge path only
+            # ever re-requests bars and never shrinks a file, so an overly
+            # generous window costs bandwidth and nothing else.
+            span = n * 2 + 5
+            force_start = (datetime.now() - timedelta(days=span)).date()
+            self.log_msg.emit(
+                f"Deep refresh: no session calendar cached "
+                f"({config.OHLCV_GAP_REFERENCE_TICKER} missing) — using a "
+                f"{span}-calendar-day window from {force_start} instead."
+            )
+
+        to_update = list(self.symbols)
+        if not to_update:
+            self.log_msg.emit("Deep refresh: no cached tickers to refresh.")
+            log.info("Deep refresh: no cached tickers to refresh.")
+            self.finished.emit(0, 0)
+            return
+
+        msg = (
+            f"Deep OHLCV refresh: {n} market day(s) back (from {force_start}) "
+            f"across {len(to_update)} ticker(s), ignoring staleness"
+            + (", overwriting cached bars" if self.overwrite else "")
+            + "..."
+        )
+        self.log_msg.emit(msg)
+        log.info(msg)
+
+        updated, errors = self._download_pass(to_update, force_start=force_start)
+        self._finish(updated, errors)
+
+    def _download_pass(self, to_update: list[str], *,
+                       force_start=None) -> tuple[int, int]:
+        """Run the batched, rate-limited download loop over ``to_update``.
+
+        Shared by the ordinary incremental update and the deep refresh so both
+        get the same batching, rate-limit backoff, progress reporting and
+        failed-ticker capture. ``force_start`` is forwarded to download_one.
+        """
         # Phase 3 I1: parallel download with shared rate limiter. Tickers
         # are processed in BATCH_SIZE chunks so rate-limit backoff can fire
         # between batches without cancelling the current one mid-flight.
@@ -431,6 +504,8 @@ class UpdateWorker(QThread):
                 min_interval_sec=config.YFINANCE_PAUSE_SEC,
                 progress_cb=_on_result,
                 stop_flag=self._stop.is_set,
+                force_start=force_start,
+                overwrite=self.overwrite,
             )
             batch_start += len(batch)
 
@@ -461,7 +536,11 @@ class UpdateWorker(QThread):
                     # Probe with a single serial download to check if unblocked
                     probe_sym = to_update[batch_start]
                     try:
-                        probe = download_one(probe_sym)
+                        probe = download_one(
+                            probe_sym,
+                            force_start=force_start,
+                            overwrite=self.overwrite,
+                        )
                         if probe.status == "ok":
                             updated += 1
                             completed += 1
@@ -481,6 +560,12 @@ class UpdateWorker(QThread):
                     log.warning("Rate limit persists, stopping update")
                     break
 
+        return updated, errors
+
+    def _finish(self, updated: int, errors: int) -> None:
+        """End-of-run reporting shared by both update modes: anomaly
+        persistence, the null last-bar health check, the interior gap sweep,
+        and the completion signal."""
         # Audit 2026-08-16 (F12): persist what `validate_ticker` found instead
         # of logging it at INFO and dropping it on the floor.
         try:
@@ -505,12 +590,65 @@ class UpdateWorker(QThread):
             except Exception as exc:
                 log.warning("OHLCV gap sweep skipped: %s", exc, exc_info=True)
 
+        overwritten = sum(
+            getattr(r, "bars_overwritten", 0) or 0 for r in self._results
+        )
         msg = (f"OHLCV update complete: {updated} updated, {errors} errors"
-               + (f", {gaps_fixed} gap-repaired" if gaps_fixed else ""))
+               + (f", {gaps_fixed} gap-repaired" if gaps_fixed else "")
+               + (f", {overwritten:,} cached bar(s) overwritten"
+                  if overwritten else ""))
         self.log_msg.emit(msg)
         log.info(msg)
+
+        self._report_last_bar_health()
+
         self.error_tickers.emit(self._failed_tickers)
         self.finished.emit(updated, errors)
+
+    def _report_last_bar_health(self) -> None:
+        """Warn when this run wrote null-priced bars for most of the tickers
+        that traded on the newest session (2026-08-29).
+
+        `validate_ticker` already counted these NaNs, but only per ticker and
+        only into a CSV — so the one number that mattered, "what fraction of
+        this refresh came back unusable", was never computed and the 2026-08-28
+        wipeout ran to completion reporting `0 errors`. Every download did
+        succeed; what they returned was null.
+
+        Reported over the tickers this run actually refreshed. A run that
+        touches a small subset therefore says nothing about the rest of the
+        store — the point is to catch a bad refresh AS IT HAPPENS, while the
+        cached bars it just overwrote are still recoverable from the source.
+        """
+        try:
+            health = summarize_last_bar_health(self._results)
+        except Exception as exc:      # a report must never break the update
+            log.warning("null last-bar check skipped: %s", exc)
+            return
+        if not health.total:
+            return
+
+        session = (
+            health.session.date() if hasattr(health.session, "date")
+            else health.session
+        )
+        detail = (
+            f"{health.null_count:,}/{health.total:,} "
+            f"({health.pct:.1f}%) of tickers with a {session} bar have NULL "
+            f"prices on it"
+        )
+        if health.pct >= config.OHLCV_NAN_LAST_BAR_WARN_PCT:
+            warning = (
+                f"WARNING - SUSPECT OHLCV REFRESH: {detail}. "
+                f"Scans will return few or no results, because a null Close "
+                f"fails every price filter. The provider was most likely "
+                f"still consolidating that session. Re-run Deep OHLCV Refresh "
+                f"once it has settled to repair the affected bars."
+            )
+            self.log_msg.emit(warning)
+            log.warning(warning)
+        else:
+            log.info("Last-bar health: %s", detail)
 
     def _repair_interior_gaps(self) -> int:
         """Detect and rebuild tickers with holes inside their own date range.

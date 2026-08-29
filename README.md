@@ -52,6 +52,12 @@ features at a live order-entry platform.
   quarantined, and an implausible EPS is judged against the close on its **own**
   period rather than today's — so a correctly restated figure is flagged, never
   deleted.
+- **A refresh that returns garbage says so** (v6.1.1): a provider can serve a
+  session with null prices, and the download still "succeeds". Every refresh
+  now reports what fraction of the newest session came back null and warns past
+  50%, and `Data → Deep OHLCV Refresh…` can re-pull the last N **market** days
+  for the whole store — the only action that can replace a bar which is present
+  but wrong, since staleness is judged by a file's date alone.
 - **Local-first**: everything lives in `scanner_data/` beside the executable.
   No account, no telemetry, no cloud dependency.
 
@@ -264,7 +270,9 @@ colouring; **Save Preset** stores the full filter + window + column layout to
 
 | Symptom | Fix |
 |---------|-----|
-| Scan returns few or no rows | OHLCV download unfinished — wait for the toolbar status to go green, or `Data → Download Missing Tickers Only`. |
+| Scan returns few or no rows | First check the funnel log for `Min Price` cutting almost everything — that means null cached prices, not a filter problem; run `Data → Deep OHLCV Refresh…`. Otherwise the OHLCV download is unfinished: wait for the toolbar status to go green, or `Data → Download Missing Tickers Only`. |
+| `WARNING - SUSPECT OHLCV REFRESH` after a refresh | The provider served the newest session with null prices. Wait for it to settle, then `Data → Deep OHLCV Refresh…` at 1 market day back. |
+| Cached bar is present but wrong (null price, stale volume) | `Data → Deep OHLCV Refresh…`. `Force OHLCV Refresh` will **not** fix it — it re-checks staleness, which passes on any file whose last date is current however bad its values. |
 | Universe missing SEC tickers | No SEC contact email — see [Credentials](#credentials). |
 | Earnings filters all blank | Earnings parquets not filled — see [Filling the data stores](#filling-the-data-stores). |
 | Zacks fill keeps pausing | Imperva is blocking — `Data → Refresh Zacks Cookies (Open Browser)…`. |
@@ -1897,6 +1905,7 @@ grouping reflects the five-source architecture plus diagnostics:
 (Universe & OHLCV — separator-grouped, no label row)
     Force Universe Refresh
     Force OHLCV Refresh
+    Deep OHLCV Refresh...
     Download Missing Tickers Only
     Stop OHLCV Refresh
     Reset yfinance Session
@@ -2599,6 +2608,65 @@ directories, and the previous `_internal/`.
 ---
 
 ## Changelog
+
+### v6.1.1 — null-bar detection and deep refresh (2026-08-29)
+
+A Saturday refill wrote a bar with **NaN Open/High/Low/Close but populated
+Volume** for **12,457 of 14,747** cached tickers — ~99.9% of every ticker that
+had a bar for that session. Every scan returned **zero results** across all five
+timeframes, and the refresh that caused it reported `0 errors`, because every
+download did succeed. What came back was null.
+
+The cause was upstream: the provider was still consolidating the previous
+session and served it with a null adjusted close. `auto_adjust=True` computes
+`ratio = AdjClose / Close` and multiplies Open/High/Low by it, so one null
+nulls all four price fields at once while leaving Volume and Stock Splits
+intact. Cached volumes sat 0.02–1.77% **below** the settled figures on 12 of 12
+sampled tickers — every one short, never over, which is what an unsettled bar
+looks like. *Refreshing over a weekend is not safe either; the previous rule
+only covered market hours.*
+
+Three properties turned a transient upstream glitch into a stuck store, and all
+three are addressed:
+
+- **The failure was silent.** `validate_ticker` counted the NaNs but is
+  advisory — the write proceeds regardless — and nothing ever computed the one
+  number that mattered: what fraction of this refresh is unusable. Every
+  refresh now reports that and warns past
+  `OHLCV_NAN_LAST_BAR_WARN_PCT` (50%). The denominator is tickers whose last
+  bar falls **on** the newest session, so the thousands of delisted and
+  illiquid names that legitimately have no bar that day cannot dilute the rate
+  and hide the failure.
+- **The guard could not see it.** `_reject_conflicting_bars` rejects a re-sent
+  bar whose Close disagrees beyond `PRICE_JUMP_PCT`, but that comparison is
+  `NaN` against a null bar and falls through as "no conflict"; the volume test
+  requires a non-null incoming volume, and volume was present.
+- **It could not be repaired from inside the app.** Staleness is judged by a
+  file's last **date**, which was correct on every poisoned file — so
+  `Force OHLCV Refresh` re-checked all 14,747 tickers and skipped 12,737 of
+  them. It bypasses only the launch-time gate, never the per-ticker check.
+
+**`Data → Deep OHLCV Refresh…`** closes that hole: it re-pulls the last N
+market days for every cached ticker with no staleness test at all. The window
+is counted in **trading** days against the reference ticker's own session index,
+so "1 day back" means the most recent session on a Saturday just as it does on a
+Tuesday. An overwrite option (on by default) suspends the cache-wins guard,
+which otherwise resolves every disagreement in favour of the cache and would
+silently discard the repair being asked for; replaced bars are counted and
+reported.
+
+The dialog deliberately offers **only a days-back count, never an arbitrary
+date range**. `download_one`'s window is what decides whether a merge or a
+whole-file replace happens, and a user-supplied range is the one input that
+could route a narrow pull down the replace path and truncate years of history
+per ticker. A days-back count cannot express that, and the write is refused
+outright if a merge ever comes out shorter than what was already on disk.
+
+Scope is always the full cached store. A narrower "only the tickers that look
+damaged" mode was considered and rejected: null prices are only the visible
+failure, and the same provisional responses leave understated **volume** on
+bars whose prices look perfectly fine — exactly the tickers any damage filter
+would skip.
 
 ### v6.0.0 — data-integrity overhaul (2026-08-16)
 
