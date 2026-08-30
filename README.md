@@ -58,6 +58,16 @@ features at a live order-entry platform.
   50%, and `Data → Deep OHLCV Refresh…` can re-pull the last N **market** days
   for the whole store — the only action that can replace a bar which is present
   but wrong, since staleness is judged by a file's date alone.
+- **A quarantine that costs only what it must** (v6.1.2): the split-seam
+  exclusion is now scoped to seams a scan can actually *read* — a
+  discontinuity older than the window plus the longest indicator lookback is
+  left alone, and ages out on its own as the window rolls forward. A step that
+  matches the split ratio is no longer sufficient on its own either: the series
+  level either side of the event has to have actually changed (a one-bar bad
+  print is reported as a bad bar, not a seam), and where the ratio is small
+  enough that a -50% day would fake it, the step must be an outlier against the
+  ticker's own volatility. **64 tickers excluded → 41 listed, 31 dropped by a
+  default scan.**
 - **Local-first**: everything lives in `scanner_data/` beside the executable.
   No account, no telemetry, no cloud dependency.
 
@@ -368,7 +378,11 @@ Per-session logs land in `scanner_data/logs/` (`scan_*`, `ohlcv_*`,
 │   scan_history.json          watchlist-diff baselines + summary  │
 │   schedules.json             scan-scheduler entries              │
 │   earnings_disagreements.csv cross-source EPS disagreement report│
+│   ohlcv_anomalies.csv        bad-bar findings (2 sources, merged)│
+│   split_seam_skip.txt        quarantined tickers + newest seam   │
+│   split_anchors.parquet      post-split momentum anchors         │
 │   exports/                   Quick Export XLSX snapshots         │
+│   ui_assets/                 generated spin-box arrow PNGs       │
 │   presets/, logs/, ftp_raw/                                      │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -940,19 +954,69 @@ scan path.
 runs on a background daemon thread at launch, kicked off *before* the earnings
 smart refresh — never on the GUI thread, and nothing downstream blocks on it.
 
-**`scanner_data/split_seam_skip.txt`** — generated, one ticker per line.
-Tickers whose price series is *discontinuous* at a split ex-date:
-`close[ex] / close[ex-1]` (or `close[ex+1] / close[ex]` — the basis does not
-always change on the stamped date; GTIC's 1-for-100 steps the session after)
-equals the split ratio itself, where a back-adjusted series should be smooth.
-**This is a defect at the SOURCE — a fresh yfinance pull reproduces it exactly,
-so do not rebuild these tickers.** EDGAR independently confirms the split is
-real and of the claimed magnitude on APRE (×19.98 vs ×20 expected), SILO,
-SIGY, HLTC and AREB; the direction is simply inverted. 63 tickers on the current
-store. Excluded at **scan time only**, recorded as a funnel stage, so downloads
-keep refreshing them and the exclusion reverses itself for free if the upstream
-ever fixes the series. Deliberately *not* folded into `blacklist.txt`, which is
-hand-maintained and suppresses downloads rather than scan rows.
+**`scanner_data/split_seam_skip.txt`** — generated, one
+`TICKER<TAB>YYYY-MM-DD` line per ticker (the date is that ticker's *newest*
+seam; a bare ticker line still loads and counts as undated). Tickers whose price
+series is *discontinuous* at a split ex-date: `close[ex] / close[ex-1]` (or
+`close[ex+1] / close[ex]` — the basis does not always change on the stamped
+date; GTIC's 1-for-100 steps the session after) equals the split ratio itself,
+where a back-adjusted series should be smooth. **This is a defect at the SOURCE
+— a fresh yfinance pull reproduces it exactly, so do not rebuild these
+tickers.** EDGAR independently confirms the split is real and of the claimed
+magnitude on APRE (×19.98 vs ×20 expected), SILO, SIGY, HLTC and AREB; the
+direction is simply inverted. Excluded at **scan time only**, recorded as a
+funnel stage, so downloads keep refreshing them and the exclusion reverses
+itself for free if the upstream ever fixes the series. Deliberately *not* folded
+into `blacklist.txt`, which is hand-maintained and suppresses downloads rather
+than scan rows.
+
+#### Three tests, not one (v6.1.2)
+
+A full-store audit of the 64 tickers the step test alone condemned found it
+excluding series that are fine, and excluding them *forever* regardless of what
+the scan was looking at. Three changes, all measured against the shipped store:
+
+1. **The level test.** A basis change moves the whole series and keeps it
+   moved; a bad print moves one bar. HBIA sits flat at $99.01, dips to $49.505
+   for a single zero-volume session, and is back at $99.01 on the ex-date — a
+   textbook ×2.0000 match to its 2-for-1. So the median close over the 5 bars
+   *before* the event is compared with the median over the 5 *after* (the
+   ex-date bar itself excluded, since it can sit on either basis), and a ratio
+   within `SPLIT_SEAM_TOL` of 1.0 means nothing durable changed. Those findings
+   are reclassified **`transient`** and written to `ohlcv_anomalies.csv` — 25
+   events over 22 tickers, including APRE, SILO, TECX, KGEI and both of DFSC's.
+   They are *reported*, not quarantined: 3,008 tickers already carry a flagged
+   >50% price jump and scan freely, so filtering these two dozen because they
+   happen to sit beside a split ex-date would be arbitrary.
+2. **The isolation test.** Where `|log(ratio)|` is inside
+   `SPLIT_SEAM_WEAK_LOG_RATIO` the "stepped by the ratio" hypothesis is only a
+   -50% / -67% day, which a nano-cap produces unaided — so there the step must
+   also exceed `SPLIT_SEAM_MIN_ISOLATION` × the ticker's own 90th-percentile
+   absolute log return over the surrounding 60 bars. PPCB oscillates
+   $0.010 ↔ $0.015 daily and was condemned on a ×0.36 smaller than its ordinary
+   range; MUD's ×0.101 is 30× its own noise and is not in doubt. Ratios outside
+   the band (a 1-for-20, a 1-for-140) are not gated — a four-decimal match there
+   is not something noise produces.
+3. **Window-scoping at scan time.** `_compute_ticker` only ever sees
+   `[start_date, end_date]` plus `ScanParams.max_trailing_bars()` of history
+   behind it, so `scanner.seam_relevance_cutoff(params)` computes the earliest
+   date the scan can read and a seam before it is left alone. On the shipped
+   store 26 of the original 64 sat outside both — GBCS's seam is 1,238 bars
+   back, NVDS's 765 — costing candidates while protecting nothing. The scan log
+   states both halves: `dropped 12/14747 ticker(s); 29 listed ticker(s) not in
+   reach of this window (seams before 2025-11-05)`.
+
+Net on the shipped store: **64 quarantined → 41 listed → 31 dropped by a
+default scan**, with DFSC, PPCB and NVDS (all liquid) recovered and MUD, SMCX
+and TJGC correctly still excluded.
+
+`ohlcv_anomalies.csv` therefore now has **two** producers — `validate_ticker`
+during a download run and the launch-time split sweep — and a `source` column
+(`download` / `split_sweep`) so each replaces only its own rows. Without it the
+sweep, which runs after the update, would erase the update's findings: the same
+trap that destroyed the cross-source disagreement report before v5.5.1. A CSV
+written before the column existed is read as `download`, which was the only
+producer then.
 
 **`scanner_data/split_anchors.parquet`** — `ticker`, `last_ex_date`,
 `cum_factor`, `n_events`. Only tickers that actually have a qualifying split
@@ -2406,6 +2470,7 @@ client's rate limiter).
 | `test_user_config.py` | user_config.json load/save/clamp/corrupt-file handling |
 | `test_phase1_quickwins.py` | Observability wave: `_log_error`/`_start_worker` helpers, window-title version, silent-except logging |
 | `test_version_info.py` | version_info.txt ↔ `trade_scanner_fh.__version__` sync |
+| `test_theme_spinbox.py` | Spin-box arrow assets + the stylesheet rules that make them visible; fallback when the assets cannot be written or no QApplication exists |
 | `test_end_date_anchor.py` | Quick-range End anchoring + stale-End warning |
 | `test_most_recent_proxy.py` | Proxy-row exclusion from most-recent-quarter pick (keep-if-orphan) |
 | `test_etf_adr_auto_skip.py` | ETF/ADR auto-skip parity across fills |
@@ -2667,6 +2732,23 @@ damaged" mode was considered and rejected: null prices are only the visible
 failure, and the same provisional responses leave understated **volume** on
 bars whose prices look perfectly fine — exactly the tickers any damage filter
 would skip.
+
+**Dialog fix (v6.1.2).** The "Market days back" field was unusable: its two
+spin buttons rendered as ~5 px stubs side by side with no arrow glyph, and they
+squeezed the number itself out of view. The cause is in `gui/theme.py`, not in
+the dialog — setting `border` / `padding` on `QSpinBox` switches Qt to full
+stylesheet rendering for the widget, and the up/down sub-controls then lose
+their native geometry. **Every one of the app's ~14 spin boxes had it.**
+`theme.build_stylesheet()` now gives the sub-controls explicit stacked geometry
+plus hover / pressed / disabled states, and — because Qt draws *no* arrow inside
+a styled button unless an `image:` is supplied — paints the two triangles into
+small PNGs under `scanner_data/ui_assets/` at startup and points the stylesheet
+at them. No packaged asset, so the `.spec` needs no data entry and a frozen
+build behaves exactly like a source run; if the write fails, a geometry-only
+fallback keeps Qt's own (smaller) native arrows rather than losing them. The
+dialog itself gained a 700 px minimum width so the runtime estimate stops
+wrapping, an explicit field width, and `setAccelerated(True)` so a held arrow
+ramps instead of ticking once per click.
 
 ### v6.0.0 — data-integrity overhaul (2026-08-16)
 

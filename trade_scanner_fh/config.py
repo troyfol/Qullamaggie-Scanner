@@ -3,6 +3,7 @@ Central configuration for the Trading Scanner project.
 All paths, defaults, and tunable constants live here.
 """
 
+import math
 import os
 import re
 import sys
@@ -667,6 +668,16 @@ MAX_MISSING_DAYS_FLAG = 5        # flag if > N trading days missing in a row
 #
 # Deliberately NOT folded into blacklist.txt: that file is hand-maintained, and
 # it suppresses DOWNLOADS rather than scan rows.
+#
+# FORMAT (v6.1.2): one `TICKER<TAB>YYYY-MM-DD` line per ticker, the date being
+# that ticker's NEWEST seam. The date is what lets the scan ask whether the
+# discontinuity can reach the window it is actually scanning instead of
+# excluding the ticker forever: measured on the shipped store, 26 of 64
+# quarantined tickers had their newest seam outside both the scan window and
+# the longest indicator lookback — GBCS's is 1,238 bars back — so the exclusion
+# was costing candidates while protecting nothing. A bare ticker line (the
+# pre-6.1.2 format, or a hand-written one) still loads and is treated as
+# undated, i.e. always in force.
 SPLIT_SEAM_SKIP_FILE = DATA_DIR / "split_seam_skip.txt"
 
 # Precomputed {ticker -> most recent qualifying split ex-date}, written once per
@@ -684,6 +695,46 @@ SPLIT_ANCHORS_PARQUET = DATA_DIR / "split_anchors.parquet"
 # genuine reverse split of any consequence puts the two hypotheses orders of
 # magnitude apart, so this is generous on purpose.
 SPLIT_SEAM_TOL = 1.5
+
+# Bars either side of a split ex-date used for the LEVEL test that vetoes a
+# seam call. The adjacent-bar step alone cannot tell a basis change from a
+# single bad print: HBIA's cached series sits flat at $99.01, drops to $49.505
+# for ONE zero-volume bar, and returns to $99.01 on the ex-date — which the
+# step test reads as a perfect x2.0000 match to its 2-for-1 and condemned the
+# ticker for. A real basis change moves the whole SERIES; a bad bar does not.
+# So the median close over the N bars before the event is compared with the
+# median over the N bars after it (the ex-date bar itself is excluded — it can
+# sit on either basis, which is why both step boundaries are tested), and a
+# ratio within SPLIT_SEAM_TOL of 1.0 means nothing durable changed.
+#
+# Medians, not means, because these are exactly the series where one absurd
+# print is the thing being defended against. 5 bars is enough for the median to
+# survive two bad bars (DFSC's 2022 event is a two-session dropout) and short
+# enough that a genuine post-split run does not drag the level away — measured
+# across the whole store, no confirmed seam is lost to it.
+SPLIT_SEAM_LEVEL_BARS = 5
+
+# Ratio band, in |log| units, within which "the price stepped by the split
+# ratio" and "the price had an ordinary bad day" are NOT separable evidence on
+# their own. Inside it a seam call additionally requires the step to be a
+# genuine outlier against the ticker's own recent volatility
+# (SPLIT_SEAM_MIN_ISOLATION), because a 1-for-2 or 1-for-3 is only a -50% /
+# -67% day and nano-caps do that unaided. Outside it — a 1-for-20, a 1-for-100
+# — a step matching the ratio to four decimals is not something noise produces,
+# and the isolation test is not applied.
+#
+# log(SPLIT_SEAM_TOL**2) is the point at which the two hypotheses' own
+# tolerance bands stop overlapping, so this reuses the existing threshold
+# rather than inventing a second one: ratios from 1/2.25 to 2.25 are gated.
+SPLIT_SEAM_WEAK_LOG_RATIO = 2.0 * math.log(SPLIT_SEAM_TOL)
+
+# How many times the ticker's own 90th-percentile absolute log return (over the
+# 60 bars around the event) the seam step must exceed before a WEAK-ratio event
+# is condemned. PPCB trades 0.010 <-> 0.015, a p90 daily move of 0.75 in log
+# terms, so its "x0.36 across a 1-for-2" is inside its ordinary noise and is
+# not evidence of anything; MUD's x0.101 across a 1-for-10 is 30x its own noise
+# and is not in doubt. 3.0 sits in the empty space between the two populations.
+SPLIT_SEAM_MIN_ISOLATION = 3.0
 
 # Relative tolerance (% of the bar's own price level) before an OHLC bound
 # violation — High below Open/Low/Close, or Low above Open/Close — is treated

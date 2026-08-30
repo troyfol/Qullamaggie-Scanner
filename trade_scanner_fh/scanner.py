@@ -454,6 +454,34 @@ class ScanParams:
     consec_rev_beats_threshold_pct: float = 0.0
     consec_rev_beats_quarter_cap: int = 0
 
+    def max_trailing_bars(self) -> int:
+        """How many bars BEFORE ``start_date`` any indicator can still read.
+
+        `_compute_ticker` runs two frames: `window` (sliced to
+        [start_date, end_date]) and `full_to_end` (everything up to end_date),
+        and every `full_to_end` indicator takes a trailing slice of its own
+        lookback. So the true reach of a scan is
+        ``start_date - max(lookback)`` bars, not "all of history".
+
+        Used by the split-seam quarantine to decide whether a discontinuity can
+        actually touch this scan. Deliberately takes the max over EVERY
+        lookback, enabled or not: `_compute_ticker` also computes display-only
+        indicators, and a filter toggled on between the artifact rebuild and
+        the scan must not be able to widen the reach behind the check's back.
+        """
+        return max(
+            self.sma1_period, self.sma2_period,
+            self.sti_short_lb, self.sti_long_lb,
+            self.adr_lookback, self.atr_period,
+            self.bbw_period, self.atr_short, self.atr_long,
+            self.vol_dryup_recent + self.vol_dryup_prior,
+            self.avg_vol_lookback, self.dollar_vol_lookback,
+            self.rvol_lookback + 1,
+            self.rs_market_lookback, self.rs_nasdaq_lookback,
+            self.rs_sector_lookback,
+            1,
+        )
+
 
 # ============================================================================
 # Scan result
@@ -1629,10 +1657,18 @@ class ScanContext:
     earnings_lookup: dict[str, tuple] = field(default_factory=dict)
     earnings_history_lookup: dict[str, pd.DataFrame] = field(
         default_factory=dict)
-    # Tickers whose cached series is discontinuous at a split ex-date. Loaded
-    # here rather than in `run_scan` so a sequenced run reads the file once
-    # instead of once per chunk. See config.SPLIT_SEAM_SKIP_FILE.
-    seam_skip: frozenset[str] = field(default_factory=frozenset)
+    # {ticker -> newest seam ex-date} for tickers whose cached series is
+    # discontinuous at a split ex-date; the date is None for an undated entry
+    # (a pre-6.1.2 or hand-written line), which counts as always in force.
+    # Loaded here rather than in `run_scan` so a sequenced run reads the file
+    # once instead of once per chunk. See config.SPLIT_SEAM_SKIP_FILE.
+    seam_quarantine: dict[str, Optional[pd.Timestamp]] = field(
+        default_factory=dict)
+
+    @property
+    def seam_skip(self) -> frozenset[str]:
+        """Quarantined tickers with the dates dropped."""
+        return frozenset(self.seam_quarantine)
     # {ticker -> most recent qualifying split ex-date}, for the post-split
     # momentum columns. Precomputed so the scan path never widens its parquet
     # read (EFF-5). See config.SPLIT_ANCHORS_PARQUET.
@@ -1655,6 +1691,40 @@ def _needs_earnings_dates(params_list: list[ScanParams]) -> bool:
     )
 
 
+def seam_relevance_cutoff(params: ScanParams) -> Optional[pd.Timestamp]:
+    """Earliest date whose price bars this scan can still read.
+
+    A seam on or after this date can corrupt a value the scan computes; one
+    before it cannot, because no frame handed to an indicator reaches back that
+    far. It is ``start_date`` less ``params.max_trailing_bars()`` sessions,
+    since `_compute_ticker` also runs the trailing-lookback indicators on
+    everything up to ``end_date``.
+
+    Walks the real session calendar when one is cached and falls back to a
+    calendar-day estimate otherwise; the fallback is deliberately GENEROUS
+    (1.6 calendar days per session against the true ~1.45) so an approximation
+    error widens the protected span rather than narrowing it. Returns None when
+    even that cannot be formed, which callers read as "quarantine everything" —
+    the safe direction.
+    """
+    bars = max(1, int(params.max_trailing_bars()))
+    start = pd.Timestamp(params.start_date)
+    try:
+        from .data_engine import reference_sessions
+        sessions = reference_sessions()
+    except Exception:
+        sessions = None
+    if sessions is not None and len(sessions):
+        idx = sessions.searchsorted(start, side="left")
+        pos = int(idx) - bars
+        if pos >= 0:
+            return pd.Timestamp(sessions[pos]).normalize()
+        # The window starts before the cached calendar does, so there is no
+        # session that far back to point at — nothing can be aged out.
+        return None
+    return (start - pd.Timedelta(days=int(bars * 1.6))).normalize()
+
+
 def build_scan_context(params_list: list[ScanParams]) -> ScanContext:
     """Build the shared lookups once for a whole multi-timeframe run.
 
@@ -1666,11 +1736,11 @@ def build_scan_context(params_list: list[ScanParams]) -> ScanContext:
     # ── Split-adjustment seam quarantine ──
     # Cheap (one small text file) and unconditional: the exclusion is a data
     # -integrity guard, not a filter the user opted into.
-    from .data_engine import load_split_anchors, load_split_seam_skip
-    ctx.seam_skip = load_split_seam_skip()
-    if ctx.seam_skip:
-        log.info("Split-seam quarantine: %d ticker(s) will be excluded",
-                 len(ctx.seam_skip))
+    from .data_engine import load_split_anchors, load_split_seam_quarantine
+    ctx.seam_quarantine = load_split_seam_quarantine()
+    if ctx.seam_quarantine:
+        log.info("Split-seam quarantine: %d ticker(s) on the list",
+                 len(ctx.seam_quarantine))
 
     # ── Split anchors for the post-split momentum columns ──
     ctx.split_anchors = load_split_anchors()
@@ -1815,15 +1885,38 @@ def run_scan(
     # and recorded as a funnel stage so the exclusion is visible rather than
     # silent. Their series steps by the split ratio at the ex-date, which pins
     # any window spanning it at roughly -100%.
-    if context.seam_skip:
+    #
+    # v6.1.2: scoped to seams this scan can actually READ. The exclusion used
+    # to be whole-ticker and permanent, but `_compute_ticker` only ever sees
+    # `[start_date, end_date]` plus `max_trailing_bars()` of history before it,
+    # so a seam older than that cannot reach a single indicator. On the shipped
+    # store 26 of 64 quarantined tickers were in exactly that position — GBCS's
+    # seam is 1,238 bars back — costing candidates while protecting nothing.
+    # Ageing out is automatic: as the window rolls forward, each seam leaves
+    # the reach on its own with no rebuild and no list edit.
+    if context.seam_quarantine:
+        cutoff = seam_relevance_cutoff(params)
         before = len(symbols)
-        symbols = [s for s in symbols if s.upper() not in context.seam_skip]
+
+        def _quarantined(sym: str) -> bool:
+            when = context.seam_quarantine.get(sym.upper(), "absent")
+            if when == "absent":
+                return False
+            # Undated entry: no date to compare, so it stays unconditional.
+            return when is None or cutoff is None or when >= cutoff
+
+        symbols = [s for s in symbols if not _quarantined(s)]
         dropped = before - len(symbols)
         if dropped:
             result.funnel.append(
                 FunnelStage("Split-seam quarantine", len(symbols), before))
-            log.info("Split-seam quarantine dropped %d/%d ticker(s)",
-                     dropped, before)
+        spared = len(context.seam_quarantine) - dropped
+        log.info(
+            "Split-seam quarantine dropped %d/%d ticker(s); %d listed "
+            "ticker(s) not in reach of this window (seams before %s)",
+            dropped, before, max(0, spared),
+            cutoff.date() if cutoff is not None else "n/a",
+        )
 
     # ── Phase A: Compute indicators for all tickers ──
     #

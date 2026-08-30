@@ -1294,7 +1294,17 @@ def prefetch_ohlcv(
 
 # ── OHLCV anomaly report (audit 2026-08-16, F12) ───────────────────────
 
-ANOMALY_COLUMNS = ["ticker", "anomaly", "detected_at"]
+ANOMALY_COLUMNS = ["ticker", "anomaly", "detected_at", "source"]
+
+# Two independent producers write this file: `validate_ticker` during a
+# download run, and the launch-time split sweep for the bad bars it finds while
+# classifying split ex-dates. Each replaces only ITS OWN rows, so the one that
+# runs second cannot erase the other's findings — the same trap that destroyed
+# the cross-source disagreement report before v5.5.1, arriving here the moment
+# a second producer existed. Rows written before the column existed are
+# attributed to the download validator, which was the only producer then.
+ANOMALY_SOURCE_DOWNLOAD = "download"
+ANOMALY_SOURCE_SPLIT_SWEEP = "split_sweep"
 
 
 def anomalies_csv_path() -> Path:
@@ -1302,6 +1312,42 @@ def anomalies_csv_path() -> Path:
     fixtures that monkeypatch config.DATA_DIR redirect it too (mirrors
     earnings_history._disagreements_csv_path)."""
     return config.DATA_DIR / config.OHLCV_ANOMALIES_CSV_NAME
+
+
+def _merge_anomaly_rows(rows: list[dict], source: str) -> int:
+    """Replace this ``source``'s rows in the anomaly CSV, keeping every other
+    source's. Returns the row count written for ``source``.
+
+    Never raises: a report must not be able to break the run that produced it.
+    """
+    frames = []
+    try:
+        path = anomalies_csv_path()
+        if path.exists():
+            existing = pd.read_csv(path)
+            if "source" not in existing.columns:
+                existing["source"] = ANOMALY_SOURCE_DOWNLOAD
+            existing = existing[existing["source"].astype(str) != source]
+            if not existing.empty:
+                frames.append(existing.reindex(columns=ANOMALY_COLUMNS))
+    except Exception as exc:
+        # An unreadable file must not cost the caller its findings — start
+        # fresh rather than abandoning the write.
+        log.warning("Could not merge existing OHLCV anomaly report: %s", exc)
+        frames = []
+    if rows:
+        frames.append(pd.DataFrame(rows, columns=ANOMALY_COLUMNS))
+    if not frames:
+        return 0
+    try:
+        config.atomic_write_csv(
+            pd.concat(frames, ignore_index=True), anomalies_csv_path(),
+            index=False,
+        )
+    except Exception as exc:      # a report must never break an update
+        log.warning("OHLCV anomaly report write failed: %s", exc)
+        return 0
+    return len(rows)
 
 
 def write_anomaly_report(results, *, now=None) -> int:
@@ -1324,24 +1370,62 @@ def write_anomaly_report(results, *, now=None) -> int:
     for res in results or []:
         for msg in getattr(res, "anomalies", None) or []:
             rows.append({"ticker": res.symbol, "anomaly": msg,
-                         "detected_at": stamp})
+                         "detected_at": stamp,
+                         "source": ANOMALY_SOURCE_DOWNLOAD})
     if not rows:
         log.debug("OHLCV anomaly report: nothing flagged — leaving %s as-is",
                   config.OHLCV_ANOMALIES_CSV_NAME)
         return 0
-    try:
-        config.atomic_write_csv(
-            pd.DataFrame(rows, columns=ANOMALY_COLUMNS),
-            anomalies_csv_path(), index=False,
-        )
-    except Exception as exc:      # a report must never break an update
-        log.warning("OHLCV anomaly report write failed: %s", exc)
+    written = _merge_anomaly_rows(rows, ANOMALY_SOURCE_DOWNLOAD)
+    if not written:
         return 0
     log.warning(
         "%d OHLCV anomal%s across %d ticker(s) — see %s",
         len(rows), "y" if len(rows) == 1 else "ies",
         len({r["ticker"] for r in rows}), config.OHLCV_ANOMALIES_CSV_NAME,
     )
+    return len(rows)
+
+
+def write_split_bad_bar_report(findings, *, now=None) -> int:
+    """Persist the ``transient`` seam findings as OHLCV anomalies.
+
+    A ``transient`` finding is a bar (or two) whose price is simply wrong,
+    caught because it happens to sit next to a split ex-date and to fake a
+    perfect match with the split ratio. Before v6.1.2 those tickers were
+    QUARANTINED — dropped from every scan indefinitely — which is both the
+    wrong remedy and an invisible one. They belong with the other bad-bar
+    findings, where they are reported and not acted on.
+
+    Rewrites only this producer's rows; see ``_merge_anomaly_rows``. Unlike the
+    download report an EMPTY result is still written, because the sweep always
+    covers the whole store: "nothing transient this launch" is a real finding
+    and must clear last launch's rows rather than leave them standing.
+    """
+    stamp = (now or datetime.now()).isoformat(timespec="seconds")
+    rows = [
+        {
+            "ticker": f.symbol,
+            "anomaly": (
+                f"bad bar(s) at split ex-date {f.ex_date.date()}: close "
+                f"stepped x{f.step:.4g} against a {f.ratio:.6g} split but the "
+                f"series level is unchanged (x{f.level_ratio:.4g}) — a print "
+                f"error, not an adjustment seam"
+            ),
+            "detected_at": stamp,
+            "source": ANOMALY_SOURCE_SPLIT_SWEEP,
+        }
+        for f in findings or []
+        if getattr(f, "verdict", None) == "transient"
+    ]
+    _merge_anomaly_rows(rows, ANOMALY_SOURCE_SPLIT_SWEEP)
+    if rows:
+        log.info(
+            "Split sweep: %d transient bad-bar finding(s) across %d ticker(s) "
+            "reported to %s (NOT quarantined)",
+            len(rows), len({r["ticker"] for r in rows}),
+            config.OHLCV_ANOMALIES_CSV_NAME,
+        )
     return len(rows)
 
 
@@ -1486,6 +1570,13 @@ class SeamFinding(NamedTuple):
     ratio: float
     step: float
     verdict: str
+    # Median close AFTER the event / median close BEFORE it, both excluding the
+    # ex-date bar. ~1.0 means the series level never changed, so whatever the
+    # adjacent step showed was a transient print, not an adjustment basis.
+    level_ratio: float = float("nan")
+    # |log(step)| as a multiple of the ticker's own 90th-percentile absolute
+    # log return around the event. Small = the step is inside ordinary noise.
+    isolation: float = float("nan")
 
 
 def _seam_verdict(step: float, ratio: float) -> str:
@@ -1515,6 +1606,55 @@ def _seam_verdict(step: float, ratio: float) -> str:
     return "ambiguous"
 
 
+def _level_ratio(close: pd.Series, pos: int, n_bars: int) -> float:
+    """Median close AFTER the ex-date bar / median close BEFORE it.
+
+    The ex-date bar is excluded from both sides because it can legitimately sit
+    on either basis (GTIC's 1-for-100 leaves it on the old one). Medians, not
+    means: one absurd print is precisely what this has to survive.
+
+    NaN when either side has no usable bar, which callers treat as "no opinion"
+    rather than as evidence.
+    """
+    lo = close.iloc[max(0, pos - n_bars):pos]
+    hi = close.iloc[pos + 1:pos + 1 + n_bars]
+    lo = lo[np.isfinite(lo) & (lo > 0)]
+    hi = hi[np.isfinite(hi) & (hi > 0)]
+    if lo.empty or hi.empty:
+        return float("nan")
+    before = float(lo.median())
+    after = float(hi.median())
+    if before <= 0 or after <= 0:
+        return float("nan")
+    return after / before
+
+
+def _step_isolation(close: pd.Series, pos: int, step: float,
+                    n_bars: int = 30) -> float:
+    """``|log(step)|`` as a multiple of the ticker's own 90th-percentile
+    absolute log return over the surrounding +/- ``n_bars`` sessions.
+
+    The two bars the step itself spans are removed, so a ticker cannot be
+    judged normal on the strength of the very move under test. Returns +inf
+    when the neighbourhood is too thin or too flat to give a scale — an
+    unmeasurable neighbourhood must not silently spare a seam.
+    """
+    if not (np.isfinite(step) and step > 0):
+        return float("nan")
+    seg = close.iloc[max(0, pos - n_bars):pos + n_bars + 1]
+    lr = np.log(seg.where(seg > 0)).diff()
+    # Drop the returns into the two candidate boundary bars.
+    lr = lr.drop(close.index[max(0, pos):min(len(close), pos + 2)],
+                 errors="ignore")
+    lr = lr[np.isfinite(lr) & (lr != 0)]
+    if len(lr) < 5:
+        return float("inf")
+    scale = float(np.percentile(np.abs(lr), 90))
+    if not np.isfinite(scale) or scale <= 0:
+        return float("inf")
+    return abs(float(np.log(step))) / scale
+
+
 def find_seams_in_frame(symbol: str, df: pd.DataFrame) -> list[SeamFinding]:
     """Seam findings for one already-loaded OHLCV frame.
 
@@ -1522,6 +1662,26 @@ def find_seams_in_frame(symbol: str, df: pd.DataFrame) -> list[SeamFinding]:
     distribution factor is not a share ratio, and for factors near 1.0 the
     "stepped by the ratio" and "stepped by 1.0" hypotheses are not separable
     anyway.
+
+    A step that matches the split ratio is NECESSARY but not sufficient for the
+    ``UNADJUSTED`` verdict. Two further tests were added in v6.1.2 after a
+    full-store audit found the step test alone condemning tickers whose series
+    is fine:
+
+    ``transient`` — the level test. A basis change moves the whole series and
+    keeps it moved; a bad print moves one bar. HBIA sits flat at $99.01, dips
+    to $49.505 for a single zero-volume bar and is back at $99.01 on the
+    ex-date, which reads as a textbook x2.0000 match to its 2-for-1. When the
+    median level before and after the event agree to within SPLIT_SEAM_TOL the
+    finding is reclassified ``transient`` — a bad-bar problem, reported to the
+    OHLCV anomaly CSV where the other bad-bar findings live, and not a reason
+    to stop scanning the ticker.
+
+    ``ambiguous`` by isolation — for ratios inside SPLIT_SEAM_WEAK_LOG_RATIO
+    the step is only a -50% / -67% day, which a nano-cap produces unaided, so
+    the step must additionally be an outlier against the ticker's own
+    volatility. PPCB, which oscillates 0.010 <-> 0.015, was condemned on a
+    x0.36 smaller than its ordinary daily range.
     """
     if df is None or df.empty or "Stock Splits" not in df.columns:
         return []
@@ -1560,10 +1720,29 @@ def find_seams_in_frame(symbol: str, df: pd.DataFrame) -> list[SeamFinding]:
         for want in ("UNADJUSTED", "adjusted"):
             hit = next((v for v in verdicts if v[0] == want), None)
             if hit is not None:
-                out.append(SeamFinding(symbol, ts, r, hit[1], hit[0]))
+                verdict, step = hit[0], hit[1]
                 break
         else:
-            out.append(SeamFinding(symbol, ts, r, verdicts[0][1], "ambiguous"))
+            verdict, step = "ambiguous", verdicts[0][1]
+
+        level = _level_ratio(close, pos, config.SPLIT_SEAM_LEVEL_BARS)
+        isolation = float("nan")
+        if verdict == "UNADJUSTED":
+            if np.isfinite(level) and level > 0 and (
+                    abs(np.log(level)) <= np.log(config.SPLIT_SEAM_TOL)):
+                # Same level after the event as before it: no basis changed,
+                # one or two bars are simply wrong.
+                verdict = "transient"
+            else:
+                isolation = _step_isolation(close, pos, step)
+                weak = abs(np.log(r)) < config.SPLIT_SEAM_WEAK_LOG_RATIO
+                if weak and np.isfinite(isolation) and (
+                        isolation < config.SPLIT_SEAM_MIN_ISOLATION):
+                    # Indistinguishable from an ordinary bad day for THIS
+                    # ticker. Refuse to decide — that leaves it scannable,
+                    # which is the safe direction for an exclusion list.
+                    verdict = "ambiguous"
+        out.append(SeamFinding(symbol, ts, r, step, verdict, level, isolation))
     return out
 
 
@@ -1677,16 +1856,25 @@ def rebuild_split_seam_skip(
     if findings is None:
         findings = find_adjustment_seams(symbols)
     bad = [f for f in findings if f.verdict == "UNADJUSTED"]
-    tickers = sorted({f.symbol for f in bad})
+    # Newest seam per ticker: a scan only has to care about the most recent
+    # one, because any older seam is further from the window still.
+    newest: dict[str, pd.Timestamp] = {}
+    for f in bad:
+        cur = newest.get(f.symbol)
+        if cur is None or f.ex_date > cur:
+            newest[f.symbol] = f.ex_date
+    tickers = sorted(newest)
 
     lines = [
         "# GENERATED by data_engine.rebuild_split_seam_skip() — do not hand-edit.",
         "# Tickers whose cached price series is discontinuous at a split ex-date.",
         "# Source defect (a fresh pull reproduces it) — DO NOT REBUILD THESE.",
         "# Excluded at scan time only; downloads keep refreshing them.",
+        "# TICKER<TAB>newest seam ex-date. The scan drops a ticker only when",
+        "# that date can actually reach the window it is scanning.",
         "# events=" + str(len(bad)) + "  tickers=" + str(len(tickers)),
     ]
-    lines.extend(tickers)
+    lines.extend(f"{t}\t{newest[t].date().isoformat()}" for t in tickers)
     try:
         config.SPLIT_SEAM_SKIP_FILE.parent.mkdir(parents=True, exist_ok=True)
         # Atomic: the scan path reads this file, and the rebuild runs on a
@@ -1702,28 +1890,64 @@ def rebuild_split_seam_skip(
     return (len(tickers), len(bad))
 
 
-def load_split_seam_skip() -> frozenset[str]:
-    """Tickers to exclude from scan results. Empty when the file is absent, so
-    a store that has never run the builder simply scans everything."""
+def load_split_seam_quarantine() -> dict[str, Optional[pd.Timestamp]]:
+    """``{ticker -> newest seam ex-date}``, or ``{ticker -> None}`` for a line
+    that carries no date.
+
+    Empty when the file is absent, so a store that has never run the builder
+    simply scans everything. ``None`` means "undated, therefore always in
+    force": it is what a pre-6.1.2 file or a hand-written line yields, and the
+    scan-time check treats it as unconditionally quarantined rather than
+    guessing a date it does not have.
+    """
     path = config.SPLIT_SEAM_SKIP_FILE
     if not path.exists():
-        return frozenset()
+        return {}
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         log.warning("Could not read %s: %s", path, exc)
-        return frozenset()
-    out = set()
+        return {}
+    out: dict[str, Optional[pd.Timestamp]] = {}
+
+    def _add(tok: str, when: Optional[str]) -> None:
+        tok = tok.strip().upper()
+        if not tok:
+            return
+        stamp: Optional[pd.Timestamp] = None
+        if when:
+            try:
+                stamp = pd.Timestamp(when.strip())
+            except (ValueError, TypeError):
+                stamp = None
+        prev = out.get(tok, "missing")
+        # An undated entry wins: it is the broader claim, so a file mixing the
+        # two formats quarantines unconditionally rather than half-way.
+        if prev == "missing":
+            out[tok] = stamp
+        elif prev is not None and stamp is None:
+            out[tok] = None
+        elif prev is not None and stamp is not None and stamp > prev:
+            out[tok] = stamp
+
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        if "\t" in line:
+            tok, _, when = line.partition("\t")
+            _add(tok, when)
+            continue
         # tolerate a comma-separated line, matching blacklist.txt's shape
         for tok in line.split(","):
-            tok = tok.strip().upper()
-            if tok:
-                out.add(tok)
-    return frozenset(out)
+            _add(tok, None)
+    return out
+
+
+def load_split_seam_skip() -> frozenset[str]:
+    """Quarantined tickers, dates discarded. Kept for callers that only need
+    the membership test."""
+    return frozenset(load_split_seam_quarantine())
 
 
 # ── Split anchor sidecar ────────────────────────────────────────────────
@@ -1800,17 +2024,20 @@ def rebuild_split_artifacts(
     sweep = sweep_split_artifacts(symbols)
     tickers, events = rebuild_split_seam_skip(symbols, findings=sweep.seams)
     rows = write_split_anchors(sweep.anchors)
+    # Bad bars found en route go to the anomaly report, not the skip list.
+    transient = write_split_bad_bar_report(sweep.seams)
     elapsed = time.time() - t0
     summary = {
         "scanned": sweep.scanned,
         "anchors": rows,
         "seam_tickers": tickers,
         "seam_events": events,
+        "transient_events": transient,
         "elapsed_sec": round(elapsed, 1),
     }
     log.info(
         "Split artifacts rebuilt: %d file(s) swept, %d anchor(s), "
-        "%d seam ticker(s)/%d event(s), %.1fs",
-        sweep.scanned, rows, tickers, events, elapsed,
+        "%d seam ticker(s)/%d event(s), %d transient bad-bar event(s), %.1fs",
+        sweep.scanned, rows, tickers, events, transient, elapsed,
     )
     return summary

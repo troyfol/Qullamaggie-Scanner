@@ -54,7 +54,7 @@ from .dialogs import (
 from .earnings_coordinator import EarningsRefreshCoordinator
 from .exports import ExportsController
 from .hotkey_dialog import HotkeySettingsDialog
-from .theme import DARK_STYLESHEET
+from .theme import build_stylesheet
 from .widgets import (
     _fmt_date, IndicatorPanel, LogPanel, QtLogHandler, RESULT_COLUMNS,
     ResultsTable, restore_rows_at_positions,
@@ -2299,21 +2299,36 @@ class MainWindow(QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Deep OHLCV Refresh")
-        dlg.setMinimumWidth(560)
+        # Wide enough that the explanatory paragraph and the estimate below it
+        # wrap at a readable measure instead of forcing the dialog to whatever
+        # width the longest unwrapped line happens to need. Measured: at 700
+        # every line of the estimate fits, at 620 the runtime line breaks two
+        # words from its end.
+        dlg.setMinimumWidth(700)
         layout = QVBoxLayout(dlg)
+        layout.setSpacing(10)
 
-        layout.addWidget(QLabel(
+        header = QLabel(
             "Re-download recent bars for <b>every cached ticker</b>, ignoring "
             "the staleness check.<br>Use when cached bars are present but "
             "wrong — null prices, or volume left provisional by a refresh that "
             "ran before the session settled."
-        ))
+        )
+        header.setWordWrap(True)
+        layout.addWidget(header)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Market days back:"))
         spin = QSpinBox()
         spin.setRange(1, config.OHLCV_DEEP_REFRESH_MAX_DAYS)
         spin.setValue(config.OHLCV_DEEP_REFRESH_DEFAULT_DAYS)
+        # The field sizes itself to two digits by default, which the stylesheet
+        # then eats entirely with the arrow buttons. Ask for room explicitly.
+        spin.setMinimumWidth(90)
+        spin.setMinimumHeight(26)
+        # Holding an arrow ramps instead of ticking once per click — the range
+        # runs to OHLCV_DEEP_REFRESH_MAX_DAYS, which is a long way at 1/click.
+        spin.setAccelerated(True)
         spin.setToolTip(
             "Trading days, not calendar days. 1 = the most recent session."
         )
@@ -7988,7 +8003,9 @@ def main():
         )
 
     app = QApplication(sys.argv)
-    app.setStyleSheet(DARK_STYLESHEET)
+    # After QApplication: the spin-box arrow assets are painted with
+    # QPixmap, which needs a live application object.
+    app.setStyleSheet(build_stylesheet())
 
     # Audit 2026-08-16 (F11): a schema mismatch used to log a WARNING and let
     # the app carry on reading, merging and WRITING the cache. Ask instead.
