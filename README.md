@@ -91,6 +91,7 @@ features at a live order-entry platform.
 - [Key data structures](#key-data-structures)
 - [Filter / indicator semantics — the three-state model](#filter--indicator-semantics--the-three-state-model)
 - [Display-only mode & red-on-fail coloring](#display-only-mode--red-on-fail-coloring)
+- [Quarter-series filters — consecutive growth & accelerating quarters](#quarter-series-filters--consecutive-growth--accelerating-quarters)
 - [Match-color anchoring system](#match-color-anchoring-system)
 
 ### Extending it
@@ -341,6 +342,8 @@ Per-session logs land in `scanner_data/logs/` (`scan_*`, `ohlcv_*`,
 │   earnings_cache.py     Schema/IO for earnings_dates.parquet     │
 │   earnings_history.py   Schema/IO for earnings_history.parquet + │
 │                         Zacks bulk/targeted fills                │
+│   earnings_series.py    Quarter-run analytics (consecutive       │
+│                         growth + accelerating quarters)          │
 │   earnings_reconcile.py Multi-source priority chain unifier      │
 │   earnings_raw.py       Append-only raw audit/replay layer       │
 │   fill_framework.py     Shared checkpoint/flush/finalize/backoff │
@@ -583,6 +586,7 @@ modules, 12 `gui/` modules, 1 `tools/` helper, 74 files under `tests/`).
 | `fill_framework.py` | 666 | Shared checkpoint/flush/finalize/backoff-rewind orchestrator for the finviz/finnhub fill pair (hooks resolved through the calling module at call time so test monkeypatching of private names keeps working) | `run_fill_loop`, `FillSpec`, `Checkpoint`, `save_checkpoint` / `load_checkpoint` / `clear_checkpoint`, `flush_pending_to_disk`, `find_gap_tickers`, `finalize_fill` |
 | `finviz_client.py` | 263 | Finviz earnings scrape — fetch `quote.ashx?t=SYM&ty=ea`, extract the `earningsData` JSON array (curl_cffi Chrome impersonation, slow jittered rate limiter, failure-kind sentinels, two-marker block-vs-empty classification) | `fetch_earnings`, `_extract_earnings_data`, `is_configured`, `last_failure_kind` |
 | `finviz_fill.py` | 581 | Bulk / gap / spot finviz fills (top-priority adjusted source) — adjusted-field mapping, forward-row skip, history-years cap, checkpoint resume, block backoff (loop delegated to `fill_framework.run_fill_loop`) | `bulk_fill_finviz`, `gap_fill_finviz`, `spot_fill_finviz`, `find_finviz_gap_tickers` |
+| `earnings_series.py` | 393 | Quarter-run analytics shared by the six consecutive-growth / accelerating-quarters filters: pool construction from a ticker's history (quarter cap, missing-slot detection), the shared gap + sign step rules, longest-run counting, and two-pass series construction with Longest / Most Recent / Backward Only selection | `build_quarter_points`, `consecutive_growth_run`, `accelerating_series`, `QuarterPoint`, `AcceleratingSeries`, `METRIC_COLUMNS` |
 | `earnings_reconcile.py` | 462 | Multi-source priority chain unifier (`nasdaq > yahoo > finviz > zacks > finnhub`) | `reconcile_earnings_dates` |
 | `earnings_raw.py` | 316 | Append-only raw audit/replay layer (one parquet per fill run per source) | `new_run_id`, `append_zacks_rows`, `append_finnhub_rows`, `append_finviz_rows`, `append_nasdaq_rows`, `append_yahoo_rows`, `read_raw`, `prune_old_raw` |
 | `nasdaq_fill.py` | 141 | Nasdaq finance-calendars bulk fill (writes earnings_dates only) | `bulk_fill_nasdaq` |
@@ -725,7 +729,19 @@ class ScanParams:
 
 The `consec_*_beats_min` spinbox accepts **0 as a valid threshold**. Setting min=0 makes the streak filter trivially pass every ticker (streak ≥ 0 is always true) AND the display-only red-on-fail can never fire (streak < 0 is impossible). Intended use: surface the streak count + Q-i blocks for context when the user wants to see the data without any pass/fail signal.
 
-The `consec_*_beats_quarter_cap` spinbox (label "Q Cap" in the panel) is an **optional ceiling on how many Q-i columns are populated** for that side. Default 0 means "no cap" — the scanner populates every available quarter up to MAX_BEATS_QUARTERS=20. Setting cap=4 limits to Q-1..Q-4 even when the ticker has 20 quarters of history. EPS and Rev caps are independent. Implementation: applied at the scanner level via `past_desc.head(cap)` so unpopulated quarters never reach the DataFrame, which means `_build_dynamic_columns` naturally renders only the capped count.
+The `consec_*_beats_quarter_cap` spinbox (label "Q Cap" in the panel) is an **optional ceiling on the pool of quarters the filter may look back over** for that side. Default 0 means "no cap". Setting cap=4 restricts that side to the 4 most recently reported quarters, which limits the rendered Q-i columns to Q-1..Q-4 **and** bounds the streak itself — with cap=4 the reported streak can never exceed 4. EPS and Rev caps are independent. Implementation: applied at the scanner level via `past_pref.head(cap)`, and that same capped frame is what `compute_consecutive_beats` walks.
+
+> **Changed 2026-09-07.** The cap was previously display-only: it limited
+> which Q-i columns were populated while `compute_consecutive_beats` still
+> walked the ticker's full history, so a cap of 4 could report a streak of
+> 12. It now bounds both. Measured on the live store, a cap of 4 changes the
+> reported EPS streak for **15.3%** of tickers (22.8% at cap=2, 8.7% at
+> cap=8, 5.5% at cap=12); a saved preset with a non-zero Q Cap will return
+> different results than it did before. Note that "no cap" stays genuinely
+> uncapped — the MAX_BEATS_QUARTERS=20 display ceiling is deliberately NOT
+> reused as the computation pool, because 95 tickers in the live store carry
+> an uncapped streak longer than 20 (max 70) and clipping them would be a
+> silent regression.
 
 The number of Q-i columns rendered is **based on populated data**, not capped by the streak count. A ticker with a streak that broke at Q-3 still shows Q-3..Q-N (up to MAX_BEATS_QUARTERS=20 quarters of history, or the user's quarter_cap if smaller). The streak count drives only the in-streak green-text coloring inside `_populate_row`; display gating is decoupled. Rationale: post-streak earnings cells must remain eligible for match-coloring against non-earnings indicator dates — a `max_gap_date` that lands on Q-4's earnings day should color the Q-4 unit even though Q-4 isn't part of an active streak.
 
@@ -761,6 +777,17 @@ bars the benchmark has, and positional slicing would compare two different
 periods. Fewer than `MIN_POST_SPLIT_BARS` (3) after the anchor falls back to the
 un-anchored figure.
 
+**As of 2026-09-07 the base `relative_strength_ratio` slices by date too.** It
+was still taking `bench_df.iloc[-lookback:]`, so the rationale above applied to
+it verbatim and went unfixed: 9.0% of cached tickers have a 20-bar window that
+starts on a different date than SPY's (median 3 days of drift, max 430). The
+bias is one-directional — measured over 2,445 tickers the old form **overstated**
+RS in 97% of the cases it changed, i.e. it flattered exactly the illiquid names
+least deserving of it. The fix moved 8.7% of RS values (median +0.004, max
++0.074) and produced no new NaNs. Note this changes `rs_market`, `rs_nasdaq` and
+`rs_sector` for those tickers, so a saved preset near an RS threshold can select
+slightly differently than before.
+
 ### Result DataFrame schema (built by `run_scan`)
 
 | Column | Always present? | Source |
@@ -779,8 +806,11 @@ un-anchored figure.
 | `surge_pct` + `surge_start_date` + `surge_end_date` + `surge_window` | Iff surge active | `indicators.surge_*` |
 | `reported_eps`, `surprise_eps_*`, `reported_rev`, `surprise_rev_*` | Per-column gating (Option B 2026-05) | `mr.get(...)` from earnings_history_lookup |
 | `last_report_date` | Iff individual earnings active AND no beats active | (suppressed when beats covers it) |
-| `consec_eps_beats`, `q1..qN_*_eps` | Iff `consec_eps_beats_enabled OR _display_only`; N = `min(populated_quarters, consec_eps_beats_quarter_cap if >0 else MAX_BEATS_QUARTERS=20)`. NOT capped by streak length. | `compute_consecutive_beats` + per-quarter projection |
+| `consec_eps_beats`, `q1..qN_*_eps` | Iff `consec_eps_beats_enabled OR _display_only`; N = `min(populated_quarters, consec_eps_beats_quarter_cap if >0 else MAX_BEATS_QUARTERS=20)`. NOT capped by streak length. The streak itself is computed over the same capped pool. | `compute_consecutive_beats` + per-quarter projection |
 | `consec_rev_beats`, `q1..qN_*_rev` | Iff `consec_rev_beats_enabled OR _display_only`; same N-rule with `consec_rev_beats_quarter_cap` (independent from EPS) | Same for revenue side |
+| `consec_eps_growth`, `consec_rev_growth` | Iff that row is enabled-or-display | `earnings_series.consecutive_growth_run` |
+| `accel_*_len`, `accel_*_span`, `accel_*_vals` | Iff that accelerating row is enabled-or-display | `earnings_series.accelerating_series` |
+| `_accel_*_start_date`, `_accel_*_end_date` | Alongside the above | hidden — match-colour anchors for the span cell |
 | `_earnings_aligned_dates` | Iff any non-earnings indicator date matches an earnings date | hidden — drives match-color in widget |
 | `_display_only_fails` | Iff any display-only filter has fail flags for this row | hidden — drives red-on-fail in widget |
 
@@ -1072,7 +1102,7 @@ Two checkboxes at the **leftmost** position of the main toolbar — `Earnings Da
 | Toggle | Gates these filters | Coverage signal |
 |--------|---------------------|-----------------|
 | **Earnings Dates** | `days_since_earnings`, `days_until_earnings`, `days_until_max` | calendar `last_report_date` / `next_earnings_date` derived |
-| **Earnings Data** | `reported_eps`, `surprise_eps_dollar/pct`, `reported_rev`, `surprise_rev_dollar/pct`, consec EPS / Rev beats | reported result values from the history sources (finviz/zacks/finnhub) |
+| **Earnings Data** | `reported_eps`, `surprise_eps_dollar/pct`, `reported_rev`, `surprise_rev_dollar/pct`, `yoy_eps_pct`, `yoy_rev_pct` | reported result values from the history sources (finviz/zacks/finnhub) |
 
 | State | Filter behavior on NaN values in that filter's column |
 |-------|--------------------------------------------------------|
@@ -1083,9 +1113,70 @@ Two checkboxes at the **leftmost** position of the main toolbar — `Earnings Da
 
 **Wired into:** [scanner.py:`ScanParams.earnings_dates_only` + `earnings_data_only`](trade_scanner_fh/scanner.py) (two `bool` fields, both default False). Read from `MainWindow.chk_earnings_dates_only` / `chk_earnings_data_only` and passed into every period's `ScanParams` via `IndicatorPanel.build_scan_params(start, end, earnings_dates_only=..., earnings_data_only=...)`.
 
-Same flags drive both the funnel mask (in `_build_filter_stages`) and the display-only red-on-fail (in `_compute_display_only_fails`) so the visual signal is consistent with what the filter would have done.
+Same flags drive both the funnel mask (in `_build_filter_stages`) and the display-only red-on-fail (in `_compute_display_only_fails`) so the visual signal is consistent with what the filter would have done. **Fixed 2026-09-07:** `yoy_eps_pct` and `yoy_rev_pct` were gated by `earnings_data_only` in the funnel but missing from the red-on-fail NaN set, so with the toggle on a NaN YoY cell rendered in the default colour while the funnel dropped the row. The two lists are now covered by a drift-guard test.
+
+**The multi-quarter filters deliberately ignore this toggle.** The two consec-beats filters and the six quarter-series filters drop a ticker with no earnings history regardless of the toggle's state — "N consecutive beats" and "N accelerating quarters" have no meaningful include-no-data reading, so there is nothing for the OFF state to pass. (The table above previously listed consec beats as gated by this toggle; it never was.)
 
 **Pandas-NaN safety:** the funnel masks all use `(v >= t) | (v.isna() & nan_passes)` which never raises on NaN — both branches evaluate cleanly regardless of how many NaN cells the column has. Verified by `tests/test_phase7_filters.py::test_earnings_data_only_drops_nan_rows_else_passes_them` and `test_earnings_dates_filter_respects_data_implies_date_invariant`.
+
+---
+
+## Point-in-time correctness of the earnings-date filters
+
+Every date-sensitive path in the scanner is clamped to the **scan end
+date** (`end_ts`), not to today: the OHLCV window, `full_to_end`, the
+benchmark frames, and the earnings-history slice that feeds the beats and
+quarter-series filters. That is what lets a historical replay or a
+Sequenced Run reproduce what the scan would have said on that date.
+
+`days_since_er` / `days_until_er` were the one exception, and the failure
+was silent. `earnings_dates.parquet` holds the two dates that bracket
+*now*; the scanner handled only the case where `next_earnings` had
+already passed, and not its mirror — a `last_earnings` that has **not yet
+happened** relative to a backdated `end_ts`. That produced a negative
+`days_since_er`, which the filter's floor of 0 then rejected.
+
+Measured on the live store before the fix (2026-09-07):
+
+| `end_date` | tickers with a negative `days_since_er` | "Days Since ER 0–90" passed |
+|---|---|---|
+| 2026-01-01 | 5,969 / 7,241 (82.4%) | — |
+| 2025-06-01 | 6,234 / 7,241 (86.1%) | **452** |
+| 2024-01-01 | 6,944 / 7,241 (95.9%) | — |
+
+`_resolve_report_dates_as_of` (scanner.py) now classifies rather than
+patching one case: of the dates held, anything at or before `end_ts` has
+happened and anything after has not; the last report is the newest of the
+former and the next report the oldest of the latter. The per-quarter
+history then contributes real announcement dates, asymmetrically and for
+measured reasons:
+
+- **next report — narrow.** Take the earliest future date across both
+  sources, because on a backdated scan the calendar's `next_earnings`
+  describes today's calendar and is typically years past `end_ts`. Safe
+  unconditionally: the history holds **zero** non-proxy rows dated after
+  today, so this cannot change a current-date scan.
+- **last report — fill only.** The calendar is the purpose-built,
+  five-source-reconciled record of past reports, so history is consulted
+  only where the calendar has nothing at or before `end_ts`. On a
+  current-date scan that fires for 0 tickers (22 of 7,267 lack such a
+  date, and none of those carry history).
+
+finnhub calendar proxies are skipped where real rows exist — a proxy is
+stamped to a quarter end ~30 days off the true announcement.
+
+After the fix, negative day counts are gone at every backdate tested, and
+"Days Since ER 0–90" at `end_date=2025-06-01` passes **4,950** tickers
+instead of 452.
+
+> **Known, deliberately not changed:** 98 tickers have a real
+> announcement in `earnings_history.parquet` that is *newer* than their
+> `earnings_dates.parquet` `last_earnings` — the calendar has not caught
+> up. Preferring the newer of the two would change those 98 on a live
+> scan. That is a data-freshness issue in the calendar fill, separate from
+> point-in-time correctness, and is left alone here.
+
+**Tests:** [`test_audit_fixes_2026_09_07.py`](trade_scanner_fh/tests/test_audit_fixes_2026_09_07.py).
 
 ---
 
@@ -1233,6 +1324,125 @@ off; missing multipliers default to 2.0 / 1.0, so an old preset renders
 ATR Stop identical to before). Tests:
 [`tests/test_rvol_atr_stop.py`](trade_scanner_fh/tests/test_rvol_atr_stop.py)
 and [`tests/test_adr_dollar_stops.py`](trade_scanner_fh/tests/test_adr_dollar_stops.py).
+
+---
+
+## Quarter-series filters — consecutive growth & accelerating quarters
+
+Six earnings filters that read a **run of quarters** rather than the most
+recent one. All six share one primitive in
+[`earnings_series.py`](trade_scanner_fh/earnings_series.py) and read the
+same point-in-time-correct slice the beats streak does (`report_date <=`
+scan end, real announcements preferred over finnhub calendar proxies).
+
+| Row | Metric | Reports |
+|-----|--------|---------|
+| Consecutive YoY EPS Growth | `yoy_eps_pct` | longest qualifying run length |
+| Consecutive YoY Rev Growth | `yoy_rev_pct` | longest qualifying run length |
+| Accel Quarters — EPS Surprise | `surprise_eps_pct` | series length + span + values |
+| Accel Quarters — Rev Surprise | `surprise_rev_pct` | " |
+| Accel Quarters — YoY EPS Growth | `yoy_eps_pct` | " |
+| Accel Quarters — YoY Rev Growth | `yoy_rev_pct` | " |
+
+### The quarter pool
+
+Each row has its own **Q Cap**, and it is pool-defining: cap=8 means the
+filter may look back over the 8 most recently reported quarters and no
+further. 0 = no cap. Same slicing basis as the beats Q Cap.
+
+Within the pool, quarters are ordered by `period_ending` (fiscal order),
+and a quarter is *missing* when it has no row **or** its row has a NaN
+value for that metric — the two are indistinguishable by design.
+
+### Shared step rules
+
+- **One missing quarter may be bridged**; two or more break the run. A
+  bridged quarter does not count toward the length.
+- **Negative → positive breaks the run**, however large the move: `-5 →
+  +10` is a swing out of contraction, not acceleration within a trend.
+  Zero is neither positive nor negative, so `-5 → 0` and `0 → +5` both
+  hold.
+- **Every threshold is inclusive** (`>=`).
+
+### Consecutive YoY Growth
+
+A quarter is a hit when its YoY growth clears the Growth % threshold; the
+filter reports the length of the **longest qualifying run anywhere in the
+pool**. Two deliberate differences from Consecutive Beats, both required
+by the spec: beats counts only the *trailing* streak and breaks on any
+missing quarter, whereas these bridge a single hole and will find a run
+that ended several quarters ago.
+
+### Accelerating Quarters
+
+**Acceleration is measured in percentage points.** `V = 20 → V = 25` is a
+move of **+5**, not +25%.
+
+| Parameter | Meaning |
+|-----------|---------|
+| `Start %` | the first (oldest) quarter of the series must clear this; later quarters are unconstrained in absolute terms |
+| `Step pp` | every step must gain at least this many percentage points |
+| `Min Count` | quarters in the series, inclusive of the start. Floors at 2 — a one-quarter "series" has no acceleration step |
+| `Q Cap` | pool size, as above |
+| `Series` | `Longest` (greatest count, ties to the newest end) or `Most Recent` (newest-ending series) |
+| `Backward Only` | anchor on the newest quarter that has data and build only that series. Greys out `Series` |
+
+Series construction is two passes. Pass 1 extends backward from each
+terminal quarter as far as the step rules allow, giving that terminal its
+maximal chain. Pass 2 walks that chain from its oldest end to the **first
+quarter clearing `Start %`** — the series begins there. So a chain whose
+oldest quarters sit below the starting threshold is not rejected; the
+series simply starts later, which is what lets a stock accelerating *up
+through* the threshold from below qualify. Each terminal quarter
+therefore yields at most one series.
+
+`Backward Only` is strict: if the anchor quarter terminates no qualifying
+series, the stock fails. The anchor is never stepped back to hunt for an
+earlier one. That is the distinction from `Most Recent`, which ranks by
+recency but does not require the series to end on the newest quarter.
+
+### Output columns
+
+Each accelerating row emits three condensed cells, rendered only when
+that row is enabled or display-only:
+
+| Column | Example | Notes |
+|--------|---------|-------|
+| `{prefix}_len` | `4` | quarter count of the resolved series |
+| `{prefix}_span` | `2024-06 -> 2025-03` | start and end **fiscal period** |
+| `{prefix}_vals` | `+12.50% -> +33.00%` | `V(start)` and `V(end)` |
+
+The span shows `period_ending`, not `report_date`, because only the
+fiscal period is monotonic with the series order — a late filing can
+announce a Q4 after the following Q1 (JOB, BYSI and LHX all do in the
+live store) and one ticker carries a plainly corrupt report_date, which
+made report-date spans read backwards. The report dates still travel on
+the row as `_{prefix}_start_date` / `_end_date` and still **anchor the
+cell's earnings match-colour**: all three cells light up when an
+indicator date pairs with *either* end of the series. This is the one
+place a cell has two anchor candidates rather than one — see
+`_anchor_date_candidates` in widgets.py.
+
+When nothing in the pool reaches `Min Count`, the best sub-threshold
+candidate is still reported (with `qualifies=False` internally) so
+display-only mode shows how far the ticker actually got and the
+red-on-fail colouring has a value to mark. The filter still rejects it.
+
+### Interactions
+
+These six are **independent** — of each other and of the beats filters.
+None greys out another, none locks Sequenced Run (they add scalar
+columns, not a wide multi-quarter block), and several can be stacked as
+an AND. A ticker with no earnings history fails them regardless of the
+`Earnings Data` toolbar toggle, matching the beats convention.
+
+**Tests:**
+[`test_earnings_series.py`](trade_scanner_fh/tests/test_earnings_series.py)
+(the algorithm, including the spec's T1–T8 acceptance cases),
+[`test_quarter_series_integration.py`](trade_scanner_fh/tests/test_quarter_series_integration.py)
+(ScanParams → columns → filter stages → red-on-fail) and
+[`test_quarter_series_gui.py`](trade_scanner_fh/tests/test_quarter_series_gui.py)
+(panel wiring, greyout, presets, match-colour anchoring).
 
 ---
 
@@ -2674,6 +2884,60 @@ directories, and the previous `_internal/`.
 
 ## Changelog
 
+### v6.2.0 — quarter-series filters + three point-in-time fixes (2026-09-07)
+
+**Six new earnings filters** that read a *run* of quarters rather than the
+most recent one, all built on one primitive in `earnings_series.py`:
+Consecutive YoY EPS / Rev Growth, and Consecutive Accelerating Quarters
+over EPS Surprise, Rev Surprise, YoY EPS and YoY Rev. Acceleration is
+measured in **percentage points**, a single missing quarter is bridged
+while two break the run, and a negative→positive step breaks it however
+large. Each accelerating row reports its series as three condensed cells
+(quarter count, fiscal-period span, `V(start) -> V(end)`), and all three
+carry the series' report dates as match-colour anchors — the one place a
+cell pairs on *two* candidate dates rather than one. See
+[Quarter-series filters](#quarter-series-filters--consecutive-growth--accelerating-quarters).
+
+Verified three ways: the spec's own T1–T8 acceptance cases, a full-universe
+invariant sweep, and a differential check against a brute-force oracle
+written from the spec's definitions — **156,060 comparisons, zero
+mismatches**.
+
+**Behaviour changes to existing filters** — a saved preset can select
+differently than it did on v6.1.2:
+
+- **The beats Q Cap is now pool-defining.** It previously limited which
+  Q-i columns were populated while `compute_consecutive_beats` still
+  walked the full history, so a cap of 4 could report a streak of 12. It
+  now bounds both. A cap of 4 changes the reported EPS streak for 15.3%
+  of tickers. "No cap" stays genuinely uncapped — the
+  MAX_BEATS_QUARTERS=20 display ceiling is deliberately not reused, since
+  95 tickers carry a streak longer than 20.
+- **`relative_strength_ratio` slices the benchmark by date, not
+  position.** The post-split variant was fixed for this reason in v6.1.0;
+  the base indicator was not. 9.0% of tickers have a 20-bar window
+  starting on a different date than SPY's, and the old form **overstated**
+  RS in 97% of the cases it changed. Moves `rs_market`, `rs_nasdaq` and
+  `rs_sector` for 8.7% of tickers; no new NaNs.
+- **`days_since_er` / `days_until_er` resolve as of the scan end date.**
+  The pair was read as of *today*, so on a backdated scan the store's
+  `last_earnings` was still in the future and the day count went negative
+  — the filter's floor of 0 then dropped the row. At `end_date=2025-06-01`
+  that hit 86.1% of tickers and left "Days Since ER 0–90" passing 452 of
+  them; it now passes 4,950 with no negatives at any backdate. See
+  [Point-in-time correctness](#point-in-time-correctness-of-the-earnings-date-filters).
+
+**Fixed:** `yoy_eps_pct` / `yoy_rev_pct` were gated by `earnings_data_only`
+in the funnel but missing from the display-only red-on-fail NaN set, so a
+NaN YoY cell rendered plain while the funnel dropped the row. Both lists
+are now covered by a drift-guard test.
+
+**Docs:** corrected the `Earnings Data` toggle table — it listed the
+consec-beats filters as gated by the toggle, which they never were (and
+should not be).
+
+1,759 tests.
+
 ### v6.1.1 — null-bar detection and deep refresh (2026-08-29)
 
 A Saturday refill wrote a bar with **NaN Open/High/Low/Close but populated
@@ -3048,7 +3312,7 @@ These are properties the codebase depends on. Breaking any one is a regression w
 20. **`last_report_date` shows ONLY when** at least one individual earnings column is active AND no beats column is active. When beats is active, Q-1 Date covers the same value.
 21. **Q-i column display gating is decoupled from streak length.** `_build_dynamic_columns` uses `_max_present(suffix)` to render every populated quarter (up to MAX_BEATS_QUARTERS=20), NOT `min(streak, present)`. The streak count drives only the green-text coloring inside `_populate_row`. This is what keeps post-streak earnings cells eligible for match-coloring against non-earnings indicator dates.
 22. **`consec_*_beats_min = 0` is a valid threshold.** Spinbox minimum is 0, not 1. With min=0 the filter trivially passes everyone AND the display-only red-on-fail can never fire.
-23. **`consec_*_beats_quarter_cap` is per-side and independent.** EPS cap controls only `q*_*_eps` columns; Rev cap controls only `q*_*_rev`. Default 0 means no cap (use full MAX_BEATS_QUARTERS=20). Values 1-20 limit population at the scanner level via `past_desc.head(cap)` so unpopulated quarters never reach the DataFrame.
+23. **`consec_*_beats_quarter_cap` is per-side, independent, and pool-defining.** EPS cap controls only the EPS side; Rev cap only the Rev side. Default 0 means no cap — and no cap means the FULL history, not MAX_BEATS_QUARTERS=20 (that constant is a display ceiling only; 95 live tickers have a longer streak than 20). Values 1-20 restrict the pool at the scanner level via `past_pref.head(cap)`, so the cap bounds both the populated `q*_*` columns and the streak `compute_consecutive_beats` can report.
 24. **NaN handling for earnings filters is driven by TWO independent global flags — `ScanParams.earnings_dates_only` (gates `days_since/until` filters) and `ScanParams.earnings_data_only` (gates the 6 most-recent-quarter earnings filters + consec beats).** Per-row `*_include_no_data` flags were removed (9 of them). Both `_build_filter_stages` and `_compute_display_only_fails` consult these flags so funnel filtering and red-on-fail coloring stay consistent. Mask form: `(v >= t) | (v.isna() & nan_passes)` — NaN-safe in both branches.
 25. **Dates ⊇ Data invariant.** A row passing the earnings-data filter MUST also pass the earnings-dates filter (data implies date). Enforced at both layers: the funnel masks for the dates filters explicitly OR in `_data_present_mask(df)` so a row with NaN date columns but populated data columns still passes; the view filter's dates check OR's in the data coverage mask. Tests: `test_earnings_dates_filter_respects_data_implies_date_invariant`, `test_view_filter_dates_supersets_data`.
 26. **View-only filters (Earnings Dates / Earnings Data / Color Match Only)** affect display + export but NEVER the underlying scan results. `MainWindow._period_results` always holds the unfiltered scan output; `_apply_view_filters(df)` produces a fresh filtered copy on every render and on every export. Toggling a view filter off restores all rows without re-scanning.

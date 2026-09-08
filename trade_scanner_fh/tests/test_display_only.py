@@ -222,6 +222,10 @@ def test_display_only_checkbox_added_to_filter_rows(panel):
         "reported_rev", "surprise_rev_dollar", "surprise_rev_pct",
         "yoy_eps_pct", "yoy_rev_pct",
         "consec_eps_beats", "consec_rev_beats",
+        # Quarter-series filters (earnings-filters-spec Parts 1 + 2).
+        "consec_eps_growth", "consec_rev_growth",
+        "accel_eps_surp", "accel_rev_surp",
+        "accel_eps_yoy", "accel_rev_yoy",
     }
     actual_supported = {
         k for k, row in panel.rows.items() if row.display_only is not None

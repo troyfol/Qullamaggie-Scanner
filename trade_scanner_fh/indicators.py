@@ -85,14 +85,38 @@ def relative_strength_ratio(
     stock_df: pd.DataFrame, bench_df: pd.DataFrame, *, lookback: int = 20
 ) -> float:
     """
-    Relative strength ratio = stock return / benchmark return over N days.
-    A value of 1.5 means the stock gained 50% more than the benchmark.
-    Capped at 10.0 to prevent outlier distortion in sorting.
+    Relative strength ratio = the stock's price relative over its last
+    `lookback` bars, divided by the benchmark's price relative over the
+    SAME CALENDAR SPAN. 1.0 = tracked the benchmark; 1.10 = ended the
+    span 10% ahead of it. Capped at 10.0 to prevent outlier distortion
+    in sorting (the cap clips only the upside — see the post-split
+    momentum note in the README).
+
+    The benchmark is sliced by DATE to the stock's own window, not by
+    position. A thin ticker can be missing bars the benchmark has, and
+    `bench_df.iloc[-lookback:]` would then measure the stock over a
+    longer calendar span than the benchmark — inflating the ratio for
+    exactly the illiquid names that need it least. Measured on the
+    cached universe, 9.0% of tickers have a 20-bar window that starts
+    on a different date than SPY's (median 3 days of drift, max 430),
+    and the bias is one-directional. `relative_strength_post_split`
+    already sliced by date for this reason; this is the same fix on the
+    base indicator.
     """
     if len(stock_df) < lookback or len(bench_df) < lookback:
         return np.nan
-    stock_close = stock_df["Close"].iloc[-lookback:]
-    bench_close = bench_df["Close"].iloc[-lookback:]
+    stock_tail = stock_df.iloc[-lookback:]
+    stock_close = stock_tail["Close"]
+    try:
+        bench_close = bench_df.loc[
+            stock_tail.index[0]:stock_tail.index[-1], "Close"
+        ]
+    except (TypeError, ValueError, KeyError):
+        # Non-comparable / unsorted index — fall back to the positional
+        # slice rather than dropping the ticker's RS entirely.
+        bench_close = bench_df["Close"].iloc[-lookback:]
+    if len(bench_close) < 2:
+        return np.nan
     if stock_close.iloc[0] == 0 or bench_close.iloc[0] == 0:
         return np.nan
     stock_ret = stock_close.iloc[-1] / stock_close.iloc[0]

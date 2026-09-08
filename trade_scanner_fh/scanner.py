@@ -454,6 +454,90 @@ class ScanParams:
     consec_rev_beats_threshold_pct: float = 0.0
     consec_rev_beats_quarter_cap: int = 0
 
+    # --- Consecutive YoY Growth (earnings-filters-spec Part 1) ---
+    # A straight port of Consecutive Beats onto the YoY metrics: a
+    # quarter is a hit when its YoY growth >= `_threshold_pct`
+    # (inclusive, per spec 3.3), and the reported figure is the length
+    # of the longest qualifying run in the pool. Two deliberate
+    # departures from the beats filters, both spec-mandated:
+    #   * the run may sit anywhere in the window, not only at the
+    #     trailing end ("there exists a run of hits");
+    #   * a single missing quarter is bridged rather than breaking the
+    #     run (spec 3.1), and a negative-to-positive step breaks it
+    #     even when both quarters are hits (spec 3.2).
+    # `_quarter_cap` is pool-defining: the N most recently reported
+    # quarters, 0 = no cap.
+
+    # #28  Consecutive YoY EPS Growth (min)
+    consec_eps_growth_enabled: bool = False
+    consec_eps_growth_display_only: bool = False
+    consec_eps_growth_min: int = 3
+    consec_eps_growth_threshold_pct: float = 0.0
+    consec_eps_growth_quarter_cap: int = 0
+
+    # #29  Consecutive YoY Revenue Growth (min)
+    consec_rev_growth_enabled: bool = False
+    consec_rev_growth_display_only: bool = False
+    consec_rev_growth_min: int = 3
+    consec_rev_growth_threshold_pct: float = 0.0
+    consec_rev_growth_quarter_cap: int = 0
+
+    # --- Consecutive Accelerating Quarters (spec Part 2) ---
+    # Four instantiations of one algorithm, differing only in which
+    # metric column they read (see `earnings_series.METRIC_COLUMNS`).
+    # Acceleration is measured in PERCENTAGE POINTS: 20 -> 25 is a move
+    # of +5, not +25%.
+    #   `_min_start_pct`  the first (oldest) quarter of the series must
+    #                     clear this; later quarters are unconstrained
+    #                     in absolute terms.
+    #   `_min_step_pct`   every step must gain at least this many points.
+    #   `_min_count`      quarters in the series, inclusive of the start.
+    #   `_selection`      "longest" | "most_recent"; ignored when
+    #                     `_backward_only` is set.
+    #   `_backward_only`  anchor the series on the newest quarter that
+    #                     has data and build only that candidate - no
+    #                     fallback to an earlier anchor.
+
+    # #30  Accelerating Quarters - EPS Surprise
+    accel_eps_surp_enabled: bool = False
+    accel_eps_surp_display_only: bool = False
+    accel_eps_surp_min_start_pct: float = 0.0
+    accel_eps_surp_min_step_pct: float = 5.0
+    accel_eps_surp_min_count: int = 3
+    accel_eps_surp_quarter_cap: int = 0
+    accel_eps_surp_selection: str = "longest"
+    accel_eps_surp_backward_only: bool = False
+
+    # #31  Accelerating Quarters - Revenue Surprise
+    accel_rev_surp_enabled: bool = False
+    accel_rev_surp_display_only: bool = False
+    accel_rev_surp_min_start_pct: float = 0.0
+    accel_rev_surp_min_step_pct: float = 5.0
+    accel_rev_surp_min_count: int = 3
+    accel_rev_surp_quarter_cap: int = 0
+    accel_rev_surp_selection: str = "longest"
+    accel_rev_surp_backward_only: bool = False
+
+    # #32  Accelerating Quarters - YoY EPS Growth
+    accel_eps_yoy_enabled: bool = False
+    accel_eps_yoy_display_only: bool = False
+    accel_eps_yoy_min_start_pct: float = 0.0
+    accel_eps_yoy_min_step_pct: float = 5.0
+    accel_eps_yoy_min_count: int = 3
+    accel_eps_yoy_quarter_cap: int = 0
+    accel_eps_yoy_selection: str = "longest"
+    accel_eps_yoy_backward_only: bool = False
+
+    # #33  Accelerating Quarters - YoY Revenue Growth
+    accel_rev_yoy_enabled: bool = False
+    accel_rev_yoy_display_only: bool = False
+    accel_rev_yoy_min_start_pct: float = 0.0
+    accel_rev_yoy_min_step_pct: float = 5.0
+    accel_rev_yoy_min_count: int = 3
+    accel_rev_yoy_quarter_cap: int = 0
+    accel_rev_yoy_selection: str = "longest"
+    accel_rev_yoy_backward_only: bool = False
+
     def max_trailing_bars(self) -> int:
         """How many bars BEFORE ``start_date`` any indicator can still read.
 
@@ -786,11 +870,15 @@ def _compute_ticker(
             or params.days_until_max_display_only) and earnings_lookup:
         last_e, next_e = earnings_lookup.get(symbol, (None, None))
 
-        # Handle "next_earnings is now in the past" edge case
-        if next_e is not None and next_e <= end_ts:
-            if last_e is None or next_e > last_e:
-                last_e = next_e
-            next_e = None
+        # Resolve the pair AS OF end_ts, not as of today — see
+        # `_resolve_report_dates_as_of`. Subsumes the old "next_earnings
+        # is now in the past" promotion and adds its missing mirror
+        # (a last_earnings that has not happened yet at the scan end),
+        # which is what made backdated scans report negative day counts.
+        last_e, next_e = _resolve_report_dates_as_of(
+            last_e, next_e, end_ts,
+            (earnings_history_lookup or {}).get(symbol),
+        )
 
         if last_e is not None:
             row["days_since_er"] = (end_ts - last_e).days
@@ -980,10 +1068,19 @@ def _compute_ticker(
                 _eps_n = MAX_BEATS_QUARTERS if _eps_cap <= 0 else min(_eps_cap, MAX_BEATS_QUARTERS)
                 _rev_cap = params.consec_rev_beats_quarter_cap
                 _rev_n = MAX_BEATS_QUARTERS if _rev_cap <= 0 else min(_rev_cap, MAX_BEATS_QUARTERS)
+                # The Q Cap is pool-defining for the STREAK as well as
+                # the columns: `compute_consecutive_beats` sees only the
+                # capped quarters, so a cap of 4 can never report a
+                # streak of 5. Deliberately NOT `_eps_n` — that carries
+                # the MAX_BEATS_QUARTERS=20 display ceiling, which must
+                # not silently truncate an uncapped streak that runs
+                # past 20 quarters. cap<=0 stays genuinely uncapped.
+                _eps_pool = past_pref if _eps_cap <= 0 else past_pref.head(_eps_cap)
+                _rev_pool = past_pref if _rev_cap <= 0 else past_pref.head(_rev_cap)
                 if params.consec_eps_beats_enabled or params.consec_eps_beats_display_only:
                     from .earnings_history import compute_consecutive_beats
                     row["consec_eps_beats"] = compute_consecutive_beats(
-                        past_pref, "eps", params.consec_eps_beats_threshold_pct,
+                        _eps_pool, "eps", params.consec_eps_beats_threshold_pct,
                     )
                     for k, (_, q) in enumerate(
                         past_pref.head(_eps_n).iterrows(), 1
@@ -1003,7 +1100,7 @@ def _compute_ticker(
                 if params.consec_rev_beats_enabled or params.consec_rev_beats_display_only:
                     from .earnings_history import compute_consecutive_beats
                     row["consec_rev_beats"] = compute_consecutive_beats(
-                        past_pref, "rev", params.consec_rev_beats_threshold_pct,
+                        _rev_pool, "rev", params.consec_rev_beats_threshold_pct,
                     )
                     for k, (_, q) in enumerate(
                         past_pref.head(_rev_n).iterrows(), 1
@@ -1013,6 +1110,15 @@ def _compute_ticker(
                         row[f"q{k}_surprise_rev_dollar"] = q.get("surprise_rev")
                         row[f"q{k}_surprise_rev_pct"] = q.get("surprise_rev_pct")
                         row[f"q{k}_yoy_rev_pct"] = q.get("yoy_rev_pct")
+
+                # --- Quarter-series filters (earnings-filters-spec) ---
+                # Both families read the same `past_pref` slice the beats
+                # streak does, so every multi-quarter earnings filter
+                # shares one point-in-time-correct pool: rows with
+                # report_date <= end_ts, real announcements preferred
+                # over finnhub calendar proxies. Each filter applies its
+                # own quarter cap on top of that.
+                _populate_quarter_series(row, params, past_pref)
 
             # Earnings-aligned date highlight: stash the matched dates
             # as ISO date strings (YYYY-MM-DD). The table model reads
@@ -1044,6 +1150,223 @@ def _compute_ticker(
         row["_display_only_fails"] = fails
 
     return row
+
+
+# ============================================================================
+# Quarter-series filters (earnings-filters-spec Parts 1 + 2)
+# ============================================================================
+
+# The four Accelerating Quarters filters, as
+# (param prefix, `earnings_series.METRIC_COLUMNS` key). One algorithm,
+# four instantiations — the only thing that varies is which metric
+# column the series is built over.
+_ACCEL_FILTERS: tuple[tuple[str, str], ...] = (
+    ("accel_eps_surp", "eps_surp"),
+    ("accel_rev_surp", "rev_surp"),
+    ("accel_eps_yoy", "eps_yoy"),
+    ("accel_rev_yoy", "rev_yoy"),
+)
+
+# The two Consecutive YoY Growth filters, as
+# (param prefix, history column).
+_GROWTH_FILTERS: tuple[tuple[str, str], ...] = (
+    ("consec_eps_growth", "yoy_eps_pct"),
+    ("consec_rev_growth", "yoy_rev_pct"),
+)
+
+
+def _fmt_series_span(start, end) -> str:
+    """Render an accelerating series' start and end *fiscal quarters* as
+    one condensed cell, e.g. ``2024-06 -> 2025-03``.
+
+    Fiscal period, not report date. The series is built in fiscal order,
+    and `period_ending` is monotonic with that order by construction —
+    `report_date` is not. Three real cases in the live store prove the
+    difference: a genuinely late filing can announce a Q4 after the
+    following Q1 (JOB, BYSI, LHX all do), and one ticker carries a
+    plainly corrupt report_date (CXAI stamps its 2026-06 quarter
+    2012-08-14). Rendering report dates made those spans read backwards
+    even though the underlying series was correct. The report dates are
+    still carried on the row as `_{prefix}_start_date` / `_end_date` and
+    still anchor the cell's earnings match-colour — they are just not
+    what the cell shows.
+
+    Year-month rather than a "Q1/Q2" label: `period_ending` is day-1 of
+    the fiscal-quarter month, and an off-cycle filer's fiscal quarter
+    number does not track the calendar quarter, so a quarter number here
+    would be wrong for exactly the filers most likely to be scanned.
+
+    ASCII arrow rather than U+2192: the same string travels to the
+    results table, the clipboard, XLSX and a `to_csv` that sets no
+    encoding, and an arrow that survives all four is worth more than a
+    prettier one that may not.
+    """
+    def _one(v):
+        if v is None or pd.isna(v):
+            return "?"
+        return pd.Timestamp(v).strftime("%Y-%m")
+    return f"{_one(start)} -> {_one(end)}"
+
+
+def _fmt_series_values(start: float, end: float) -> str:
+    """Render V(start) and V(end) as one condensed cell, e.g.
+    ``+12.50% -> +33.00%``. Signed so a contraction series reads
+    correctly at a glance."""
+    return f"{start:+.2f}% -> {end:+.2f}%"
+
+
+def _populate_quarter_series(row: dict, params: "ScanParams", past_pref) -> None:
+    """Compute every enabled quarter-series filter for one ticker and
+    write its columns onto `row`.
+
+    `past_pref` is the scanner's point-in-time-correct earnings slice
+    (report_date <= end_ts, real announcements preferred over finnhub
+    calendar proxies, sorted report_date DESC) — the same frame the
+    beats streak reads, so all multi-quarter earnings filters agree on
+    which quarters exist.
+
+    Column shape per Accelerating filter (three condensed columns,
+    populated only when that filter is enabled or in display-only):
+
+        {prefix}_len    quarter count of the resolved series
+        {prefix}_span   "<start report date> -> <end report date>"
+        {prefix}_vals   "<V(start)> -> <V(end)>"
+
+    plus two underscore-prefixed raw timestamps (`_{prefix}_start_date`
+    / `_{prefix}_end_date`) that the results table uses to anchor the
+    span cell's earnings match-colour. They are table-internal and never
+    appear in RESULT_COLUMNS.
+
+    When no candidate series reaches Minimum Series Count, the best
+    sub-threshold candidate is still reported, so display-only mode
+    shows how far the ticker actually got and the `_len` filter has a
+    value to reject.
+    """
+    from . import earnings_series as es
+
+    for prefix, metric_col in _GROWTH_FILTERS:
+        if not (getattr(params, f"{prefix}_enabled")
+                or getattr(params, f"{prefix}_display_only")):
+            continue
+        points = es.build_quarter_points(
+            past_pref, metric_col,
+            quarter_cap=getattr(params, f"{prefix}_quarter_cap"),
+        )
+        row[prefix] = es.consecutive_growth_run(
+            points, getattr(params, f"{prefix}_threshold_pct"),
+        )
+
+    for prefix, metric_key in _ACCEL_FILTERS:
+        if not (getattr(params, f"{prefix}_enabled")
+                or getattr(params, f"{prefix}_display_only")):
+            continue
+        points = es.build_quarter_points(
+            past_pref, es.METRIC_COLUMNS[metric_key],
+            quarter_cap=getattr(params, f"{prefix}_quarter_cap"),
+        )
+        result = es.accelerating_series(
+            points,
+            min_start_pct=getattr(params, f"{prefix}_min_start_pct"),
+            min_step_pct=getattr(params, f"{prefix}_min_step_pct"),
+            min_count=getattr(params, f"{prefix}_min_count"),
+            selection=getattr(params, f"{prefix}_selection"),
+            backward_only=getattr(params, f"{prefix}_backward_only"),
+        )
+        if result is None:
+            # No quarter in the pool carries this metric at all. Leave
+            # `_len` as NaN rather than 0: 0 would read as "a series of
+            # length zero was measured", and the filter's `>= min_count`
+            # test rejects NaN just as firmly.
+            row[f"{prefix}_len"] = float("nan")
+            continue
+        row[f"{prefix}_len"] = result.length
+        row[f"{prefix}_span"] = _fmt_series_span(
+            result.start_period, result.end_period,
+        )
+        row[f"{prefix}_vals"] = _fmt_series_values(
+            result.start_value, result.end_value,
+        )
+        row[f"_{prefix}_start_date"] = result.start_report_date
+        row[f"_{prefix}_end_date"] = result.end_report_date
+
+
+def _resolve_report_dates_as_of(last_e, next_e, end_ts, ticker_hist):
+    """Resolve a ticker's (last report, next report) pair **as of the scan
+    end date** rather than as of today.
+
+    `earnings_dates.parquet` holds the two dates that bracket *now*. Every
+    other earnings path in the scanner is clamped to `end_ts` so a
+    historical replay is point-in-time correct; this pair was not, and the
+    asymmetry was silent rather than loud. With a scan ending in the past,
+    the store's `last_earnings` is typically still in the *future* relative
+    to `end_ts`, so `(end_ts - last_e).days` went negative — and the
+    days-since filter's floor of 0 then dropped the row. Measured on the
+    live store, an `end_date` of 2025-06-01 put 86.1% of tickers into that
+    state and left the default "Days Since ER 0-90" passing 6.2% of them.
+
+    Resolution is by classification, not by patching one case: of the dates
+    we hold, anything on or before `end_ts` has happened and anything after
+    it has not. The last report is the newest of the former, the next
+    report the oldest of the latter. That subsumes the previous
+    "next_earnings is now in the past" promotion.
+
+    The per-quarter history then contributes, because it carries real
+    announcement dates going back years and so *can* answer "what was the
+    last report before this date". finnhub calendar proxies are skipped
+    where real rows exist — a proxy is stamped to a quarter end ~30 days
+    off the true announcement, the wrong basis for a day count.
+
+    The two sides use history differently, on purpose, and both choices
+    were measured against the live store rather than assumed:
+
+    * **next report — narrow.** Take the earliest future date across both
+      sources. On a backdated scan the calendar's `next_earnings`
+      describes *today's* calendar and is typically years past `end_ts`,
+      while the history holds the report that actually came next. Safe to
+      apply unconditionally: the history contains **zero** non-proxy rows
+      dated after today, so on a current-date scan this cannot change any
+      ticker's answer.
+    * **last report — fill only.** The calendar is the purpose-built,
+      five-source-reconciled record of past reports, so history is used
+      only where the calendar has nothing at or before `end_ts`. Taking
+      the newer of the two instead would change 98 tickers on a live scan
+      (cases where a company reported and the calendar has not caught up)
+      — a genuine staleness issue, but a separate one from this fix, and
+      not something to change silently. On a current-date scan the
+      fill-only rule fires for 0 tickers: only 22 of 7,267 lack a calendar
+      date at or before today, and none of those carry history.
+
+    Returns `(last_report, next_report)`, either of which may be None.
+    """
+    cands = [d for d in (last_e, next_e) if d is not None and not pd.isna(d)]
+    last_r = max((d for d in cands if d <= end_ts), default=None)
+    future_dates = [d for d in cands if d > end_ts]
+
+    hist_dates = None
+    if ticker_hist is not None and not getattr(ticker_hist, "empty", True) \
+            and "report_date" in ticker_hist:
+        src = ticker_hist
+        if "report_date_proxy" in src.columns:
+            real = src.loc[
+                ~src["report_date_proxy"].fillna(False).astype(bool)
+            ]
+            if not real.empty:
+                src = real
+        rd = pd.to_datetime(src["report_date"], errors="coerce").dropna()
+        if not rd.empty:
+            hist_dates = rd
+
+    if hist_dates is not None:
+        if last_r is None:
+            before = hist_dates.loc[hist_dates <= end_ts]
+            if not before.empty:
+                last_r = before.max()
+        after = hist_dates.loc[hist_dates > end_ts]
+        if not after.empty:
+            future_dates.append(after.min())
+
+    next_r = min(future_dates) if future_dates else None
+    return last_r, next_r
 
 
 def _compute_display_only_fails(
@@ -1110,6 +1433,14 @@ def _compute_display_only_fails(
     _flag_min("yoy_rev_pct", "yoy_rev_pct", "yoy_rev_pct_min")
     _flag_min("consec_eps_beats", "consec_eps_beats", "consec_eps_beats_min")
     _flag_min("consec_rev_beats", "consec_rev_beats", "consec_rev_beats_min")
+    # Quarter-series filters. The growth runs mirror the beats streaks
+    # exactly; the accelerating filters flag their `_len` column, which
+    # holds the resolved series' quarter count (the best sub-threshold
+    # candidate when nothing reached `_min_count`).
+    for _prefix, _ in _GROWTH_FILTERS:
+        _flag_min(_prefix, _prefix, f"{_prefix}_min")
+    for _prefix, _ in _ACCEL_FILTERS:
+        _flag_min(_prefix, f"{_prefix}_len", f"{_prefix}_min_count")
 
     # Max-threshold filters (col <= threshold).
     _flag_max("dist_high", "dist_high_pct", "dist_high_max_pct")
@@ -1194,9 +1525,15 @@ def _compute_display_only_fails(
             if not (0 <= float(v) <= params.days_until_max):
                 fails["days_until_er"] = True
 
-    # Per-quarter earnings (#20-#25): NaN → red iff earnings_data_only.
+    # Per-quarter earnings (#20-#27): NaN → red iff earnings_data_only.
     # Mirrors the funnel-filter semantics so the red-on-fail signal
     # is consistent with what the filter would actually have done.
+    #
+    # This list must stay in step with `_DATA_COVERAGE_COLS` in
+    # `_build_filter_stages` — the two YoY columns were added to the
+    # funnel's data-gated set but missed here, so with the Earnings Data
+    # toggle on, a NaN YoY cell rendered in the default colour while the
+    # funnel would have dropped the row. Guarded by a test.
     if _data_only:
         for do_attr_prefix, col in (
             ("reported_eps", "reported_eps"),
@@ -1205,6 +1542,8 @@ def _compute_display_only_fails(
             ("reported_rev", "reported_rev"),
             ("surprise_rev_dollar", "surprise_rev_dollar"),
             ("surprise_rev_pct", "surprise_rev_pct"),
+            ("yoy_eps_pct", "yoy_eps_pct"),
+            ("yoy_rev_pct", "yoy_rev_pct"),
         ):
             if not getattr(params, f"{do_attr_prefix}_display_only", False):
                 continue
@@ -1627,6 +1966,58 @@ def _build_filter_stages(params: ScanParams) -> list[tuple[str, Callable]]:
                 else pd.Series([False] * len(df), index=df.index)
             ),
         ))
+
+    # --- Quarter-series filters (earnings-filters-spec Parts 1 + 2) ---
+    # NaN handling matches the beats filters: a ticker with no earnings
+    # history has no run and no series, and "N consecutive accelerating
+    # quarters" has no meaningful include-no-data reading, so NaN fails
+    # regardless of the `earnings_data_only` toolbar toggle. These six
+    # filters are independent of each other and of the beats filters —
+    # none suppresses another, so several can be stacked as an AND.
+
+    def _series_stage(col: str, minimum) -> "callable":
+        """`col >= minimum`, with a missing column or a NaN value
+        failing. `NaN >= n` is already False in pandas; the column-
+        absent branch covers a scan where no ticker populated it."""
+        def mask(df, c=col, m=minimum):
+            if c not in df.columns:
+                return pd.Series([False] * len(df), index=df.index)
+            return pd.to_numeric(df[c], errors="coerce") >= m
+        return mask
+
+    # #28 / #29  Consecutive YoY EPS / Revenue Growth
+    for _prefix, _label in (
+        ("consec_eps_growth", "Consec YoY EPS Growth"),
+        ("consec_rev_growth", "Consec YoY Rev Growth"),
+    ):
+        if (getattr(params, f"{_prefix}_enabled")
+                and not getattr(params, f"{_prefix}_display_only")):
+            _min = getattr(params, f"{_prefix}_min")
+            _thr = getattr(params, f"{_prefix}_threshold_pct")
+            stages.append((
+                f"{_label} >= {_min} (>={_thr:g}%)",
+                _series_stage(_prefix, _min),
+            ))
+
+    # #30-#33  Consecutive Accelerating Quarters
+    for _prefix, _label in (
+        ("accel_eps_surp", "Accel EPS Surp"),
+        ("accel_rev_surp", "Accel Rev Surp"),
+        ("accel_eps_yoy", "Accel YoY EPS"),
+        ("accel_rev_yoy", "Accel YoY Rev"),
+    ):
+        if (getattr(params, f"{_prefix}_enabled")
+                and not getattr(params, f"{_prefix}_display_only")):
+            _count = getattr(params, f"{_prefix}_min_count")
+            _step = getattr(params, f"{_prefix}_min_step_pct")
+            _start = getattr(params, f"{_prefix}_min_start_pct")
+            _mode = ("backward" if getattr(params, f"{_prefix}_backward_only")
+                     else getattr(params, f"{_prefix}_selection"))
+            stages.append((
+                f"{_label} >= {_count}q (start >={_start:g}%, "
+                f"step >={_step:g}pp, {_mode})",
+                _series_stage(f"{_prefix}_len", _count),
+            ))
 
     return stages
 

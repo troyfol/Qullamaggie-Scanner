@@ -352,6 +352,30 @@ class IndicatorRow(QWidget):
 # Indicator controls panel
 # ============================================================================
 
+# The four Accelerating Quarters rows. Their eight ScanParams fields are
+# identical in shape, so they are unrolled from one list rather than
+# written out thirty-two times in `build_scan_params`.
+_ACCEL_ROW_KEYS: tuple[str, ...] = (
+    "accel_eps_surp", "accel_rev_surp", "accel_eps_yoy", "accel_rev_yoy",
+)
+
+
+def _accel_scan_params(rows: dict) -> dict:
+    """Read the four accelerating rows into their ScanParams kwargs."""
+    out: dict = {}
+    for key in _ACCEL_ROW_KEYS:
+        row = rows[key]
+        out[f"{key}_enabled"] = row.is_enabled()
+        out[f"{key}_display_only"] = row.is_display_only()
+        out[f"{key}_min_start_pct"] = row.value("min_start_pct")
+        out[f"{key}_min_step_pct"] = row.value("min_step_pct")
+        out[f"{key}_min_count"] = int(row.value("min_count"))
+        out[f"{key}_quarter_cap"] = int(row.value("quarter_cap"))
+        out[f"{key}_selection"] = row.value("selection")
+        out[f"{key}_backward_only"] = bool(row.value("backward_only"))
+    return out
+
+
 class IndicatorPanel(QScrollArea):
     """Scrollable panel with all indicator controls."""
 
@@ -713,6 +737,67 @@ class IndicatorPanel(QScrollArea):
             self._on_rev_beats_toggled
         )
 
+        # --- Consecutive YoY Growth (earnings-filters-spec Part 1) ---
+        # Same shape as the beats rows above (Min / Threshold / Q Cap),
+        # measuring YoY growth instead of surprise. Unlike beats these
+        # do NOT lock the individual EPS/Rev rows or the Sequenced Run
+        # controls: they add three scalar columns rather than a wide
+        # multi-quarter block, so there is nothing to conflict with.
+        # Q Cap: 0 = no cap; 1-40 restricts the pool to that many of the
+        # most recently reported quarters.
+        self._section("Consecutive YoY Growth")
+
+        self._add("consec_eps_growth", "Consecutive YoY EPS Growth", [
+            {"name": "min_count", "label": "Min", "type": "int", "default": 3, "min": 0, "max": 50},
+            {"name": "threshold_pct", "label": "Growth %", "type": "float", "default": 0.0, "min": -9999.0, "max": 9999.0, "step": 1.0},
+            {"name": "quarter_cap", "label": "Q Cap", "type": "int", "default": 0, "min": 0, "max": 40},
+        ])
+        self.rows["consec_eps_growth"].set_enabled(False)
+
+        self._add("consec_rev_growth", "Consecutive YoY Rev Growth", [
+            {"name": "min_count", "label": "Min", "type": "int", "default": 3, "min": 0, "max": 50},
+            {"name": "threshold_pct", "label": "Growth %", "type": "float", "default": 0.0, "min": -9999.0, "max": 9999.0, "step": 1.0},
+            {"name": "quarter_cap", "label": "Q Cap", "type": "int", "default": 0, "min": 0, "max": 40},
+        ])
+        self.rows["consec_rev_growth"].set_enabled(False)
+
+        # --- Accelerating Quarters (spec Part 2) ---
+        # Four discrete rows rather than one row with a metric selector,
+        # matching the pattern the beats filters already set (one row
+        # per metric) — and so that two metrics can be required at once.
+        #
+        # `Min Count` floors at 2 (spec Part 5 item 2): a "series" of one
+        # quarter contains no acceleration step and cannot mean anything.
+        # `Step pp` is in PERCENTAGE POINTS — 20 -> 25 is +5, not +25%.
+        # `Backward Only` greys out `Selection`; see
+        # `_wire_accel_backward_only_fields`.
+        self._section("Consecutive Accelerating Quarters")
+
+        for _key, _label in (
+            ("accel_eps_surp", "Accel Quarters — EPS Surprise"),
+            ("accel_rev_surp", "Accel Quarters — Rev Surprise"),
+            ("accel_eps_yoy", "Accel Quarters — YoY EPS Growth"),
+            ("accel_rev_yoy", "Accel Quarters — YoY Rev Growth"),
+        ):
+            self._add(_key, _label, [
+                {"name": "min_start_pct", "label": "Start %", "type": "float",
+                 "default": 0.0, "min": -9999.0, "max": 9999.0, "step": 1.0},
+                {"name": "min_step_pct", "label": "Step pp", "type": "float",
+                 "default": 5.0, "min": 0.0, "max": 9999.0, "step": 1.0},
+                {"name": "min_count", "label": "Min Count", "type": "int",
+                 "default": 3, "min": 2, "max": 40},
+                {"name": "quarter_cap", "label": "Q Cap", "type": "int",
+                 "default": 0, "min": 0, "max": 40},
+                {"name": "selection", "label": "Series", "type": "combo",
+                 "default": "longest", "width": 120,
+                 "choices": [("longest", "Longest"),
+                             ("most_recent", "Most Recent")]},
+                {"name": "backward_only", "label": "Backward Only",
+                 "type": "checkbox", "default": False},
+            ])
+            self.rows[_key].set_enabled(False)
+            self._wire_accel_backward_only_fields(_key)
+
         self.vbox.addStretch()
         self.setWidget(container)
 
@@ -756,6 +841,60 @@ class IndicatorPanel(QScrollArea):
             self.rows["consec_eps_beats"].is_enabled()
             or self.rows["consec_rev_beats"].is_enabled()
         )
+
+    # ── Accelerating-quarters field greyout ──────────────────────────
+
+    def _wire_accel_backward_only_fields(self, key: str):
+        """Grey out an accelerating row's `Series` selector while
+        `Backward Only` is checked.
+
+        Backward Only anchors the series on the newest quarter that has
+        data and builds only that candidate, so there is never more than
+        one series to choose between — Longest and Most Recent become
+        meaningless. Same visual treatment as the surge-mode greyout:
+        `setEnabled(False)` plus the explicit muted stylesheet, because
+        Qt's default `:disabled` rendering is nearly invisible against
+        the dark theme's `#3c3c3c` inputs.
+        """
+        row = self.rows[key]
+        backward = row.spinboxes.get("backward_only")
+        selection = row.spinboxes.get("selection")
+        if backward is None or selection is None:
+            return
+
+        def _apply():
+            on = backward.isChecked()
+            selection.setEnabled(not on)
+            selection.setStyleSheet(
+                IndicatorRow._GREYED_INPUT_STYLE if on else ""
+            )
+
+        backward.toggled.connect(lambda _on: _apply())
+        _apply()  # Apply once with the default (Backward Only off)
+
+    def _sync_accel_backward_only(self):
+        """Re-apply every accelerating row's Backward-Only greyout.
+
+        `set_value` drives the checkbox through `setChecked`, which only
+        emits `toggled` on an actual state change — a preset that
+        re-asserts the value a row already holds would otherwise leave
+        the Series combo in the wrong enabled state. Mirrors the same
+        post-load resync the beats and surge rows already do.
+        """
+        for key in ("accel_eps_surp", "accel_rev_surp",
+                    "accel_eps_yoy", "accel_rev_yoy"):
+            row = self.rows.get(key)
+            if row is None:
+                continue
+            backward = row.spinboxes.get("backward_only")
+            selection = row.spinboxes.get("selection")
+            if backward is None or selection is None:
+                continue
+            on = backward.isChecked()
+            selection.setEnabled(not on)
+            selection.setStyleSheet(
+                IndicatorRow._GREYED_INPUT_STYLE if on else ""
+            )
 
     # ── Surge-mode field greyout ─────────────────────────────────────
 
@@ -1023,6 +1162,21 @@ class IndicatorPanel(QScrollArea):
             consec_rev_beats_min=int(r["consec_rev_beats"].value("min_count")),
             consec_rev_beats_threshold_pct=r["consec_rev_beats"].value("threshold_pct"),
             consec_rev_beats_quarter_cap=int(r["consec_rev_beats"].value("quarter_cap")),
+
+            # --- Consecutive YoY Growth (spec Part 1) ---
+            consec_eps_growth_enabled=r["consec_eps_growth"].is_enabled(),
+            consec_eps_growth_display_only=r["consec_eps_growth"].is_display_only(),
+            consec_eps_growth_min=int(r["consec_eps_growth"].value("min_count")),
+            consec_eps_growth_threshold_pct=r["consec_eps_growth"].value("threshold_pct"),
+            consec_eps_growth_quarter_cap=int(r["consec_eps_growth"].value("quarter_cap")),
+            consec_rev_growth_enabled=r["consec_rev_growth"].is_enabled(),
+            consec_rev_growth_display_only=r["consec_rev_growth"].is_display_only(),
+            consec_rev_growth_min=int(r["consec_rev_growth"].value("min_count")),
+            consec_rev_growth_threshold_pct=r["consec_rev_growth"].value("threshold_pct"),
+            consec_rev_growth_quarter_cap=int(r["consec_rev_growth"].value("quarter_cap")),
+
+            # --- Accelerating Quarters (spec Part 2) ---
+            **_accel_scan_params(r),
         )
 
     def to_dict(self) -> dict:
@@ -1084,6 +1238,10 @@ class IndicatorPanel(QScrollArea):
         # land the per-row disabled flags.
         self._on_eps_beats_toggled(self.rows["consec_eps_beats"].is_enabled())
         self._on_rev_beats_toggled(self.rows["consec_rev_beats"].is_enabled())
+        # Same reason: a preset that re-asserts a Backward Only value the
+        # row already holds emits no `toggled`, so the Series combo's
+        # enabled state has to be re-derived explicitly.
+        self._sync_accel_backward_only()
         # Resync surge field-greyout after loading. Mirror
         # `_wire_surge_mode_dependent_fields` — apply the same explicit
         # muted style so a preset that lands on trend mode greys days
@@ -1194,7 +1352,40 @@ RESULT_COLUMNS = [
     ("Curr Surp Rev %",   "surprise_rev_pct",    lambda x: f"{x:+.2f}%"),
     ("Curr YoY Rev %",    "yoy_rev_pct",         lambda x: f"{x:+.2f}%"),
     ("Last Report Date",  "last_report_date",    _fmt_date),
+    # Quarter-series filters (earnings-filters-spec). Each accelerating
+    # filter condenses spec 3.5's five auditable facts into three cells:
+    # the quarter count, the report-date span, and V(start) -> V(end).
+    # Like every other column here they render only when populated, so
+    # a scan with none of these filters on is unchanged.
+    ("Consec YoY EPS Grw", "consec_eps_growth",  lambda x: str(int(x))),
+    ("Consec YoY Rev Grw", "consec_rev_growth",  lambda x: str(int(x))),
+    ("Accel EPS Surp Q",  "accel_eps_surp_len",  lambda x: str(int(x))),
+    ("Accel EPS Surp Span", "accel_eps_surp_span", str),
+    ("Accel EPS Surp V",  "accel_eps_surp_vals", str),
+    ("Accel Rev Surp Q",  "accel_rev_surp_len",  lambda x: str(int(x))),
+    ("Accel Rev Surp Span", "accel_rev_surp_span", str),
+    ("Accel Rev Surp V",  "accel_rev_surp_vals", str),
+    ("Accel YoY EPS Q",   "accel_eps_yoy_len",   lambda x: str(int(x))),
+    ("Accel YoY EPS Span", "accel_eps_yoy_span", str),
+    ("Accel YoY EPS V",   "accel_eps_yoy_vals",  str),
+    ("Accel YoY Rev Q",   "accel_rev_yoy_len",   lambda x: str(int(x))),
+    ("Accel YoY Rev Span", "accel_rev_yoy_span", str),
+    ("Accel YoY Rev V",   "accel_rev_yoy_vals",  str),
 ]
+
+# The four accelerating filters' column prefixes, in RESULT_COLUMNS
+# order. Used by the match-colour anchoring below.
+_ACCEL_COLUMN_PREFIXES: tuple[str, ...] = (
+    "accel_eps_surp", "accel_rev_surp", "accel_eps_yoy", "accel_rev_yoy",
+)
+
+# Every accelerating column key -> the prefix it belongs to, so a cell
+# can find its series' `_{prefix}_start_date` / `_end_date` anchors.
+_ACCEL_KEY_TO_PREFIX: dict[str, str] = {
+    f"{p}_{suffix}": p
+    for p in _ACCEL_COLUMN_PREFIXES
+    for suffix in ("len", "span", "vals")
+}
 # Period column intentionally absent — the timeframe selector dropdown above
 # the results table now identifies which period is being viewed. Multi-period
 # Excel/CSV exports re-add a `Period` column at write time when needed.
@@ -1302,6 +1493,10 @@ def _is_earnings_anchor_key(key: str) -> bool:
     when earnings_history is loaded)."""
     if key in _EARNINGS_ANCHOR_TOP_LEVEL:
         return True
+    if key in _ACCEL_KEY_TO_PREFIX:
+        # An accelerating series' span IS a pair of report dates, so
+        # its three cells anchor on earnings by construction.
+        return True
     return _Q_COL_RE.match(key) is not None
 
 
@@ -1324,10 +1519,42 @@ def _first_present(row_data, *keys):
     return None
 
 
+def _anchor_date_candidates(key: str, row_data) -> list:
+    """Every date that may anchor `key`'s match-color, most significant
+    first. Empty when the column doesn't participate in match-coloring.
+
+    Almost every column has exactly one anchor, and `_anchor_date_value`
+    remains the accessor for those. The accelerating-series columns are
+    the exception: their condensed span cell spans TWO report dates, and
+    either end should be able to pair with an indicator date that landed
+    on it. The end (newest) quarter is tried first — a series ending on
+    the bar that gapped is the more interesting reading — with the start
+    quarter as the fallback.
+    """
+    prefix = _ACCEL_KEY_TO_PREFIX.get(key)
+    if prefix is not None:
+        return [
+            v for v in (row_data.get(f"_{prefix}_end_date"),
+                        row_data.get(f"_{prefix}_start_date"))
+            if v is not None
+        ]
+    single = _anchor_date_value(key, row_data)
+    return [] if single is None else [single]
+
+
 def _anchor_date_value(key: str, row_data):
     """Return the date value (Timestamp / scalar / None) that anchors
     the match-color for `key`'s cell. None means this column doesn't
-    participate in match-coloring (e.g., symbol, close)."""
+    participate in match-coloring (e.g., symbol, close).
+
+    Single-anchor accessor. Cells that can pair on more than one date
+    go through `_anchor_date_candidates`; this returns their primary
+    (newest) anchor so existing single-anchor callers keep working."""
+    prefix = _ACCEL_KEY_TO_PREFIX.get(key)
+    if prefix is not None:
+        return _first_present(
+            row_data, f"_{prefix}_end_date", f"_{prefix}_start_date",
+        )
     # Q-i columns first (most common shape after a beats scan).
     qm = _Q_COL_RE.match(key)
     if qm is not None:
@@ -2713,20 +2940,22 @@ class ResultsTable(QTableView):
             for _h, _k, _f in cols:
                 if not _is_earnings_anchor_key(_k):
                     continue
-                anchor_v = _anchor_date_value(_k, row_data)
-                if anchor_v is None:
-                    continue
-                try:
-                    _ts = pd.Timestamp(anchor_v)
-                    if pd.isna(_ts):
+                # Candidates, not a single anchor: an accelerating
+                # series' span cell can pair on either end of the
+                # series, so both of its report dates count toward the
+                # earnings-anchor gate.
+                for anchor_v in _anchor_date_candidates(_k, row_data):
+                    try:
+                        _ts = pd.Timestamp(anchor_v)
+                        if pd.isna(_ts):
+                            continue
+                    except (TypeError, ValueError):
                         continue
-                except (TypeError, ValueError):
-                    continue
-                _v_iso = _ts.normalize().date().isoformat()
-                _lookup = (
-                    canon_map.get(_v_iso, _v_iso) if canon_map else _v_iso
-                )
-                earnings_anchored_isos.add(_lookup)
+                    _v_iso = _ts.normalize().date().isoformat()
+                    _lookup = (
+                        canon_map.get(_v_iso, _v_iso) if canon_map else _v_iso
+                    )
+                    earnings_anchored_isos.add(_lookup)
             seed_isos = [
                 iso for iso in seed_isos if iso in earnings_anchored_isos
             ]
@@ -2811,26 +3040,32 @@ class ResultsTable(QTableView):
             # red-on-fail so the alignment color wins on conflict
             # (date-pair signal is more specific than the others).
             if aligned_color_map:
-                anchor_val = _anchor_date_value(key, row_data)
-                if anchor_val is not None:
+                # Candidates in priority order: the first one that has a
+                # color wins. Single-anchor columns yield exactly one, so
+                # this is the previous behavior for every column except
+                # an accelerating series' three cells, which may pair on
+                # either end of the series' report-date span.
+                for anchor_val in _anchor_date_candidates(key, row_data):
                     try:
                         ts = pd.Timestamp(anchor_val)
-                        if not pd.isna(ts):
-                            v_iso = ts.normalize().date().isoformat()
-                            # When a canonical map is present, route
-                            # the cell's iso through it so paired-
-                            # but-not-identical dates land on the
-                            # same color entry. No-op for exact-only
-                            # match results (legacy behavior).
-                            lookup_iso = (
-                                canon_map.get(v_iso, v_iso)
-                                if canon_map else v_iso
-                            )
-                            color = aligned_color_map.get(lookup_iso)
-                            if color is not None:
-                                item.setForeground(color)
+                        if pd.isna(ts):
+                            continue
+                        v_iso = ts.normalize().date().isoformat()
+                        # When a canonical map is present, route
+                        # the cell's iso through it so paired-
+                        # but-not-identical dates land on the
+                        # same color entry. No-op for exact-only
+                        # match results (legacy behavior).
+                        lookup_iso = (
+                            canon_map.get(v_iso, v_iso)
+                            if canon_map else v_iso
+                        )
+                        color = aligned_color_map.get(lookup_iso)
+                        if color is not None:
+                            item.setForeground(color)
+                            break
                     except Exception:
-                        pass
+                        continue
 
             item.setEditable(False)
             self.model_src.setItem(r, c, item)
