@@ -567,11 +567,46 @@ columns (Q-i YoY EPS / Rev %) inside the consec-beats blocks.
 canonical save (`save_earnings_history` with dedup on) first runs
 `report_cross_source_disagreements`, which compares same-`(ticker,
 period_ending)` rows from *different* sources and flags pairs whose
-`reported_eps` differ by more than `config.EPS_DISAGREEMENT_ABS_TOL`
-($0.10) or whose `surprise_eps_pct` differ by more than
+`reported_eps` clears **both** `config.EPS_DISAGREEMENT_ABS_TOL` ($0.10)
+**and** `config.EPS_DISAGREEMENT_REL_TOL` (25% of the larger magnitude), or
+whose `surprise_eps_pct` differ by more than
 `config.SURPRISE_DISAGREEMENT_PP_TOL` (2.0 pp). Findings are atomically
 written to `scanner_data/earnings_disagreements.csv`
 (`config.EARNINGS_DISAGREEMENTS_CSV_NAME`).
+
+**Why both gates (v6.3.1).** An absolute-only threshold is inverted relative
+to where the risk is: it flags a routine 5% vendor difference on a $3.00 EPS
+and ignores a 100% error on a $0.05 one. The mechanism turned out to be
+mundane — **zacks publishes EPS rounded to 2 decimals** (78% of its values,
+never more than 2) while finviz carries 3–5 decimals on 38% of its, so
+**51.3% of all overlapping slots differ by ≤$0.005**: arithmetic, not
+disagreement. Requiring both gates suppressed 70 of 221 live findings (32%),
+every one ≤25% relative with a median |EPS| of $3.37, and removed no real
+finding.
+
+**The `structure` column answers "different bases, or just noise?"** It is the
+lag-1 autocorrelation of `log(|eps_a| / |eps_b|)` across **every** overlapping
+quarter for that ticker (not just the flagged ones — scoring the flagged
+subset measures a selected sample). Noise is independent per quarter, so
+acf₁ ≈ 0; a basis difference is the same multiplier every quarter, so
+acf₁ → 1. No external data, no threshold on magnitude.
+
+Measured on the live store 2026-09-19 over 37 tickers with ≥6 overlapping
+quarters: **median acf₁ +0.010, and 27 of 37 below 0.2.** The disagreements
+are overwhelmingly noise. Five scored above 0.5 (SKM .78, RDY .72, CLGN .63,
+UPXI .61, SID .56) and are worth a human look — though the split explanation
+fails even for them: price does not step at the changepoint (SKM's EPS ratio
+moves 1.72× against a 0.926 price ratio) and the recorded ex-dates do not
+match. Four of the five are ADRs, and an ADR ratio change is not a stock split
+and would not appear in `split_anchors.parquet`. Unresolved; settling it needs
+a per-filing external source.
+
+> A caution recorded here because it cost a wrong conclusion first time round:
+> comparing seam steps against a **global** control is confounded, because
+> seams do not fall on a random sample of tickers. Scored against each
+> ticker's *own* non-seam steps, the median source-change seam is **smaller**
+> than that ticker's typical quarter step (median z −0.28); the excess lives
+> in a right tail of ~8%, not in a shifted distribution.
 
 **The file is a standing record merged across saves, not a snapshot of the
 last one (v6.3.0).** Each canonical save speaks only for the `(ticker,
@@ -2738,7 +2773,7 @@ never touched by a rebuild.
 | `earnings_dates_by_source.parquet` | DataFrame | `nasdaq_fill`, `yahoo_fill`, finviz's forward-date flush | **v6.0.0.** Each date source's own observation, keyed `(ticker, source)`. Before it, all three wrote into the single row above, so the last fill to run won and the priority chain never applied to the date-backed sources. The reconciler reads this and still writes the 1:1 consumer file, so readers are unaffected |
 | `earnings_history.parquet` | DataFrame | Finviz scrape + Zacks scraper + Finnhub `/stock/earnings` | Per-quarter EPS / revenue history (`EARNINGS_HISTORY_YEARS`, default 10); per-slot priority dedup (finviz > zacks > finnhub), with reported actuals merged across sources and estimate/surprise figures finviz-only (v6.0.0) |
 | `earnings_raw/{source}/<run_id>.parquet` | DataFrame | Each fill's raw response | Append-only audit/replay layer. **v6.0.0:** 365 d for every source (`RAW_RETENTION_DAYS`) plus a keep-newest-N floor (`RAW_MIN_RUNS_KEPT`, 5) that survives any quiet stretch. finviz/zacks were on 30 d, which is where the truncation guard falls back — and an age-only rule empties the directory exactly when the store has sat untouched |
-| `earnings_disagreements.csv` | CSV | `report_cross_source_disagreements` (merged at every canonical history save) | Report-only cross-source EPS disagreement findings. **v6.3.0:** a standing record, not a snapshot — each save rewrites only the slots it could actually compare, so two sources finalizing in the same refresh no longer blank each other's findings |
+| `earnings_disagreements.csv` | CSV | `report_cross_source_disagreements` (merged at every canonical history save) | Report-only cross-source EPS disagreement findings. **v6.3.0:** a standing record, not a snapshot — each save rewrites only the slots it could actually compare, so two sources finalizing in the same refresh no longer blank each other's findings. **v6.3.1:** gated on absolute **and** relative difference, and carries `rel_eps` plus a per-ticker `structure` score (lag-1 autocorrelation of the log-ratio) separating a basis difference from vendor noise |
 | `ohlcv_anomalies.csv` | CSV | `data_engine.write_anomaly_report` (end of every OHLCV update) | **v6.0.0.** One row per (ticker, anomaly) from `validate_ticker` — zero/negative prices, OHLC-bound violations, duplicate dates, price jumps, date gaps. Previously computed, logged at INFO and discarded. A run that flags nothing leaves the file alone rather than erasing a full sweep's findings |
 | `.finviz_bulk_checkpoint.json` / `.finnhub_bulk_checkpoint.json` / `.zacks_bulk_checkpoint.json` | JSON | `fill_framework` | Resumable bulk-fill progress; cleared only on natural completion (preserved on stop / block-halt / spike-halt). **The zacks one is v6.0.0** — that fill had no resume at all, so a killed bulk restarted ~6.5 h of work |
 | `.ohlcv_gap_attempts.json` | JSON | `data_engine.record_gap_attempts` | **v6.0.0.** Ledger of interior-gap repair attempts, so a hole that survives a rebuild (a real trading halt, or bars the provider lacks) isn't rebuilt again for `OHLCV_GAP_RECHECK_DAYS` (90) |
@@ -2827,7 +2862,7 @@ data directory.
 
 ## Testing
 
-Test suite at `trade_scanner_fh/tests/` — **1,852 tests, all passing** as of 2026-09-18 (v6.3.0 added 93 across the disagreement merge, the failure taxonomy, the trim scoping, both new features and the unified series engine; v6.2.0 brought it to 1,759; v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
+Test suite at `trade_scanner_fh/tests/` — **1,868 tests, all passing** as of 2026-09-19 (v6.3.1 added 16, v6.3.0 added 93 across the disagreement merge, the failure taxonomy, the trim scoping, both new features and the unified series engine; v6.2.0 brought it to 1,759; v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
 
 ```bash
 cd c:/python/EDA_Project/Trade_Scanner_FH
@@ -3123,6 +3158,38 @@ directories, and the previous `_internal/`.
 ---
 
 ## Changelog
+
+### v6.3.1 — the disagreement report learns the difference between a basis and a rounding error (2026-09-19)
+
+Follow-up to v6.3.0's disagreement fix. That release made the report stop
+erasing itself; this one makes what it reports worth reading.
+
+**The gate is now absolute AND relative.** `EPS_DISAGREEMENT_REL_TOL` (25%)
+joins the existing $0.10 absolute floor. An absolute-only threshold is
+inverted relative to where the risk is — it flags a 5% vendor difference on a
+$3.00 EPS and ignores a 100% error on a $0.05 one. On the live store this
+suppressed **70 of 221 findings (32%)**, all ≤25% relative with a median |EPS|
+of $3.37, and removed nothing real.
+
+The cause was mundane once measured: **zacks publishes EPS rounded to 2
+decimals** and finviz does not, so **51.3% of all overlapping slots differ by
+≤$0.005**. That is arithmetic, not disagreement.
+
+**New `structure` column: is it a different basis, or noise?** The lag-1
+autocorrelation of `log(|eps_a| / |eps_b|)` over every overlapping quarter for
+the ticker. Noise is independent per quarter (acf₁ ≈ 0); a basis difference is
+the same multiplier every quarter (acf₁ → 1). Live store: **median +0.010, 27
+of 37 tickers below 0.2** — overwhelmingly noise. Five above 0.5 remain
+unexplained, and notably *not* by splits: price does not step at their
+changepoints and the recorded ex-dates do not match.
+
+Also corrected: an earlier claim that a source change "nearly doubles the
+discontinuity rate" (28.1% vs 16.5%) was confounded — seams do not fall on a
+random sample of tickers. Against each ticker's *own* non-seam steps the
+median seam is **smaller** than that ticker's typical step; the excess is a
+right tail of ~8%.
+
+1,868 tests.
 
 ### v6.3.0 — diagnostics that can be acted on (2026-09-18)
 
@@ -3715,7 +3782,10 @@ These are properties the codebase depends on. Breaking any one is a regression w
 70. **A diagnostic that offers an action derives the action's targets from the same function that produced the finding.** `find_quarter_gap_tickers` backs both the `missing_quarter` count and the re-fetch button, so what is queued is by construction what was reported.
 71. **Unifying filters must not change their defaults.** Beats, growth and acceleration now share one primitive, and each type's defaults are set so the shared implementation reproduces its prior behaviour exactly (beats `backward_only=True` / bridge 0 / strict `>`; the other two `longest` / bridge 1 / inclusive `>=`). A saved preset is a user's committed intent — a refactor may widen what is *possible*, never silently change what an existing configuration selects. `test_series_selectors.py` pins the parity against `compute_consecutive_beats` on real-shaped frames.
 72. **Measure a series gap in fiscal order, never in arrival order.** `period_ending` is the right metric, but only over a frame sorted by `period_ending`. Measuring it across a `report_date`-ordered frame — which `compute_consecutive_beats` does — fabricates a hole whenever a late filing puts two quarters out of sequence, silently truncating a real streak.
-73. **A null metric value is a hole for some filters and a miss for others, and the difference is load-bearing.** `build_quarter_points(keep_valueless=...)` makes it explicit rather than implicit. `surprise_*_pct` is null often enough that reading a null as "quarter absent" would let a dead streak look live on 2.56% of tickers.
+73. **A diagnostic threshold must be dimensioned like the thing it measures.** An absolute-only EPS tolerance flags rounding on a large EPS and misses an order-of-magnitude error on a small one. Where a vendor's precision is the noise floor (zacks caps at 2 decimals), an absolute gate measures the vendor's formatting, not its data — so the EPS gate is absolute AND relative.
+74. **To tell a systematic offset from noise, test its structure over time, not its size.** Magnitude, near-integer clustering and per-ticker variance all conflate the two. The lag-1 autocorrelation of the within-ticker log-ratio does not: noise is independent per quarter, a basis difference is the same multiplier every quarter. Score it over ALL overlapping quarters — scoring the flagged subset measures a selected sample, which is what made the first pass look like a basis story.
+75. **Compare against a within-subject control, not a global one.** Seam steps benchmarked against all same-source steps looked alarming (28.1% vs 16.5%); benchmarked against each ticker's own steps the median seam is *below* normal. Any population whose membership is not randomly assigned needs the within-subject comparison.
+76. **A null metric value is a hole for some filters and a miss for others, and the difference is load-bearing.** `build_quarter_points(keep_valueless=...)` makes it explicit rather than implicit. `surprise_*_pct` is null often enough that reading a null as "quarter absent" would let a dead streak look live on 2.56% of tickers.
 
 ---
 

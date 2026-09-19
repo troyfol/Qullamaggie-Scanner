@@ -1027,6 +1027,24 @@ HISTORY_BACKUP_MIN_INTERVAL_HOURS = 12
 # these tolerances never changes which row the dedup keeps.
 EPS_DISAGREEMENT_ABS_TOL = 0.10        # dollars of reported_eps
 SURPRISE_DISAGREEMENT_PP_TOL = 2.0     # percentage points of surprise_eps_pct
+
+# v6.3.1: the EPS gate is now absolute AND relative. An absolute-only
+# threshold is inverted relative to where the risk actually is — it flags a
+# routine 5% vendor difference on a $3.00 EPS and ignores a 100% error on a
+# $0.05 one. Measured over 1,025 overlapping finviz/zacks slots on the live
+# store: 32% of the flagged findings were <=25% relative on high-EPS names
+# (median |EPS| $3.37), pure vendor variance.
+#
+# The mechanism is mundane: zacks publishes EPS rounded to 2 decimals (78% of
+# its values, and never more than 2) while finviz carries 3-5 decimals on 38%
+# of its. 51.3% of ALL overlapping slots differ by <=$0.005 — arithmetic, not
+# disagreement. Requiring both gates keeps the report about data quality
+# instead of about rounding.
+EPS_DISAGREEMENT_REL_TOL = 0.25        # fraction of the larger |reported_eps|
+
+# Quarters of overlap a ticker needs before its structure score is computed.
+# Below this the lag-1 autocorrelation is too unstable to mean anything.
+DISAGREEMENT_STRUCTURE_MIN_QUARTERS = 6
 # Name only — resolved against DATA_DIR at call time (like the migration
 # flags) so test fixtures that monkeypatch DATA_DIR redirect the report too.
 EARNINGS_DISAGREEMENTS_CSV_NAME = "earnings_disagreements.csv"

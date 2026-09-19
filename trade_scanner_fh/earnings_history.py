@@ -1052,7 +1052,7 @@ def dedupe_history(
 DISAGREEMENT_COLUMNS: list[str] = [
     "ticker", "period_ending", "source_a", "source_b",
     "eps_a", "eps_b", "surprise_a", "surprise_b",
-    "delta_eps", "delta_surprise_pp",
+    "delta_eps", "delta_surprise_pp", "rel_eps", "structure",
 ]
 
 
@@ -1063,10 +1063,67 @@ def _disagreements_csv_path() -> Path:
     return config.DATA_DIR / config.EARNINGS_DISAGREEMENTS_CSV_NAME
 
 
+def _structure_scores(sub: pd.DataFrame) -> dict:
+    """``{ticker: lag-1 autocorrelation of log(|eps_a| / |eps_b|)}``.
+
+    The one statistic that separates "the two sources are on different bases"
+    from "the two sources are noisy about the same number", and it needs no
+    external data and no threshold on magnitude:
+
+      * noise is independent per quarter        -> acf1 ~ 0
+      * a basis difference is the SAME multiplier every quarter -> acf1 -> 1
+
+    Measured on the live store 2026-09-19 across 37 tickers with >=6
+    overlapping quarters: **median acf1 +0.010**, and 27 of 37 below 0.2. The
+    disagreements are overwhelmingly noise. Five tickers scored above 0.5
+    (SKM .78, RDY .72, CLGN .63, UPXI .61, SID .56) and those are worth a
+    human look — though note the split hypothesis fails even for them: price
+    does not step at the changepoint, and the recorded ex-dates do not match.
+
+    Computed over EVERY overlapping slot for the ticker, not just the flagged
+    ones — scoring the flagged subset would be measuring a selected sample.
+    NaN when the ticker has fewer than
+    ``config.DISAGREEMENT_STRUCTURE_MIN_QUARTERS`` overlapping quarters.
+    """
+    import numpy as _np
+    need = config.DISAGREEMENT_STRUCTURE_MIN_QUARTERS
+    out: dict = {}
+    if sub.empty:
+        return out
+    usable = sub.loc[
+        sub["eps_a"].notna() & sub["eps_b"].notna()
+        & (sub["eps_a"] != 0) & (sub["eps_b"] != 0)
+    ]
+    for ticker, grp in usable.groupby("ticker", sort=False):
+        if len(grp) < need:
+            continue
+        g = grp.sort_values("period_ending", kind="stable")
+        lr = _np.log(g["eps_a"].abs().to_numpy() / g["eps_b"].abs().to_numpy())
+        lr = lr[_np.isfinite(lr)]
+        if len(lr) < need:
+            continue
+        # A CONSTANT ratio is the perfect basis signature, but it has no
+        # variance, so the correlation would be computed from floating-point
+        # rounding noise and could come out anywhere. Decide it explicitly
+        # instead: a constant ratio materially different from 1 scores 1.0
+        # (maximally structured); a constant ratio OF 1 is agreement, not
+        # structure, and scores 0.0.
+        if _np.ptp(lr) < 1e-9:
+            out[ticker] = 1.0 if abs(float(_np.median(lr))) > 0.00995 else 0.0
+            continue
+        a, b = lr[:-1], lr[1:]
+        if _np.std(a) == 0 or _np.std(b) == 0:
+            out[ticker] = 0.0
+            continue
+        out[ticker] = float(_np.corrcoef(a, b)[0, 1])
+    return out
+
+
 def find_cross_source_disagreements(
     df: Optional[pd.DataFrame],
     eps_abs_tol: Optional[float] = None,
     surprise_pp_tol: Optional[float] = None,
+    eps_rel_tol: Optional[float] = None,
 ) -> pd.DataFrame:
     """Report-only scan for (ticker, period_ending) slots where two
     sources materially disagree — the cases ``dedupe_history`` resolves
@@ -1103,6 +1160,8 @@ def find_cross_source_disagreements(
         eps_abs_tol = config.EPS_DISAGREEMENT_ABS_TOL
     if surprise_pp_tol is None:
         surprise_pp_tol = config.SURPRISE_DISAGREEMENT_PP_TOL
+    if eps_rel_tol is None:
+        eps_rel_tol = config.EPS_DISAGREEMENT_REL_TOL
 
     def _num(col: str) -> pd.Series:
         if col in df.columns:
@@ -1154,10 +1213,20 @@ def find_cross_source_disagreements(
     m = m.copy()
     m["delta_eps"] = (m["eps_a"] - m["eps_b"]).abs()
     m["delta_surprise_pp"] = (m["surprise_a"] - m["surprise_b"]).abs()
+    # Relative difference against the LARGER magnitude, so the measure is
+    # symmetric in a/b and cannot be inflated by a near-zero denominator.
+    larger = pd.concat([m["eps_a"].abs(), m["eps_b"].abs()], axis=1).max(axis=1)
+    m["rel_eps"] = m["delta_eps"] / larger.replace(0.0, float("nan"))
+    # Both gates, not either: absolute alone flags rounding on a $3 EPS,
+    # relative alone flags a penny difference on a $0.02 one.
     eps_bad = (m["eps_a"].notna() & m["eps_b"].notna()
-               & (m["delta_eps"] > float(eps_abs_tol)))
+               & (m["delta_eps"] > float(eps_abs_tol))
+               & (m["rel_eps"] > float(eps_rel_tol)))
     sur_bad = (m["surprise_a"].notna() & m["surprise_b"].notna()
                & (m["delta_surprise_pp"] > float(surprise_pp_tol)))
+    # Scored over every overlapping slot, before the gate narrows the frame.
+    scores = _structure_scores(m)
+    m["structure"] = m["ticker"].map(scores)
     out = m.loc[eps_bad | sur_bad, DISAGREEMENT_COLUMNS]
     if out.empty:
         return empty

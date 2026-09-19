@@ -483,3 +483,145 @@ def test_slot_key_matches_across_the_csv_round_trip():
     fresh = eh._slot_key(pd.Series(["aapl"]), pd.Series([pd.Timestamp("2026-03-01")]))
     from_csv = eh._slot_key(pd.Series(["AAPL"]), pd.Series(["2026-03-01"]))
     assert fresh.iloc[0] == from_csv.iloc[0] == "AAPL|2026-03-01"
+
+
+# ── 2026-09-19: the gate is absolute AND relative ──────────────────────
+
+def test_large_absolute_but_small_relative_is_not_flagged():
+    """The inversion the old gate had. A $0.22 gap on a $3.40 EPS is routine
+    vendor variance; an absolute-only threshold called it a disagreement.
+    Measured on the live store, 32% of findings were of exactly this shape
+    (median |EPS| $3.37)."""
+    df = pd.DataFrame([
+        _row("BIG", "2026-03-01", "finviz", eps=3.40),
+        _row("BIG", "2026-03-01", "zacks", eps=3.18),
+    ])
+    assert eh.find_cross_source_disagreements(df).empty
+    # ...and the old absolute-only behaviour is still reachable.
+    assert len(eh.find_cross_source_disagreements(df, eps_rel_tol=0.0)) == 1
+
+
+def test_large_relative_but_small_absolute_is_still_not_flagged():
+    """The absolute floor has to survive too, or a one-cent difference on a
+    two-cent EPS becomes a 50% 'disagreement'."""
+    df = pd.DataFrame([
+        _row("TINY", "2026-03-01", "finviz", eps=0.02),
+        _row("TINY", "2026-03-01", "zacks", eps=0.01),
+    ])
+    assert eh.find_cross_source_disagreements(df).empty
+
+
+def test_both_gates_cleared_is_flagged():
+    df = pd.DataFrame([
+        _row("REAL", "2026-03-01", "finviz", eps=1.00),
+        _row("REAL", "2026-03-01", "zacks", eps=0.10),
+    ])
+    rep = eh.find_cross_source_disagreements(df)
+    assert len(rep) == 1
+    assert rep.iloc[0]["rel_eps"] == pytest.approx(0.90)
+
+
+def test_relative_gate_is_symmetric_in_a_and_b():
+    """Measured against the LARGER magnitude, so swapping the sources cannot
+    change the verdict and a near-zero denominator cannot inflate it."""
+    hi = pd.DataFrame([_row("S", "2026-03-01", "finviz", eps=1.00),
+                       _row("S", "2026-03-01", "zacks", eps=0.70)])
+    lo = pd.DataFrame([_row("S", "2026-03-01", "finviz", eps=0.70),
+                       _row("S", "2026-03-01", "zacks", eps=1.00)])
+    a = eh.find_cross_source_disagreements(hi)
+    b = eh.find_cross_source_disagreements(lo)
+    assert len(a) == len(b) == 1
+    assert a.iloc[0]["rel_eps"] == pytest.approx(b.iloc[0]["rel_eps"])
+    assert a.iloc[0]["rel_eps"] == pytest.approx(0.30)
+
+
+def test_surprise_axis_is_unaffected_by_the_eps_relative_gate():
+    """The surprise figure is already expressed in percentage points, so it
+    needs no relative companion — and must not be suppressed by one."""
+    df = pd.DataFrame([
+        _row("SURP", "2026-03-01", "finviz", eps=3.40, surprise=1.0),
+        _row("SURP", "2026-03-01", "zacks", eps=3.40, surprise=40.0),
+    ])
+    assert len(eh.find_cross_source_disagreements(df)) == 1
+
+
+# ── the structure score: basis vs noise ────────────────────────────────
+
+def _series(ticker, pairs):
+    """pairs = [(period, finviz_eps, zacks_eps)]"""
+    rows = []
+    for p, a, b in pairs:
+        rows.append(_row(ticker, p, "finviz", eps=a))
+        rows.append(_row(ticker, p, "zacks", eps=b))
+    return pd.DataFrame(rows)
+
+
+_PERIODS = [f"20{y}-{m}-01" for y in (20, 21, 22) for m in ("03", "06", "09", "12")]
+
+
+def test_a_constant_multiplier_scores_as_structured():
+    """A basis difference is the same multiplier every quarter, so the
+    log-ratio is flat and its lag-1 autocorrelation is defined as 0 only when
+    there is literally no variance — here we vary the level but hold the
+    RATIO fixed, which is the real basis signature."""
+    vals = [1.0, 1.4, 0.8, 2.2, 1.1, 1.9, 0.6, 2.5, 1.3, 1.7, 0.9, 2.0]
+    df = _series("BASIS", [(p, v * 10.0, v) for p, v in zip(_PERIODS, vals)])
+    rep = eh.find_cross_source_disagreements(df)
+    assert not rep.empty
+    # An exactly-constant ratio has no variance, so the score is decided
+    # explicitly rather than read off floating-point noise: 1.0, maximally
+    # structured. That is the textbook basis difference.
+    assert rep["structure"].dropna().iloc[0] == pytest.approx(1.0)
+    assert rep["rel_eps"].iloc[0] == pytest.approx(0.90)
+
+
+def test_a_constant_ratio_of_one_is_agreement_not_structure():
+    """The degenerate twin of the case above: identical values every quarter
+    are also zero-variance, but that is the sources agreeing."""
+    from trade_scanner_fh.earnings_history import _structure_scores
+    sub = pd.DataFrame({
+        "ticker": ["SAME"] * 8,
+        "period_ending": pd.to_datetime(_PERIODS[:8]),
+        "eps_a": [1.0, 1.4, 0.8, 2.2, 1.1, 1.9, 0.6, 2.5],
+        "eps_b": [1.0, 1.4, 0.8, 2.2, 1.1, 1.9, 0.6, 2.5],
+    })
+    assert _structure_scores(sub)["SAME"] == pytest.approx(0.0)
+
+
+def test_an_alternating_offset_scores_negative_and_noise_scores_low():
+    """A source that alternates high/low quarter to quarter is the opposite of
+    a basis difference, and the score says so with a negative value."""
+    alt = [(p, 1.0 if i % 2 else 0.2, 0.2 if i % 2 else 1.0)
+           for i, p in enumerate(_PERIODS)]
+    rep = eh.find_cross_source_disagreements(_series("ALT", alt))
+    score = rep["structure"].dropna().iloc[0]
+    assert score < 0, f"alternating offset should score negative, got {score}"
+
+
+def test_structure_is_nan_below_the_minimum_overlap():
+    short = [(p, 1.0, 0.1) for p in _PERIODS[:3]]
+    rep = eh.find_cross_source_disagreements(_series("SHORT", short))
+    assert not rep.empty
+    assert rep["structure"].isna().all()
+
+
+def test_structure_is_scored_over_all_overlap_not_just_flagged_rows():
+    """Scoring only the flagged subset would measure a selected sample — the
+    exact error that made the first pass at this look like a basis story."""
+    pairs = [(p, 1.00, 0.99) for p in _PERIODS[:10]]      # agree: never flagged
+    pairs += [(p, 1.00, 0.10) for p in _PERIODS[10:]]     # flagged
+    rep = eh.find_cross_source_disagreements(_series("MIX", pairs))
+    assert len(rep) == 2, "only the two contested quarters should be flagged"
+    assert rep["structure"].notna().all(), (
+        "the score must still be computed, using all 12 overlapping quarters"
+    )
+
+
+def test_structure_column_is_in_the_csv_schema(tmp_parquets):
+    eh.save_earnings_history(pd.DataFrame([
+        _row("AAPL", "2026-03-01", "finviz", eps=1.00),
+        _row("AAPL", "2026-03-01", "zacks", eps=0.10),
+    ]))
+    cols = list(pd.read_csv(_csv_path(tmp_parquets)).columns)
+    assert cols == eh.DISAGREEMENT_COLUMNS
+    assert "rel_eps" in cols and "structure" in cols
