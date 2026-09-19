@@ -727,6 +727,9 @@ class EarningsRefreshCoordinator(QObject):
         win._finnhub_worker.etf_identified.connect(
             win._on_finnhub_etf_identified
         )
+        win._finnhub_worker.failure_breakdown.connect(
+            lambda b: win._stash_source_failures("finnhub", b)
+        )
         win._finnhub_worker.finished.connect(win._on_finnhub_done)
         win._earn_prog_begin("finnhub", label)
         win._finnhub_worker.start()
@@ -768,6 +771,9 @@ class EarningsRefreshCoordinator(QObject):
         )
         win._finviz_worker.empty_identified.connect(
             win._on_finviz_empty_identified
+        )
+        win._finviz_worker.failure_breakdown.connect(
+            lambda b: win._stash_source_failures("finviz", b)
         )
         win._finviz_worker.finished.connect(win._on_finviz_done)
         win._earn_prog_begin("finviz", label)
@@ -945,6 +951,12 @@ class EarningsRefreshCoordinator(QObject):
         can report the count cleanly."""
         win = self.win
         win._last_zacks_failures = dict(breakdown or {})
+        # v6.3.2: persist as well as stash, so an overnight fill is still
+        # reviewable after a restart.
+        try:
+            win._stash_source_failures("zacks", breakdown or {})
+        except Exception:
+            pass
         win._auto_added_zacks_skips = 0
         if not breakdown:
             return

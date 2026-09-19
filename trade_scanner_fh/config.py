@@ -1042,6 +1042,17 @@ SURPRISE_DISAGREEMENT_PP_TOL = 2.0     # percentage points of surprise_eps_pct
 # instead of about rounding.
 EPS_DISAGREEMENT_REL_TOL = 0.25        # fraction of the larger |reported_eps|
 
+# -- Per-source fill-failure reports (v6.3.2) ------------------------------
+# Every fill already classifies each per-ticker failure, but the breakdown
+# lived only in memory on the MainWindow and died with the process — so a
+# fill that ran overnight left nothing to act on in the morning. Written
+# beside earnings_disagreements.csv, one file per source, replaced in full at
+# the end of each run of that source (a run's failures are a snapshot of that
+# run, not a standing record — unlike the disagreement report, which merges).
+# A run with no failures clears its file, which is a true "nothing failed".
+SOURCE_FAILURE_CSV_TEMPLATE = "{source}_failures.csv"
+SOURCE_FAILURE_SOURCES: tuple = ("zacks", "finviz", "finnhub")
+
 # Quarters of overlap a ticker needs before its structure score is computed.
 # Below this the lag-1 autocorrelation is too unstable to mean anything.
 DISAGREEMENT_STRUCTURE_MIN_QUARTERS = 6

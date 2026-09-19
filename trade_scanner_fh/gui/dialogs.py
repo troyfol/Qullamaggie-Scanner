@@ -12,6 +12,7 @@ from typing import Optional
 from PyQt6.QtCore import QDate, Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
+    QApplication, QMessageBox,
     QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
@@ -994,3 +995,215 @@ class StaleSkipDialog(QDialog):
         )
         self.buttons.button(
             QDialogButtonBox.StandardButton.Ok).setEnabled(total > 0)
+
+
+class SourceFailureDialog(QDialog):
+    """Per-source fill-failure report with selective skip-listing (v6.3.2).
+
+    Replaces the Zacks-only "Send All Misses to Skip List" button, which was
+    all-or-nothing across every failure kind at once. The kinds mean very
+    different things — a 404 says the source will never cover this ticker, a
+    429 says we asked too fast — so adding them together is almost never what
+    you want.
+
+    Kinds are grouped by `failure_kinds.classify`, and only the PERMANENT
+    group is pre-selected. The UPSTREAM group (parse errors, blocks) takes a
+    second confirmation, because that group is the one the parse-spike alarm
+    exists to protect: a page-format change makes hundreds of good tickers
+    fail at once, and bulk-adding them is self-inflicted data loss the alarm
+    deliberately refuses to cause. Nothing is forbidden — `auth` aside, which
+    is a revoked key rather than a property of any ticker — but the dangerous
+    choices have to be made on purpose.
+    """
+
+    def __init__(self, source: str, by_kind: dict, details: dict,
+                 run_at: str = "", already_skipped: "set | None" = None,
+                 parent=None):
+        super().__init__(parent)
+        from .. import failure_kinds as fk
+        self._fk = fk
+        self.source = source
+        self.by_kind = {k: sorted(set(v)) for k, v in (by_kind or {}).items() if v}
+        self.details = details or {}
+        self.already = {str(t).upper() for t in (already_skipped or set())}
+
+        self.setWindowTitle(f"Last {source.title()} Failures")
+        self.setMinimumWidth(780)
+        self.setMinimumHeight(600)
+        root = QVBoxLayout(self)
+
+        total = sum(len(v) for v in self.by_kind.values())
+        when = f" &nbsp;·&nbsp; run at {run_at}" if run_at else ""
+        head = QLabel(
+            f"<b>{total:,}</b> ticker(s) failed in the most recent "
+            f"{source} fill{when}."
+        )
+        head.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(head)
+
+        note = QLabel(
+            "Tick the kinds you want added to the "
+            f"<b>{source}</b> skip list. Only <i>permanent</i> kinds are "
+            "pre-selected — the others describe a bad moment or a problem at "
+            "the source, not a property of the ticker."
+        )
+        note.setWordWrap(True)
+        note.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(note)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        col = QVBoxLayout(inner)
+        self.kind_checks: dict = {}
+
+        by_group: dict = {}
+        for kind in self.by_kind:
+            by_group.setdefault(fk.classify(kind), []).append(kind)
+
+        for grp in fk.GROUP_ORDER:
+            kinds = sorted(by_group.get(grp, []))
+            if not kinds:
+                continue
+            box = QGroupBox(fk.GROUP_LABEL[grp])
+            bl = QVBoxLayout(box)
+            hint = QLabel(fk.GROUP_HINT[grp])
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color: #888888; font-size: 11px;")
+            bl.addWidget(hint)
+            for kind in kinds:
+                tickers = self.by_kind[kind]
+                new = [t for t in tickers if t.upper() not in self.already]
+                cb = QCheckBox(
+                    f"{kind}  —  {len(tickers):,} ticker(s)"
+                    + (f", {len(new):,} not already on the list"
+                       if len(new) != len(tickers) else "")
+                )
+                cb.setToolTip(fk.KIND_HELP.get(kind, ""))
+                cb.setChecked(fk.default_checked(kind))
+                if not fk.is_skippable(kind):
+                    cb.setChecked(False)
+                    cb.setEnabled(False)
+                cb.stateChanged.connect(self._refresh)
+                self.kind_checks[kind] = cb
+                bl.addWidget(cb)
+                sample = ", ".join(tickers[:14]) + (" …" if len(tickers) > 14 else "")
+                lbl = QLabel(f"      {sample}")
+                lbl.setWordWrap(True)
+                lbl.setStyleSheet("color: #777777; font-size: 10px;")
+                bl.addWidget(lbl)
+            col.addWidget(box)
+
+        if not self.by_kind:
+            col.addWidget(QLabel("No failures recorded for this source."))
+        col.addStretch()
+        scroll.setWidget(inner)
+        root.addWidget(scroll, 1)
+
+        self.lbl_sel = QLabel()
+        self.lbl_sel.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(self.lbl_sel)
+
+        btns = QDialogButtonBox()
+        self.btn_add = btns.addButton("Add selected to skip list",
+                                      QDialogButtonBox.ButtonRole.AcceptRole)
+        self.btn_copy = btns.addButton("Copy selected",
+                                       QDialogButtonBox.ButtonRole.ActionRole)
+        btns.addButton(QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(self.reject)
+        self.btn_add.clicked.connect(self._on_add)
+        self.btn_copy.clicked.connect(self._on_copy)
+        root.addWidget(btns)
+
+        self._refresh()
+
+    # ── selection ──────────────────────────────────────────────────────
+
+    def selected_kinds(self) -> list:
+        return [k for k, cb in self.kind_checks.items()
+                if cb.isChecked() and cb.isEnabled()]
+
+    def selected_tickers(self, *, exclude_existing: bool = True) -> list:
+        out: set = set()
+        for k in self.selected_kinds():
+            out.update(self.by_kind.get(k, []))
+        if exclude_existing:
+            out = {t for t in out if t.upper() not in self.already}
+        return sorted(out)
+
+    def _refresh(self):
+        kinds = self.selected_kinds()
+        n = len(self.selected_tickers())
+        risky = [k for k in kinds
+                 if self._fk.classify(k) != self._fk.PERMANENT]
+        warn = ""
+        if risky:
+            warn = ("  &nbsp;<span style='color:#ff9800'>⚠ includes "
+                    + ", ".join(sorted(risky)) + "</span>")
+        self.lbl_sel.setText(
+            f"Selected: <b>{n:,}</b> new ticker(s) across {len(kinds)} "
+            f"kind(s){warn}"
+        )
+        self.btn_add.setEnabled(n > 0)
+        self.btn_copy.setEnabled(n > 0)
+
+    # ── actions ────────────────────────────────────────────────────────
+
+    def _on_copy(self):
+        QApplication.clipboard().setText(
+            ", ".join(self.selected_tickers()))
+
+    def _on_add(self):
+        fk = self._fk
+        tickers = self.selected_tickers()
+        if not tickers:
+            return
+        kinds = self.selected_kinds()
+        upstream = sorted(k for k in kinds if fk.classify(k) == fk.UPSTREAM)
+        transient = sorted(k for k in kinds if fk.classify(k) == fk.TRANSIENT)
+
+        detail = ""
+        if transient:
+            detail += (
+                f"\n\n<b>{', '.join(transient)}</b> are transient — the same "
+                f"tickers will very likely succeed on the next run. Adding "
+                f"them removes coverage you still have."
+            )
+        if upstream:
+            detail += (
+                f"\n\n<b>{', '.join(upstream)}</b> are upstream faults. A "
+                f"parse error or block means the SOURCE changed or challenged "
+                f"us, not that these tickers are bad. The parse-spike alarm "
+                f"deliberately blacklists nothing for this reason — adding "
+                f"them here overrides that."
+            )
+
+        if QMessageBox.question(
+            self, f"Add to {self.source} skip list",
+            f"Add <b>{len(tickers):,}</b> ticker(s) to the "
+            f"<b>{self.source}</b> skip list?<br><br>"
+            f"Kinds: {', '.join(sorted(kinds))}{detail}<br><br>"
+            f"They will not be retried until removed "
+            f"(Data → Edit {self.source.title()} Skip List…).",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        # A second, explicit gate for the group that should never be added by
+        # reflex. Deliberately worded as a count, because scale is the risk.
+        if upstream and QMessageBox.warning(
+            self, "Confirm upstream-fault skips",
+            f"{len(tickers):,} ticker(s) include upstream faults "
+            f"({', '.join(upstream)}).\n\n"
+            f"If the source's page format just changed, these are good "
+            f"tickers and you are about to skip them permanently.\n\n"
+            f"Proceed anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        self._accepted_tickers = tickers
+        self.accept()
+
+    def accepted_tickers(self) -> list:
+        return list(getattr(self, "_accepted_tickers", []))

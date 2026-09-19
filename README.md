@@ -2424,6 +2424,7 @@ grouping reflects the five-source architecture plus diagnostics:
     Gap Fill Earnings (Finviz)
     Spot Fill Earnings (Finviz)...
     Stop Finviz Fill
+    Show Last Finviz Failures...
     Edit Finviz Skip List...
 
 — Earnings (Finnhub — deep history) —
@@ -2431,6 +2432,7 @@ grouping reflects the five-source architecture plus diagnostics:
     Gap Fill Earnings (Finnhub)
     Spot Fill Earnings (Finnhub)...
     Stop Finnhub Fill
+    Show Last Finnhub Failures...
     Edit Finnhub Skip List...
 
 — Earnings dates (Nasdaq + Yahoo) —
@@ -2756,6 +2758,68 @@ Loader (`MainWindow._load_preset`) tolerates missing keys via `.get()` for forwa
 
 ---
 
+## Per-source failure reports (v6.3.2)
+
+`Data → Show Last <Source> Failures…` exists for **all three** earnings
+sources and is the same dialog parameterised by source. It answers "what
+failed, why, and which of those should I stop asking for?"
+
+**Why this was cheap for finviz and finnhub.** `fill_framework.run_fill_loop`
+has always invoked `failed_cb(sym, kind)` on every failure path — those two
+workers simply never passed one, so the classification the fill already did
+was computed and thrown away. They needed a callback, a dict and a signal, not
+new logic. Their kinds were already granular too (404→`empty`, 429→
+`rate_limited`, 403→`forbidden`, 5xx→`server_error`), which is why they need
+no equivalent of the Zacks detail-string work from v6.3.0: Zacks was the only
+source that had collapsed everything into one `http_error` bucket.
+
+### Selective skip-listing, and the guard on it
+
+The old Zacks dialog had one button that added **every** failed ticker across
+**every** kind. The kinds mean very different things, so the report now groups
+them by what the failure says about the ticker
+([`failure_kinds.py`](trade_scanner_fh/failure_kinds.py)):
+
+| Group | Kinds | Pre-selected | Means |
+|---|---|:--:|---|
+| **Permanent** | `not_found`, `empty`, `forbidden`, `rejected_symbol`, `http_4xx` | ✅ | A property of the TICKER — this source will never cover it |
+| **Transient** | `network`, `server_error`, `rate_limited`, `http_5xx`, `http_429` | ☐ | A property of the MOMENT — it will very likely succeed next run |
+| **Upstream fault** | `parse_error`, `blocked`, `oversized`, `too_large` | ☐ + extra confirm | A property of the SOURCE — not the ticker's problem |
+| **Never skippable** | `auth` | disabled | A revoked key fails every symbol equally |
+
+The upstream group carries a second confirmation because it is the one that
+can do real damage. The parse-failure spike alarm halts a run at ≥40% parse
+errors and deliberately blacklists **nothing**, precisely because a format
+break is upstream's fault. A one-click "add all" would hand you a way to undo
+that guarantee and permanently skip-list hundreds of good tickers the moment a
+page layout changes. Nothing is forbidden — `auth` aside — but the dangerous
+choices have to be made on purpose.
+
+An unrecognised kind classifies as **upstream**, so a future `FAIL_*` sentinel
+can never be silently offered as a safe skip. `test_source_failures.py` has a
+drift guard that fails if any client emits a kind the taxonomy does not know.
+
+The dialog also marks how many tickers of each kind are **not already on the
+list** (several permanent kinds are auto-added by the fill itself), and adding
+rolls the in-memory set back if the write fails, so memory and disk cannot
+diverge.
+
+### Persistence
+
+Each run writes `scanner_data/<source>_failures.csv`
+(`ticker, kind, group, detail, run_at`). The breakdown used to live only on
+the MainWindow and died with the process, so an overnight fill left nothing to
+act on in the morning; the dialog now falls back to this file when the current
+session has not run that source.
+
+The file is **replaced wholesale** each run, which is the opposite of
+`earnings_disagreements.csv`'s merge semantics — and deliberately so. A
+disagreement is a standing property of the store; a fetch failure is an event.
+Carrying rows forward would mix one ticker's outcome across two different
+nights. A run with no failures therefore clears the file, which is honest.
+
+---
+
 ## Storage layout
 
 `scanner_data/` lives next to the executable — since v5.5.0 that means
@@ -2774,6 +2838,7 @@ never touched by a rebuild.
 | `earnings_history.parquet` | DataFrame | Finviz scrape + Zacks scraper + Finnhub `/stock/earnings` | Per-quarter EPS / revenue history (`EARNINGS_HISTORY_YEARS`, default 10); per-slot priority dedup (finviz > zacks > finnhub), with reported actuals merged across sources and estimate/surprise figures finviz-only (v6.0.0) |
 | `earnings_raw/{source}/<run_id>.parquet` | DataFrame | Each fill's raw response | Append-only audit/replay layer. **v6.0.0:** 365 d for every source (`RAW_RETENTION_DAYS`) plus a keep-newest-N floor (`RAW_MIN_RUNS_KEPT`, 5) that survives any quiet stretch. finviz/zacks were on 30 d, which is where the truncation guard falls back — and an age-only rule empties the directory exactly when the store has sat untouched |
 | `earnings_disagreements.csv` | CSV | `report_cross_source_disagreements` (merged at every canonical history save) | Report-only cross-source EPS disagreement findings. **v6.3.0:** a standing record, not a snapshot — each save rewrites only the slots it could actually compare, so two sources finalizing in the same refresh no longer blank each other's findings. **v6.3.1:** gated on absolute **and** relative difference, and carries `rel_eps` plus a per-ticker `structure` score (lag-1 autocorrelation of the log-ratio) separating a basis difference from vendor noise |
+| `{zacks,finviz,finnhub}_failures.csv` | CSV | `earnings_history.write_source_failures` (end of each fill) | **v6.3.2.** One run's per-ticker failures for that source — `ticker, kind, group, detail, run_at`. Replaced in full each run (a failure is an event, not a standing property), so an empty run clears the file. Read back by `Show Last <Source> Failures…` when the session has not run that source |
 | `ohlcv_anomalies.csv` | CSV | `data_engine.write_anomaly_report` (end of every OHLCV update) | **v6.0.0.** One row per (ticker, anomaly) from `validate_ticker` — zero/negative prices, OHLC-bound violations, duplicate dates, price jumps, date gaps. Previously computed, logged at INFO and discarded. A run that flags nothing leaves the file alone rather than erasing a full sweep's findings |
 | `.finviz_bulk_checkpoint.json` / `.finnhub_bulk_checkpoint.json` / `.zacks_bulk_checkpoint.json` | JSON | `fill_framework` | Resumable bulk-fill progress; cleared only on natural completion (preserved on stop / block-halt / spike-halt). **The zacks one is v6.0.0** — that fill had no resume at all, so a killed bulk restarted ~6.5 h of work |
 | `.ohlcv_gap_attempts.json` | JSON | `data_engine.record_gap_attempts` | **v6.0.0.** Ledger of interior-gap repair attempts, so a hole that survives a rebuild (a real trading halt, or bars the provider lacks) isn't rebuilt again for `OHLCV_GAP_RECHECK_DAYS` (90) |
@@ -2841,6 +2906,30 @@ is deliberately absent: it is one comma-joined line with no dates and no
 reasons, so "older than N days" has nothing to read. The dialog re-enables
 entries only — it fetches nothing, same as before.
 
+**How an entry actually leaves a skip list.** Removal is *optimistic, not
+evidence-driven*, which is worth stating because the reverse is the intuitive
+guess:
+
+1. The re-check removes the selected entries **up front**, before anything is
+   fetched.
+2. You then run the relevant Gap Fill, which now attempts them.
+3. **Data found** → the ticker simply stays off. Nothing removes it *because*
+   data was found; it was already removed in step 1 and nothing re-adds it.
+4. **No data** → the fill re-adds it with today's date, restarting the clock.
+
+There is no success-driven removal anywhere in the codebase, and there cannot
+usefully be one: a source can never find data for a ticker on its own skip
+list, because the list is applied *before* the fetch
+(`work = [t for t in tickers if t not in blacklist]`).
+
+The lists are also strictly per-source with **no cross-source clearing**. If
+finviz, nasdaq and yahoo all carry a ticker, that fact never touches the zacks
+skip list — a well-covered name can sit on one source's list indefinitely,
+revisited only by the staleness clock, a manual edit, or the failure dialog. A
+cross-source staleness signal ("source Y has a quarter dated after X skipped
+it") would be a genuine improvement and is deliberately **not** implemented;
+managing it by hand is the current answer.
+
 Relatedly, the universal `blacklist.txt` is no longer *unioned into* the finviz
 and finnhub lists. That merge was irreversible — removing a ticker from
 `blacklist.txt` left it skipped by those two sources permanently. It is now
@@ -2862,7 +2951,7 @@ data directory.
 
 ## Testing
 
-Test suite at `trade_scanner_fh/tests/` — **1,868 tests, all passing** as of 2026-09-19 (v6.3.1 added 16, v6.3.0 added 93 across the disagreement merge, the failure taxonomy, the trim scoping, both new features and the unified series engine; v6.2.0 brought it to 1,759; v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
+Test suite at `trade_scanner_fh/tests/` — **1,908 tests, all passing** as of 2026-09-19 (v6.3.2 added 40, v6.3.1 added 16, v6.3.0 added 93 across the disagreement merge, the failure taxonomy, the trim scoping, both new features and the unified series engine; v6.2.0 brought it to 1,759; v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
 
 ```bash
 cd c:/python/EDA_Project/Trade_Scanner_FH
@@ -2923,6 +3012,7 @@ client's rate limiter).
 | `test_parse_spike.py` | Parse-failure spike alarm (threshold math, checkpoint preservation, no-blacklist guarantee) |
 | `test_disagreements.py` | Cross-source EPS disagreement report (detection tolerances, report-only guarantee, **slot-scoped merge** — concurrent finalize cannot blank another source's findings, a re-examined slot still clears, findings accumulate, CSV round-trip key match) |
 | `test_quarter_gap_refetch.py` | **v6.3.0.** `missing_quarter` detector ↔ finding agreement, attempt ledger round-trip / corruption degradation / clear, resting window incl. the edge day, widest-hole-first ordering |
+| `test_source_failures.py` | **v6.3.2.** The shared failure taxonomy (incl. a drift guard that every client's `FAIL_*` sentinel is classified), per-source CSV persistence and its degradation modes, the selective-add dialog's defaults and both confirmation gates, and the MainWindow wiring for all three sources |
 | `test_series_selectors.py` | **v6.3.0.** The shared series engine: selection modes, Backward Only, bridging allowance, strict-vs-inclusive thresholds, `keep_valueless`, beats-default-equals-legacy parity, the report_date-ordering phantom gap, the config knobs, and the GUI controls on all eight rows |
 | `test_quarter_gap_refetch_gui.py` | **v6.3.0.** The re-fetch action row: offers exactly the detected tickers, stamps the ledger before launching, hands finviz + zacks (never finnhub) to the fill, refuses while a fill runs, reset button |
 | `test_rvol_atr_stop.py` | RVOL indicator + funnel stage + panel row; ATR Stop derived column |
@@ -3158,6 +3248,37 @@ directories, and the previous `_internal/`.
 ---
 
 ## Changelog
+
+### v6.3.2 — the same failure report, and selective skip-listing, for all three sources (2026-09-19)
+
+`Show Last Zacks Failures…` had one button that added every failed ticker
+across every kind at once, and the other two sources had no report at all.
+
+**Selective skip-listing.** Failure kinds are grouped by what they say about
+the ticker — permanent, transient, upstream fault — and only the permanent
+group is pre-selected. Upstream faults (`parse_error`, `blocked`) take a
+second confirmation, because that is the group the parse-spike alarm exists to
+protect: a page-format change makes hundreds of good tickers fail at once, and
+the alarm deliberately blacklists nothing for that reason. `auth` is not
+offerable at all — a revoked key fails every symbol equally.
+
+**The same report for finviz and finnhub.** `fill_framework.run_fill_loop` has
+always called `failed_cb` on every failure path; those two workers simply never
+passed one, so the classification the fill already performed was computed and
+discarded. They needed a callback, a dict and a signal. Their kinds were
+already granular (404→`empty`, 429→`rate_limited`, 403→`forbidden`,
+5xx→`server_error`), so unlike Zacks in v6.3.0 they need no detail-string
+plumbing.
+
+**Persisted per source.** `scanner_data/<source>_failures.csv`, written at the
+end of each run and read back when the session has not run that source — an
+overnight fill is now reviewable in the morning. Replaced wholesale rather than
+merged, because a fetch failure is an event, not a standing property.
+
+Removed the superseded Zacks-only dialog (145 lines). Its all-at-once bulk-add
+helper stays: it is a legitimate primitive and is pinned by tests.
+
+1,908 tests.
 
 ### v6.3.1 — the disagreement report learns the difference between a basis and a rounding error (2026-09-19)
 
@@ -3785,7 +3906,9 @@ These are properties the codebase depends on. Breaking any one is a regression w
 73. **A diagnostic threshold must be dimensioned like the thing it measures.** An absolute-only EPS tolerance flags rounding on a large EPS and misses an order-of-magnitude error on a small one. Where a vendor's precision is the noise floor (zacks caps at 2 decimals), an absolute gate measures the vendor's formatting, not its data — so the EPS gate is absolute AND relative.
 74. **To tell a systematic offset from noise, test its structure over time, not its size.** Magnitude, near-integer clustering and per-ticker variance all conflate the two. The lag-1 autocorrelation of the within-ticker log-ratio does not: noise is independent per quarter, a basis difference is the same multiplier every quarter. Score it over ALL overlapping quarters — scoring the flagged subset measures a selected sample, which is what made the first pass look like a basis story.
 75. **Compare against a within-subject control, not a global one.** Seam steps benchmarked against all same-source steps looked alarming (28.1% vs 16.5%); benchmarked against each ticker's own steps the median seam is *below* normal. Any population whose membership is not randomly assigned needs the within-subject comparison.
-76. **A null metric value is a hole for some filters and a miss for others, and the difference is load-bearing.** `build_quarter_points(keep_valueless=...)` makes it explicit rather than implicit. `surprise_*_pct` is null often enough that reading a null as "quarter absent" would let a dead streak look live on 2.56% of tickers.
+76. **A destructive bulk action must be grouped by consequence, not by convenience.** "Add every failure to the skip list" treats a 404 and a parse error as the same event. They are opposites: one says the source will never cover this ticker, the other says the source just changed its page. `failure_kinds.classify` is the single place that judgement lives, an unknown kind defaults to the dangerous group, and a drift-guard test fails if any client emits a kind the taxonomy does not know.
+77. **Never let the UI undo a safety property the pipeline enforces.** The parse-spike alarm halts a run and blacklists nothing when a format breaks. A one-click "add all failures" would reverse that at scale with no ceremony, so upstream-fault kinds are unchecked by default and take a second confirmation.
+78. **A null metric value is a hole for some filters and a miss for others, and the difference is load-bearing.** `build_quarter_points(keep_valueless=...)` makes it explicit rather than implicit. `surprise_*_pct` is null often enough that reading a null as "quarter absent" would let a dead streak look live on 2.56% of tickers.
 
 ---
 

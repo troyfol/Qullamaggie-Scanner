@@ -1251,6 +1251,11 @@ class FinnhubFillWorker(QThread):
     want to abort.
     """
 
+    # Per-ticker failure breakdown emitted at end of run, {sentinel} ->
+    # [tickers]. v6.3.2: `fill_framework.run_fill_loop` has always invoked
+    # `failed_cb` on every failure path — this worker simply never passed one,
+    # so the classification the fill already did was computed and discarded.
+    failure_breakdown = pyqtSignal(dict)
     log_msg = pyqtSignal(str)
     progress = pyqtSignal(int, int)              # done, total
     etf_identified = pyqtSignal(str)             # ticker — emitted live so the
@@ -1270,6 +1275,10 @@ class FinnhubFillWorker(QThread):
         self.mode = mode
         self.flush_every = flush_every
         self._stop = [False]
+        # v6.3.2: per-ticker failure classification for the Show Last
+        # <Source> Failures report. Populated by `failed_cb` inside run().
+        self._failures_by_kind: dict = {}
+        self._failure_details: dict = {}
 
     def request_stop(self):
         self._stop[0] = True
@@ -1295,6 +1304,15 @@ class FinnhubFillWorker(QThread):
                 )
                 return "stop"
 
+            def failed_cb(sym, kind, detail=None):
+                # Bookkeeping must never be what kills a long fill.
+                try:
+                    self._failures_by_kind.setdefault(str(kind), []).append(sym)
+                    if detail:
+                        self._failure_details[sym] = str(detail)
+                except Exception:
+                    pass
+
             if self.mode == "bulk":
                 self.log_msg.emit(
                     f"Finnhub bulk fill: {len(self.symbols)} ticker(s) "
@@ -1307,6 +1325,7 @@ class FinnhubFillWorker(QThread):
                     flush_every=self.flush_every,
                     on_block_callback=block_cb,
                     on_etf_identified=etf_cb,
+                    failed_cb=failed_cb,
                 )
             elif self.mode in ("gap", "targeted"):
                 # "targeted" == smart-refresh: process exactly the
@@ -1325,14 +1344,19 @@ class FinnhubFillWorker(QThread):
                     flush_every=self.flush_every,
                     on_block_callback=block_cb,
                     on_etf_identified=etf_cb,
+                    failed_cb=failed_cb,
                 )
             else:
                 raise ValueError(f"unknown FinnhubFillWorker mode: {self.mode!r}")
 
+            self.failure_breakdown.emit(dict(self._failures_by_kind))
             self.finished.emit(filled, errors)
         except Exception as exc:
             log.error("FinnhubFillWorker crashed: %s", exc, exc_info=True)
             self.log_msg.emit(f"Finnhub fill error: {exc}")
+            # Surface whatever was classified before the crash — a partial
+            # breakdown is still actionable.
+            self.failure_breakdown.emit(dict(self._failures_by_kind))
             self.finished.emit(0, 0)
 
 
@@ -1355,6 +1379,11 @@ class FinvizFillWorker(QThread):
     halts; the user can hit "Stop Finviz Fill" at any time.
     """
 
+    # Per-ticker failure breakdown emitted at end of run, {sentinel} ->
+    # [tickers]. v6.3.2: `fill_framework.run_fill_loop` has always invoked
+    # `failed_cb` on every failure path — this worker simply never passed one,
+    # so the classification the fill already did was computed and discarded.
+    failure_breakdown = pyqtSignal(dict)
     log_msg = pyqtSignal(str)
     progress = pyqtSignal(int, int)              # done, total
     empty_identified = pyqtSignal(str)           # ticker — emitted live
@@ -1373,6 +1402,10 @@ class FinvizFillWorker(QThread):
         self.mode = mode
         self.flush_every = flush_every
         self._stop = [False]
+        # v6.3.2: per-ticker failure classification for the Show Last
+        # <Source> Failures report. Populated by `failed_cb` inside run().
+        self._failures_by_kind: dict = {}
+        self._failure_details: dict = {}
 
     def request_stop(self):
         self._stop[0] = True
@@ -1396,6 +1429,14 @@ class FinvizFillWorker(QThread):
                 )
                 return "stop"
 
+            def failed_cb(sym, kind, detail=None):
+                try:
+                    self._failures_by_kind.setdefault(str(kind), []).append(sym)
+                    if detail:
+                        self._failure_details[sym] = str(detail)
+                except Exception:
+                    pass
+
             if self.mode == "bulk":
                 self.log_msg.emit(
                     f"Finviz bulk fill: {len(self.symbols)} ticker(s) "
@@ -1408,6 +1449,7 @@ class FinvizFillWorker(QThread):
                     flush_every=self.flush_every,
                     on_block_callback=block_cb,
                     on_empty_identified=empty_cb,
+                    failed_cb=failed_cb,
                 )
             elif self.mode in ("gap", "targeted"):
                 # "targeted" == smart-refresh: process exactly the
@@ -1426,12 +1468,15 @@ class FinvizFillWorker(QThread):
                     flush_every=self.flush_every,
                     on_block_callback=block_cb,
                     on_empty_identified=empty_cb,
+                    failed_cb=failed_cb,
                 )
             else:
                 raise ValueError(f"unknown FinvizFillWorker mode: {self.mode!r}")
 
+            self.failure_breakdown.emit(dict(self._failures_by_kind))
             self.finished.emit(filled, errors)
         except Exception as exc:
+            self.failure_breakdown.emit(dict(self._failures_by_kind))
             log.error("FinvizFillWorker crashed: %s", exc, exc_info=True)
             self.log_msg.emit(f"Finviz fill error: {exc}")
             self.finished.emit(0, 0)

@@ -2144,6 +2144,95 @@ def verify_integrity(
     return findings
 
 
+# ── Per-source fill-failure reports ────────────────────────────────────
+
+SOURCE_FAILURE_COLUMNS: list = ["ticker", "kind", "group", "detail", "run_at"]
+
+
+def source_failure_csv_path(source: str) -> Path:
+    """scanner_data/<source>_failures.csv — resolved at call time so test
+    fixtures that monkeypatch config.DATA_DIR redirect it too."""
+    return config.DATA_DIR / config.SOURCE_FAILURE_CSV_TEMPLATE.format(
+        source=str(source).strip().lower())
+
+
+def write_source_failures(
+    source: str,
+    by_kind: dict,
+    details: Optional[dict] = None,
+    *,
+    run_at=None,
+) -> int:
+    """Persist one run's per-ticker failures for ``source``. Returns the row
+    count written.
+
+    Replaces the file wholesale: a failure report describes ONE run, so
+    carrying rows forward would mix a ticker's outcome from two different
+    nights. That is the opposite of the disagreement report's merge semantics,
+    and the difference is deliberate — a disagreement is a standing property
+    of the store, a fetch failure is an event.
+
+    An empty run therefore clears the file, which is honest: nothing failed.
+    Never raises; a failed write costs the report, never the fill.
+    """
+    from . import failure_kinds as fk
+    stamp = (run_at or datetime.now()).isoformat(timespec="seconds")
+    details = details or {}
+    rows = []
+    for kind, tickers in (by_kind or {}).items():
+        grp = fk.classify(kind)
+        for t in tickers or ():
+            rows.append({
+                "ticker": str(t), "kind": str(kind), "group": grp,
+                "detail": str(details.get(t, "") or ""), "run_at": stamp,
+            })
+    frame = pd.DataFrame(rows, columns=SOURCE_FAILURE_COLUMNS)
+    if len(frame):
+        frame = frame.sort_values(["group", "kind", "ticker"], kind="stable")
+    try:
+        config.atomic_write_csv(frame, source_failure_csv_path(source),
+                                index=False)
+    except Exception as exc:  # noqa: BLE001 — diagnostics never block a fill
+        log.warning("Could not write %s failure report: %s", source, exc)
+        return 0
+    return len(frame)
+
+
+def load_source_failures(source: str) -> "tuple[dict, dict, str]":
+    """``(by_kind, details, run_at)`` from disk, or empty when absent.
+
+    Lets the GUI show last night's failures after a restart, which is the
+    whole reason the report is persisted. A malformed file degrades to
+    "no failures recorded" rather than blocking the dialog.
+    """
+    path = source_failure_csv_path(source)
+    if not path.exists():
+        return {}, {}, ""
+    try:
+        # Every column is text. Without this, a detail that happens to look
+        # numeric ("404") is inferred as int64 and silently dropped by the
+        # string check below — and a ticker like "0700" would lose its
+        # leading zero.
+        df = pd.read_csv(path, dtype=str, keep_default_na=False)
+    except (OSError, UnicodeDecodeError, ValueError, pd.errors.ParserError):
+        log.debug("unreadable %s failure report — treating as empty", source)
+        return {}, {}, ""
+    if df.empty or not {"ticker", "kind"}.issubset(df.columns):
+        return {}, {}, ""
+    by_kind: dict = {}
+    details: dict = {}
+    for r in df.itertuples(index=False):
+        by_kind.setdefault(str(r.kind), []).append(str(r.ticker))
+        d = getattr(r, "detail", "")
+        if d is not None and str(d).strip():
+            details[str(r.ticker)] = str(d)
+    run_at = ""
+    if "run_at" in df.columns and len(df):
+        first = df["run_at"].iloc[0]
+        run_at = "" if first is None or str(first) == "" else str(first)
+    return by_kind, details, run_at
+
+
 # ── Quarter-gap re-fetch ledger ────────────────────────────────────────
 #
 # Mirrors data_engine's OHLCV gap-attempt ledger deliberately — same file

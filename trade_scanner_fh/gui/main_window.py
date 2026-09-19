@@ -155,6 +155,12 @@ class MainWindow(QMainWindow):
         # Surfaced via Data → Show Last Zacks Failures... so the user
         # can review what was missed and decide what to blacklist.
         self._last_zacks_failures: dict[str, list[str]] = {}
+        # v6.3.2: the same per-kind breakdown for the other two sources. The
+        # fill framework always classified their failures; nothing consumed it.
+        self._last_finviz_failures: dict[str, list[str]] = {}
+        self._last_finnhub_failures: dict[str, list[str]] = {}
+        self._last_finviz_failure_details: dict[str, str] = {}
+        self._last_finnhub_failure_details: dict[str, str] = {}
         # {symbol: "HTTP 404"} for that same run — the per-ticker specifics
         # behind the coarse per-kind buckets above.
         self._last_zacks_failure_details: dict[str, str] = {}
@@ -655,7 +661,7 @@ class MainWindow(QMainWindow):
             "errors, parse errors."
         )
         act_zacks_show_failures.triggered.connect(
-            self._show_last_zacks_failures
+            lambda: self._show_source_failures("zacks")
         )
         data_menu.addAction(act_zacks_show_failures)
 
@@ -716,6 +722,17 @@ class MainWindow(QMainWindow):
         act_stop_finviz.triggered.connect(self._stop_finviz_fill)
         data_menu.addAction(act_stop_finviz)
 
+        act_finviz_show_failures = QAction(
+            "Show Last Finviz Failures...", self,
+        )
+        act_finviz_show_failures.setToolTip(
+            "Per-ticker breakdown of the most recent Finviz fill's failures, grouped by cause and by whether the cause is a property of the ticker, the moment, or Finviz itself. Tick the kinds you want and add just those to the Finviz skip list. Persisted to scanner_data/finviz_failures.csv, so an overnight fill is still reviewable in the morning."
+        )
+        act_finviz_show_failures.triggered.connect(
+            lambda: self._show_source_failures("finviz")
+        )
+        data_menu.addAction(act_finviz_show_failures)
+
         act_finviz_skip_list = QAction("Edit Finviz Skip List...", self)
         act_finviz_skip_list.setToolTip(
             "View and edit the finviz-only skip list. Auto-populated by "
@@ -768,6 +785,17 @@ class MainWindow(QMainWindow):
         act_stop_finnhub.setToolTip("Stop a running Finnhub fill operation.")
         act_stop_finnhub.triggered.connect(self._stop_finnhub_fill)
         data_menu.addAction(act_stop_finnhub)
+
+        act_finnhub_show_failures = QAction(
+            "Show Last Finnhub Failures...", self,
+        )
+        act_finnhub_show_failures.setToolTip(
+            "Per-ticker breakdown of the most recent Finnhub fill's failures, grouped by cause and by whether the cause is a property of the ticker, the moment, or Finnhub itself. Tick the kinds you want and add just those to the Finnhub skip list. Persisted to scanner_data/finnhub_failures.csv, so an overnight fill is still reviewable in the morning."
+        )
+        act_finnhub_show_failures.triggered.connect(
+            lambda: self._show_source_failures("finnhub")
+        )
+        data_menu.addAction(act_finnhub_show_failures)
 
         act_finnhub_skip_list = QAction("Edit Finnhub Skip List...", self)
         act_finnhub_skip_list.setToolTip(
@@ -2057,153 +2085,132 @@ class MainWindow(QMainWindow):
 
     def _on_zacks_failure_details(self, details: dict):
         """Stash the worker's per-ticker failure detail map for the
-        Show Last Zacks Failures dialog."""
+        Show Last Zacks Failures dialog, then re-persist the report so the
+        CSV carries the details as well as the kinds. Ordering is not
+        guaranteed between the two signals, so whichever lands second writes
+        the complete picture."""
         self._last_zacks_failure_details = dict(details or {})
+        if getattr(self, "_last_zacks_failures", None):
+            self._stash_source_failures("zacks", self._last_zacks_failures)
 
-    def _show_last_zacks_failures(self):
-        """Menu action: per-kind ticker-failure breakdown for the most
-        recent Zacks fill. Each section is a copy-friendly text block.
-        Has a 'Send Not-Found to Blacklist' button so the user can
-        prune ETFs / ADRs / delisted symbols from future fills with
-        one click."""
-        breakdown = dict(self._last_zacks_failures or {})
+    # Which in-memory set and saver back each source's skip list. One table
+    # so the failure report can be written once and parameterised by source
+    # instead of three near-identical dialogs (v6.3.2).
+    _SOURCE_SKIP_ATTRS: dict = {
+        "zacks": ("_zacks_blacklist", "_save_zacks_blacklist"),
+        "finviz": ("_finviz_blacklist", "_save_finviz_blacklist"),
+        "finnhub": ("_finnhub_blacklist", "_save_finnhub_blacklist"),
+    }
+
+    def _stash_source_failures(self, source: str, breakdown: dict) -> None:
+        """Slot for a worker's `failure_breakdown`. Keeps the run in memory
+        for the dialog AND persists it, so a fill that finished overnight is
+        still actionable in the morning — the whole point of the CSV."""
+        setattr(self, f"_last_{source}_failures", dict(breakdown or {}))
+        details = getattr(self, f"_last_{source}_failure_details", {}) or {}
+        try:
+            from ..earnings_history import write_source_failures
+            n = write_source_failures(source, breakdown or {}, details)
+            if n:
+                self.log_panel.write_line(
+                    f"{source.title()} failure report: {n:,} row(s) written to "
+                    f"scanner_data/{source}_failures.csv"
+                )
+        except Exception as exc:
+            self._log_error("failure-report",
+                            f"Could not persist {source} failures: {exc}", exc)
+
+    def _show_source_failures(self, source: str) -> None:
+        """Data → Show Last <Source> Failures… — the per-kind breakdown for
+        the most recent fill of `source`, with selective skip-listing.
+
+        Falls back to the persisted CSV when this session has not run that
+        source yet, which is the case every morning after an overnight fill.
+        """
+        from .dialogs import SourceFailureDialog
+        from ..earnings_history import load_source_failures
+
+        breakdown = dict(getattr(self, f"_last_{source}_failures", {}) or {})
+        details = dict(getattr(self, f"_last_{source}_failure_details", {}) or {})
+        run_at = ""
+        if not breakdown:
+            breakdown, details, run_at = load_source_failures(source)
         if not breakdown:
             QMessageBox.information(
-                self, "Zacks Failures",
-                "No Zacks fill has run yet (or it had no failures). "
-                "Try Data → Bulk Fill Earnings (Zacks) or wait for "
-                "the daily smart refresh.",
+                self, f"{source.title()} Failures",
+                f"No {source} fill has run yet, and no saved report was "
+                f"found at scanner_data/{source}_failures.csv.\n\n"
+                f"Run a {source.title()} fill from the Data menu first.",
             )
             return
 
-        from ..zacks_scraper import (
-            FAIL_BLOCKED, FAIL_NOT_FOUND, FAIL_HTTP_ERROR, FAIL_PARSE_ERROR,
-            FAIL_REJECTED_SYMBOL, FAIL_NETWORK, FAIL_HTTP_4XX, FAIL_HTTP_429,
-            FAIL_HTTP_5XX, FAIL_OVERSIZED,
+        set_attr, saver = self._SOURCE_SKIP_ATTRS[source]
+        live = getattr(self, set_attr, set())
+        dlg = SourceFailureDialog(
+            source, breakdown, details, run_at=run_at,
+            already_skipped=live, parent=self,
         )
-        # Display order + human-readable headings for each kind. Keys
-        # not in this list still appear under "Unknown".
-        kind_meta = [
-            (FAIL_BLOCKED,
-             "Imperva blocks — cookie refresh likely needed"),
-            (FAIL_NOT_FOUND,
-             "Not on Zacks — auto-added to Zacks skip list "
-             "(edit via Data → Edit Zacks Skip List...)"),
-            (FAIL_HTTP_4XX,
-             "HTTP 4xx — the page is gone or forbidden. NOT transient; "
-             "these will fail identically next run"),
-            (FAIL_HTTP_429,
-             "HTTP 429 — rate limited. Raise the per-request delay rather "
-             "than retrying immediately"),
-            (FAIL_HTTP_5XX,
-             "HTTP 5xx — Zacks server-side. Worth retrying later"),
-            (FAIL_NETWORK,
-             "Network errors — timeout / DNS / reset. Transient"),
-            (FAIL_REJECTED_SYMBOL,
-             "Rejected before the request — the symbol failed our own "
-             "allowlist. Permanent; fix or skip-list the symbol"),
-            (FAIL_OVERSIZED,
-             "Oversized response — body past the sanity cap, almost "
-             "always a block page rather than real content"),
-            (FAIL_HTTP_ERROR,
-             "Other HTTP errors — unclassified"),
-            (FAIL_PARSE_ERROR,
-             "Parse errors — Zacks page format may have changed"),
-        ]
-        listed_kinds = {k for k, _ in kind_meta}
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._add_to_source_skip_list(source, dlg.accepted_tickers())
 
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Last Zacks Failures")
-        dlg.setMinimumWidth(720)
-        dlg.setMinimumHeight(540)
-        layout = QVBoxLayout(dlg)
-        total = sum(len(v) for v in breakdown.values())
-        layout.addWidget(QLabel(
-            f"<b>{total}</b> ticker(s) failed in the most recent Zacks "
-            "fill, broken down by cause:"
-        ))
+    def _add_to_source_skip_list(self, source: str, tickers: list) -> None:
+        """Normalise, dedupe and persist `tickers` onto `source`'s skip list.
 
-        body = QTextEdit()
-        body.setReadOnly(True)
-        body.setFont(QFont("Consolas", 9))
-        details = dict(self._last_zacks_failure_details or {})
-
-        def _render(tickers: list[str]) -> list[str]:
-            """One section body. When the run captured per-ticker specifics,
-            show `TICKER (HTTP 404)` one per line and lead with a tally of the
-            distinct details — that tally is the thing that actually answers
-            "what are these errors?". Without details, fall back to the
-            compact 10-per-row grid."""
-            out: list[str] = []
-            named = [t for t in sorted(tickers) if details.get(t)]
-            if named:
-                from collections import Counter
-                tally = Counter(details[t] for t in named)
-                out.append("  " + ",  ".join(
-                    f"{d} ×{n}" for d, n in tally.most_common()))
-                out.append("")
-                for t in sorted(tickers):
-                    d = details.get(t)
-                    out.append(f"  {t:<10} {d}" if d else f"  {t}")
-            else:
-                for i in range(0, len(tickers), 10):
-                    out.append("  " + ", ".join(sorted(tickers)[i:i + 10]))
-            return out
-
-        lines: list[str] = []
-        for kind, header in kind_meta:
-            tickers = breakdown.get(kind, [])
-            if not tickers:
+        Rolls the in-memory set back if the write fails, so memory and disk
+        can never disagree — otherwise the next fill would try a ticker the
+        file still excludes and re-add it on every run.
+        """
+        if not tickers:
+            return
+        set_attr, saver = self._SOURCE_SKIP_ATTRS[source]
+        live = getattr(self, set_attr)
+        added, already = [], 0
+        for raw in tickers:
+            norm = self._normalize_ticker(raw)
+            if not norm:
                 continue
-            lines.append(f"=== {header} ({len(tickers)}) ===")
-            lines.extend(_render(tickers))
-            lines.append("")
-        # Catch any kinds outside the canonical list (defensive)
-        for kind, tickers in breakdown.items():
-            if kind in listed_kinds or not tickers:
-                continue
-            lines.append(f"=== Unknown ({kind}, {len(tickers)}) ===")
-            lines.extend(_render(tickers))
-            lines.append("")
-        body.setPlainText("\n".join(lines).rstrip())
-        layout.addWidget(body)
-
-        btns = QDialogButtonBox()
-        btn_copy = btns.addButton(
-            "Copy All to Clipboard",
-            QDialogButtonBox.ButtonRole.ActionRole,
+            if norm in live:
+                already += 1
+            elif norm not in added:
+                added.append(norm)
+        if not added:
+            QMessageBox.information(
+                self, f"{source.title()} Skip List",
+                f"All {already:,} ticker(s) were already on the list.",
+            )
+            return
+        live.update(added)
+        try:
+            getattr(self, saver)()
+        except Exception as exc:
+            live.difference_update(added)
+            self._log_error("skip-list",
+                            f"Could not save {source} skip list: {exc}", exc)
+            QMessageBox.warning(
+                self, "Write Error",
+                f"Could not write the {source} skip list:\n{exc}\n\n"
+                f"Nothing was changed.",
+            )
+            return
+        self.log_panel.write_line(
+            f"{source.title()} skip list: added {len(added):,} ticker(s) "
+            f"from the failure report (list size now {len(live):,})."
         )
-        btn_copy.clicked.connect(
-            lambda: QApplication.clipboard().setText(body.toPlainText())
-        )
-
-        # New: bulk-add every ticker in the breakdown to the Zacks skip
-        # list. FAIL_NOT_FOUND is already auto-added by `_on_zacks_failures`,
-        # but the user may want to skip the OTHER buckets too (Imperva
-        # blocks, HTTP errors, parse errors) when those tickers are
-        # consistently noisy. Skip-list format is one ticker per line,
-        # sorted, normalized via `_normalize_ticker` — the helper
-        # below handles dedup against the in-memory set so re-clicks
-        # are no-ops.
-        btn_skip = btns.addButton(
-            "Send All Misses to Zacks Skip List",
-            QDialogButtonBox.ButtonRole.ActionRole,
-        )
-        btn_skip.setToolTip(
-            "Add every ticker in the failure breakdown to "
-            "scanner_data/zacks_blacklist.txt, deduped against what's "
-            "already on the list. Honored by every future Zacks fill "
-            "(targeted / bulk / smart) — those tickers won't be "
-            "re-tried until manually removed."
-        )
-        btn_skip.clicked.connect(
-            lambda: self._send_zacks_misses_to_skip_list(breakdown, dlg)
+        QMessageBox.information(
+            self, f"{source.title()} Skip List",
+            f"Added {len(added):,} ticker(s)."
+            + (f" {already:,} were already on the list." if already else "")
+            + f"\n\nList size is now {len(live):,}. Review with "
+              f"Data → Edit {source.title()} Skip List…",
         )
 
-        close_btn = btns.addButton(QDialogButtonBox.StandardButton.Close)
-        close_btn.clicked.connect(dlg.accept)
-        layout.addWidget(btns)
-        dlg.exec()
+    # `_show_last_zacks_failures` lived here until v6.3.2. It was the
+    # Zacks-only, all-or-nothing version of the failure report; the Data menu
+    # now routes all three sources through `_show_source_failures`, which
+    # groups the kinds and lets you add only the ones you mean. The bulk-add
+    # helper below is kept: it is the "everything at once" primitive, it is
+    # pinned by tests, and nothing about it was wrong.
 
     def _send_zacks_misses_to_skip_list(self, breakdown: dict, parent_dlg) -> None:
         """Bulk-add every ticker in `breakdown` (across ALL failure
