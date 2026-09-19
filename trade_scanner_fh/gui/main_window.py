@@ -29,7 +29,8 @@ from PyQt6.QtCore import QDate, QEvent, Qt, pyqtSlot
 from PyQt6.QtGui import QAction, QFont
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QDialog,
-    QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout,
+    QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFrame, QGroupBox,
+    QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QProgressBar, QPushButton, QSpinBox, QSplitter, QStatusBar,
     QTextEdit, QToolBar, QVBoxLayout, QWidget,
@@ -154,6 +155,9 @@ class MainWindow(QMainWindow):
         # Surfaced via Data → Show Last Zacks Failures... so the user
         # can review what was missed and decide what to blacklist.
         self._last_zacks_failures: dict[str, list[str]] = {}
+        # {symbol: "HTTP 404"} for that same run — the per-ticker specifics
+        # behind the coarse per-kind buckets above.
+        self._last_zacks_failure_details: dict[str, str] = {}
         # Mirror config flag in a mutable container so the menu toggle
         # picks up changes without restart. Same pattern as
         # _backoff_enabled_ref. Persisted across sessions via QSettings
@@ -915,13 +919,13 @@ class MainWindow(QMainWindow):
 
         act_recheck_skips = QAction("Re-check Stale Skips...", self)
         act_recheck_skips.setToolTip(
-            "Re-enable per-source skip-list entries that were auto-added "
-            f"because a source returned no data more than "
-            f"{config.SKIP_RECHECK_DAYS} days ago — that also describes an IPO "
-            "which has since started reporting. Removes up to "
-            f"{config.SKIP_RECHECK_MAX} per list so the next Gap Fill tries "
-            "them; anything still uncovered is re-added automatically. "
-            "Manually-added entries are never touched. Fetches nothing."
+            "Re-enable entries on the finviz / finnhub / zacks skip lists so "
+            "the next Gap Fill tries them again — an entry auto-added because "
+            "a source returned no data also describes an IPO that has since "
+            "started reporting. Opens a dialog: choose the staleness window, "
+            "the per-list cap, which sources, and which reason codes, with a "
+            "live count of what each setting would re-enable. Anything still "
+            "uncovered is re-added automatically. Fetches nothing."
         )
         act_recheck_skips.triggered.connect(self._recheck_stale_skips)
         data_menu.addAction(act_recheck_skips)
@@ -1908,8 +1912,10 @@ class MainWindow(QMainWindow):
     def _maybe_run_nasdaq_refresh(self) -> bool:
         return self._earn_coord._maybe_run_nasdaq_refresh()
 
-    def _trim_all_blocked_candidates(self, candidates: list[str]) -> list[str]:
-        return self._earn_coord._trim_all_blocked_candidates(candidates)
+    def _trim_all_blocked_candidates(
+        self, candidates: list[str], sources: "tuple[str, ...] | None" = None,
+    ) -> list[str]:
+        return self._earn_coord._trim_all_blocked_candidates(candidates, sources)
 
     def _kick_off_smart_refresh(self) -> None:
         self._earn_coord._kick_off_smart_refresh()
@@ -2027,6 +2033,8 @@ class MainWindow(QMainWindow):
         self._zacks_worker.progress.connect(self._on_zacks_progress)
         self._zacks_worker.finished.connect(self._on_zacks_done)
         self._zacks_worker.failure_breakdown.connect(self._on_zacks_failures)
+        self._zacks_worker.failure_details.connect(
+            self._on_zacks_failure_details)
         # Audit H1: the daily smart refresh must surface the cookie
         # refresh dialog if Imperva blocks mid-run, otherwise the worker
         # blocks indefinitely on its resume Event with no UX recovery.
@@ -2047,6 +2055,11 @@ class MainWindow(QMainWindow):
     def _on_zacks_failures(self, breakdown: dict):
         self._earn_coord._on_zacks_failures(breakdown)
 
+    def _on_zacks_failure_details(self, details: dict):
+        """Stash the worker's per-ticker failure detail map for the
+        Show Last Zacks Failures dialog."""
+        self._last_zacks_failure_details = dict(details or {})
+
     def _show_last_zacks_failures(self):
         """Menu action: per-kind ticker-failure breakdown for the most
         recent Zacks fill. Each section is a copy-friendly text block.
@@ -2065,6 +2078,8 @@ class MainWindow(QMainWindow):
 
         from ..zacks_scraper import (
             FAIL_BLOCKED, FAIL_NOT_FOUND, FAIL_HTTP_ERROR, FAIL_PARSE_ERROR,
+            FAIL_REJECTED_SYMBOL, FAIL_NETWORK, FAIL_HTTP_4XX, FAIL_HTTP_429,
+            FAIL_HTTP_5XX, FAIL_OVERSIZED,
         )
         # Display order + human-readable headings for each kind. Keys
         # not in this list still appear under "Unknown".
@@ -2074,8 +2089,24 @@ class MainWindow(QMainWindow):
             (FAIL_NOT_FOUND,
              "Not on Zacks — auto-added to Zacks skip list "
              "(edit via Data → Edit Zacks Skip List...)"),
+            (FAIL_HTTP_4XX,
+             "HTTP 4xx — the page is gone or forbidden. NOT transient; "
+             "these will fail identically next run"),
+            (FAIL_HTTP_429,
+             "HTTP 429 — rate limited. Raise the per-request delay rather "
+             "than retrying immediately"),
+            (FAIL_HTTP_5XX,
+             "HTTP 5xx — Zacks server-side. Worth retrying later"),
+            (FAIL_NETWORK,
+             "Network errors — timeout / DNS / reset. Transient"),
+            (FAIL_REJECTED_SYMBOL,
+             "Rejected before the request — the symbol failed our own "
+             "allowlist. Permanent; fix or skip-list the symbol"),
+            (FAIL_OVERSIZED,
+             "Oversized response — body past the sanity cap, almost "
+             "always a block page rather than real content"),
             (FAIL_HTTP_ERROR,
-             "HTTP / network errors — usually transient"),
+             "Other HTTP errors — unclassified"),
             (FAIL_PARSE_ERROR,
              "Parse errors — Zacks page format may have changed"),
         ]
@@ -2095,23 +2126,44 @@ class MainWindow(QMainWindow):
         body = QTextEdit()
         body.setReadOnly(True)
         body.setFont(QFont("Consolas", 9))
+        details = dict(self._last_zacks_failure_details or {})
+
+        def _render(tickers: list[str]) -> list[str]:
+            """One section body. When the run captured per-ticker specifics,
+            show `TICKER (HTTP 404)` one per line and lead with a tally of the
+            distinct details — that tally is the thing that actually answers
+            "what are these errors?". Without details, fall back to the
+            compact 10-per-row grid."""
+            out: list[str] = []
+            named = [t for t in sorted(tickers) if details.get(t)]
+            if named:
+                from collections import Counter
+                tally = Counter(details[t] for t in named)
+                out.append("  " + ",  ".join(
+                    f"{d} ×{n}" for d, n in tally.most_common()))
+                out.append("")
+                for t in sorted(tickers):
+                    d = details.get(t)
+                    out.append(f"  {t:<10} {d}" if d else f"  {t}")
+            else:
+                for i in range(0, len(tickers), 10):
+                    out.append("  " + ", ".join(sorted(tickers)[i:i + 10]))
+            return out
+
         lines: list[str] = []
         for kind, header in kind_meta:
             tickers = breakdown.get(kind, [])
             if not tickers:
                 continue
             lines.append(f"=== {header} ({len(tickers)}) ===")
-            # 10 per row for readability
-            for i in range(0, len(tickers), 10):
-                lines.append("  " + ", ".join(sorted(tickers)[i:i + 10]))
+            lines.extend(_render(tickers))
             lines.append("")
         # Catch any kinds outside the canonical list (defensive)
         for kind, tickers in breakdown.items():
             if kind in listed_kinds or not tickers:
                 continue
             lines.append(f"=== Unknown ({kind}, {len(tickers)}) ===")
-            for i in range(0, len(tickers), 10):
-                lines.append("  " + ", ".join(sorted(tickers)[i:i + 10]))
+            lines.extend(_render(tickers))
             lines.append("")
         body.setPlainText("\n".join(lines).rstrip())
         layout.addWidget(body)
@@ -2861,7 +2913,20 @@ class MainWindow(QMainWindow):
 
         Existing on-disk metadata wins; entries added during this session pick up
         today's date plus whatever reason code the fill recorded. New entries with
-        no recorded reason get ``"manual"`` — they came from the editor dialog.
+        no recorded reason get ``"unknown"``.
+
+        That fallback used to be ``"manual"``, which was a lie with real
+        consequences: ``manual`` reads as "the user curated this", and the
+        stale-skip re-check deliberately leaves curated entries alone. So every
+        entry that arrived WITHOUT a reason — the overwhelming majority — was
+        permanently exempted from re-validation by a label nobody chose. On
+        2026-09-18 the zacks list was 10,143 entries and 100% ``manual``, none
+        of them re-checkable. ``unknown`` says what is actually known.
+
+        Entries already on disk keep whatever label they were written with;
+        relabelling them here would be guessing at intent we do not have. The
+        re-check dialog makes every reason code selectable instead, so the
+        existing ``manual`` backlog is reachable without rewriting history.
         """
         mgr = BlacklistManager(path, label=label)
         prior = mgr.load_entries()
@@ -2873,7 +2938,7 @@ class MainWindow(QMainWindow):
             if t in prior:
                 entries[t] = prior[t]
             else:
-                entries[t] = (None, session_reasons.get(t, "manual"))
+                entries[t] = (None, session_reasons.get(t, "unknown"))
         mgr.save_entries(entries)
 
     def _save_zacks_blacklist(self):
@@ -3440,102 +3505,167 @@ class MainWindow(QMainWindow):
          "_zacks_blacklist", "_save_zacks_blacklist"),
     )
 
-    def _stale_skip_candidates(self) -> dict[str, list[str]]:
-        """Per source, the auto-added ``empty`` entries older than
-        ``config.SKIP_RECHECK_DAYS``, oldest first and capped at
-        ``config.SKIP_RECHECK_MAX``.
-
-        Only the ``empty`` reason is eligible: that is the code recorded when a
-        source returned no data (finviz 404 / finnhub ``[]``), which covers a
-        genuinely uncovered ETF *and* a brand-new IPO that will start reporting.
-        Manual entries and legacy entries with a recorded non-empty reason are
-        the user's curation and are left alone.
-
-        Legacy bare-ticker lines carry no date OR reason, so they are excluded
-        here — re-offering ~26k undated entries in one action is exactly the
-        unbounded behaviour this fix exists to avoid. They become eligible
-        naturally as they get rewritten with real metadata.
-        """
-        out: dict[str, list[str]] = {}
+    def _skip_entries_by_source(self) -> tuple[dict, dict]:
+        """``({source: {ticker: (added_on, reason)}}, {source: live set})``
+        for the three earnings skip lists. One read per list, so the dialog
+        can recompute its preview in memory rather than re-reading files on
+        every keystroke."""
+        entries: dict = {}
+        live: dict = {}
         for key, _label, path_attr, set_attr, _saver in (
                 self._RECHECKABLE_SKIP_LISTS):
             mgr = BlacklistManager(getattr(self, path_attr), label=key)
+            entries[key] = mgr.load_entries()
+            live[key] = set(getattr(self, set_attr))
+        return entries, live
+
+    def _stale_skip_candidates(
+        self, *,
+        days: "int | None" = None,
+        max_per_list: "int | None" = None,
+        reasons: "set[str] | None" = None,
+        sources: "tuple[str, ...] | None" = None,
+        include_undated: bool = False,
+    ) -> dict[str, list[str]]:
+        """Per source, the skip entries eligible for a re-check, oldest first.
+
+        Defaults reproduce the original fixed rule: the auto-added ``empty``
+        entries older than ``config.SKIP_RECHECK_DAYS``, capped at
+        ``config.SKIP_RECHECK_MAX``. ``empty`` is the code recorded when a
+        source returned no data (finviz 404 / finnhub ``[]``), which covers a
+        genuinely uncovered ETF *and* a brand-new IPO that will start
+        reporting.
+
+        Every part of that rule is now overridable, because as a fixed rule it
+        could not reach the list that most needed it: on 2026-09-18 the zacks
+        skip list held 10,143 entries all labelled ``manual``, and ``manual``
+        is the fallback stamped on an entry with no recorded reason — not
+        proof of curation. See ``StaleSkipDialog``.
+
+        ``include_undated`` admits legacy bare-ticker lines, which carry
+        neither date nor reason. They are excluded by default: re-offering
+        ~26k undated entries in one action is the unbounded behaviour this
+        mechanism exists to avoid.
+        """
+        eff_days = config.SKIP_RECHECK_DAYS if days is None else days
+        eff_max = config.SKIP_RECHECK_MAX if max_per_list is None else max_per_list
+        eff_reasons = {"empty"} if reasons is None else set(reasons)
+        cutoff = date.today() - timedelta(days=int(eff_days))
+
+        out: dict[str, list[str]] = {}
+        for key, _label, path_attr, set_attr, _saver in (
+                self._RECHECKABLE_SKIP_LISTS):
+            if sources is not None and key not in sources:
+                out[key] = []
+                continue
+            mgr = BlacklistManager(getattr(self, path_attr), label=key)
             entries = mgr.load_entries()
-            cutoff = date.today() - timedelta(days=config.SKIP_RECHECK_DAYS)
             live = getattr(self, set_attr)
-            stale = [
-                (added, tk) for tk, (added, reason) in entries.items()
-                if reason == "empty" and added is not None and added <= cutoff
-                and tk in live
-            ]
+            stale = []
+            for tk, (added, reason) in entries.items():
+                if tk not in live:
+                    continue
+                if (reason or "(none)") not in eff_reasons:
+                    continue
+                if added is None:
+                    if include_undated:
+                        stale.append((date.max, tk))
+                    continue
+                if added <= cutoff:
+                    stale.append((added, tk))
             stale.sort()
-            out[key] = [tk for _added, tk in stale[:config.SKIP_RECHECK_MAX]]
+            out[key] = [tk for _added, tk in stale[:int(eff_max)]]
         return out
 
-    def _recheck_stale_skips(self):
-        """Menu: re-offer long-standing auto-skipped tickers to their source.
-
-        Removes up to ``config.SKIP_RECHECK_MAX`` stale ``empty`` entries per
-        list so the next gap fill picks them up. If a ticker really is
-        uncovered, the fill re-adds it with a fresh date and it drops out of
-        scope for another ``SKIP_RECHECK_DAYS`` — a self-correcting cycle
-        rather than the permanent exclusion this list used to be.
-
-        Deliberately manual: an automatic sweep of 10,246 finnhub skips at
-        ~4 s/ticker would be ~11 hours of unrequested traffic.
-        """
-        candidates = self._stale_skip_candidates()
-        total = sum(len(v) for v in candidates.values())
-        if not total:
-            QMessageBox.information(
-                self, "Re-check Stale Skips",
-                f"No skip-list entries are eligible.\n\n"
-                f"Eligible entries were auto-added because a source returned "
-                f"no data, and are older than {config.SKIP_RECHECK_DAYS} days. "
-                f"Manually-added entries are never re-checked.",
-            )
-            return
-        breakdown = "\n".join(
-            f"  {label}: {len(candidates[key])}"
-            for key, label, _p, _s, _v in self._RECHECKABLE_SKIP_LISTS
-            if candidates[key]
-        )
-        if QMessageBox.question(
-            self, "Re-check Stale Skips",
-            f"Remove {total} ticker(s) from the per-source skip lists so the "
-            f"next gap fill tries them again?\n\n"
-            f"{breakdown}\n\n"
-            f"These were auto-added because the source returned no data more "
-            f"than {config.SKIP_RECHECK_DAYS} days ago — which also describes "
-            f"an IPO that has since started reporting, or a ticker that was "
-            f"mid-rename that day.\n\n"
-            f"Capped at {config.SKIP_RECHECK_MAX} per list. Anything still "
-            f"uncovered goes back on the list on the next fill.\n\n"
-            f"Nothing is fetched now — run the relevant Gap Fill afterwards.",
-        ) != QMessageBox.StandardButton.Yes:
-            return
+    def _apply_stale_skip_selection(self, selection: dict) -> int:
+        """Drop `selection`'s tickers from their lists and persist. Returns
+        how many were actually re-enabled; a list whose save fails is rolled
+        back in memory so the in-memory set never disagrees with disk."""
+        total = 0
         for key, label, _path_attr, set_attr, saver in (
                 self._RECHECKABLE_SKIP_LISTS):
-            syms = candidates[key]
+            syms = [s for s in selection.get(key, []) if s]
             if not syms:
                 continue
-            getattr(self, set_attr).difference_update(syms)
+            live = getattr(self, set_attr)
+            live.difference_update(syms)
             try:
                 getattr(self, saver)()
             except Exception as exc:
+                live.update(syms)   # keep memory and disk in agreement
                 self._log_error(
                     "skip-recheck",
                     f"Could not save {label} skip list: {exc}", exc,
                 )
                 continue
+            total += len(syms)
             self.log_panel.write_line(
-                f"{label} skip list: re-enabled {len(syms)} stale entries "
-                f"(auto-skipped >{config.SKIP_RECHECK_DAYS}d ago)."
+                f"{label} skip list: re-enabled {len(syms)} entries."
             )
+        return total
+
+    def _recheck_stale_skips(self):
+        """Menu: re-offer long-standing auto-skipped tickers to their source.
+
+        Opens ``StaleSkipDialog`` so the staleness window, the per-list cap,
+        the sources and the reason codes are all chosen at run time with a
+        live count of what each setting would do. Applying it removes those
+        entries so the next gap fill picks them up; anything still uncovered
+        is re-added with a fresh date, a self-correcting cycle rather than the
+        permanent exclusion these lists used to be.
+
+        Deliberately manual and never automatic: a full sweep of ~10k finnhub
+        skips at ~4 s/ticker would be ~11 hours of unrequested traffic.
+
+        Earnings sources only. The OHLCV blacklist is a single comma-joined
+        line with no dates or reasons, so there is no staleness to compute for
+        it — it is edited directly from its own menu action instead.
+        """
+        from .dialogs import StaleSkipDialog
+
+        entries, live = self._skip_entries_by_source()
+        if not any(entries.values()):
+            QMessageBox.information(
+                self, "Re-check Stale Skips",
+                "The earnings skip lists are empty — nothing to re-check.",
+            )
+            return
+
+        labels = {key: label for key, label, _p, _s, _v
+                  in self._RECHECKABLE_SKIP_LISTS}
+        dlg = StaleSkipDialog(
+            entries, live,
+            labels=labels,
+            default_days=config.SKIP_RECHECK_DAYS,
+            default_max=config.SKIP_RECHECK_MAX,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selection = dlg.selection()
+        settings = dlg.settings()
+        total = sum(len(v) for v in selection.values())
+        if not total:
+            QMessageBox.information(
+                self, "Re-check Stale Skips",
+                "Nothing matched those settings — no entries were changed.",
+            )
+            return
+
+        self.log_panel.write_line(
+            f"Skip re-check: >{settings['days']}d, "
+            f"reasons={', '.join(settings['reasons']) or '(none)'}, "
+            f"cap={settings['max_per_list']}/list"
+            + (", including undated" if settings["include_undated"] else "")
+        )
+        applied = self._apply_stale_skip_selection(selection)
         QMessageBox.information(
             self, "Re-check Stale Skips",
-            f"{total} ticker(s) re-enabled.\n\n"
-            f"Run Gap Fill for each source to attempt them.",
+            f"{applied:,} ticker(s) re-enabled.\n\n"
+            f"Nothing was fetched — run Gap Fill for each source to attempt "
+            f"them. Anything still uncovered returns to the list with a fresh "
+            f"date.",
         )
 
     # ── Orphaned-data pruning (audit 2026-08-12, INT-14) ───────────────
@@ -4972,6 +5102,98 @@ class MainWindow(QMainWindow):
 
         dlg.show()
 
+    def _quarter_gap_refetch_row(self, dlg, history_df):
+        """Action row under the `missing_quarter` finding: re-fetch exactly
+        the gapped tickers, then rest them.
+
+        The list is recomputed here from `find_quarter_gap_tickers` +
+        `select_quarter_gap_refetches` rather than read off the finding, so
+        the tickers queued are by construction the tickers reported.
+        """
+        from ..earnings_history import (
+            find_quarter_gap_tickers, select_quarter_gap_refetches,
+            record_earnings_gap_attempts, clear_earnings_gap_attempts,
+            load_earnings_gap_attempts,
+        )
+        row = QHBoxLayout()
+        row.addSpacing(18)
+        gaps = find_quarter_gap_tickers(history_df)
+        targets = select_quarter_gap_refetches(gaps)
+
+        btn = QPushButton(f"Re-fetch these ({len(targets)})...")
+        btn.setToolTip(
+            "Run a targeted finviz + zacks fill against exactly the gapped "
+            "tickers, widest hole first. Each ticker is then rested for "
+            f"{config.EARNINGS_GAP_RECHECK_DAYS} days so it drops out of this "
+            "finding — a legitimate gap (a company that went dark, a "
+            "fiscal-year change) stops re-reporting instead of sitting in the "
+            "count forever."
+        )
+        btn.setEnabled(bool(targets))
+
+        def _do_refetch():
+            if self._earn_threads_active():
+                QMessageBox.warning(
+                    dlg, "Fill in progress",
+                    "An earnings fill is already running — wait for it to "
+                    "finish, then re-run the integrity check.",
+                )
+                return
+            if QMessageBox.question(
+                dlg, "Re-fetch gapped tickers",
+                f"Run a targeted <b>finviz + zacks</b> fill against "
+                f"<b>{len(targets):,}</b> ticker(s) with a missing quarter?"
+                f"<br><br>They are then rested for "
+                f"{config.EARNINGS_GAP_RECHECK_DAYS} days, so this finding "
+                f"shrinks to the ones you have not tried yet.<br><br>"
+                f"Widest holes first: "
+                f"{', '.join(targets[:8])}"
+                + (" ..." if len(targets) > 8 else ""),
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            # Stamp BEFORE launching. A fill that errors on a ticker still
+            # counts as tried — the alternative is re-queueing a permanently
+            # uncoverable name every run, which is the churn this exists to
+            # stop. "Reset" below is the escape hatch.
+            record_earnings_gap_attempts(targets)
+            self.log_panel.write_line(
+                f"Quarter-gap re-fetch: queued {len(targets):,} ticker(s) "
+                f"(finviz + zacks), rested for "
+                f"{config.EARNINGS_GAP_RECHECK_DAYS} days."
+            )
+            self._launch_smart_refresh_workers(
+                list(targets), due=False, include_finnhub=False,
+            )
+            dlg.close()
+
+        btn.clicked.connect(_do_refetch)
+        row.addWidget(btn)
+
+        n_rested = len(load_earnings_gap_attempts())
+        btn_reset = QPushButton(f"Reset rested ({n_rested})")
+        btn_reset.setToolTip(
+            "Forget every recorded re-fetch attempt so all gapped tickers "
+            "become eligible again immediately."
+        )
+        btn_reset.setEnabled(bool(n_rested))
+
+        def _do_reset():
+            removed = clear_earnings_gap_attempts()
+            self.log_panel.write_line(
+                f"Quarter-gap ledger: cleared {removed:,} rested ticker(s)."
+            )
+            QMessageBox.information(
+                dlg, "Rested tickers cleared",
+                f"{removed:,} ticker(s) are eligible again. Re-run the "
+                f"integrity check to see the full list.",
+            )
+            btn_reset.setEnabled(False)
+
+        btn_reset.clicked.connect(_do_reset)
+        row.addWidget(btn_reset)
+        row.addStretch()
+        return row
+
     def _verify_earnings_history_integrity(self):
         """Menu: Data → Earnings → Diagnostics → Verify Integrity.
         Walks earnings_history.parquet for known issues and renders a
@@ -5033,6 +5255,13 @@ class MainWindow(QMainWindow):
                 row_lbl.setTextFormat(Qt.TextFormat.RichText)
                 row_lbl.setWordWrap(True)
                 layout.addWidget(row_lbl)
+                # `missing_quarter` is the one finding whose remedy is a
+                # fetch rather than a rewrite, so it gets its own action —
+                # otherwise the only way to act on 525 tickers was to read
+                # them out of a log and drive a fill by hand.
+                if f.check == "missing_quarter":
+                    layout.addLayout(
+                        self._quarter_gap_refetch_row(dlg, df))
 
         btn_row = QHBoxLayout()
         if any(f.auto_fixable for f in findings):
@@ -5360,7 +5589,8 @@ class MainWindow(QMainWindow):
     def _show_advanced_settings(self) -> None:
         """Settings → Advanced… — edit the user-configurable tunables:
         OHLCV cache depth, earnings-history depth, the reference/
-        benchmark ticker list, and the launch-time OHLCV prefetch
+        benchmark ticker list, the per-filter-type missing-quarter
+        bridging allowance, and the launch-time OHLCV prefetch
         toggle. OK validates, persists via config.save_user_config()
         (scanner_data/user_config.json), and applies the values to the
         live config module immediately — no restart (the prefetch
@@ -5432,6 +5662,47 @@ class MainWindow(QMainWindow):
         txt.setMinimumHeight(80)
         layout.addWidget(txt)
 
+        # Missing-quarter bridging, per series filter type (v6.3.0).
+        # These were hardcoded and inconsistent: beats broke on any hole while
+        # growth and acceleration bridged one. Exposing them per type is the
+        # honest version — the three filters genuinely want different answers,
+        # and "consecutive" means whatever this number says it means.
+        bridge_box = QGroupBox("Series filters — missing-quarter bridging")
+        bridge_layout = QVBoxLayout(bridge_box)
+        bridge_note = QLabel(
+            "How many consecutive MISSING fiscal quarters a run may bridge "
+            "before it breaks. 0 = any gap ends the run. Defaults reproduce "
+            "each filter's original behaviour."
+        )
+        bridge_note.setWordWrap(True)
+        bridge_note.setStyleSheet("color: #888888; font-size: 11px;")
+        bridge_layout.addWidget(bridge_note)
+
+        bridge_spins: dict = {}
+        for _key, _label, _tip in (
+            ("SERIES_MAX_BRIDGED_BEATS", "Consecutive Beats",
+             "Originally 0 — a missing quarter always broke a beats streak."),
+            ("SERIES_MAX_BRIDGED_GROWTH", "Consecutive YoY Growth",
+             "Originally 1 — spec 3.1 bridges a single missing quarter."),
+            ("SERIES_MAX_BRIDGED_ACCEL", "Accelerating Quarters",
+             "Originally 1 — spec 3.1 bridges a single missing quarter."),
+        ):
+            _row = QHBoxLayout()
+            _lbl = QLabel(f"{_label}:")
+            _lbl.setToolTip(_tip)
+            _lbl.setMinimumWidth(190)
+            _row.addWidget(_lbl)
+            _spin = QSpinBox()
+            _spin.setRange(*config.USER_CONFIG_INT_RANGES[_key])
+            _spin.setValue(int(getattr(config, _key)))
+            _spin.setMinimumWidth(80)
+            _spin.setToolTip(_tip)
+            _row.addWidget(_spin)
+            _row.addStretch()
+            bridge_layout.addLayout(_row)
+            bridge_spins[_key] = _spin
+        layout.addWidget(bridge_box)
+
         # Launch-time OHLCV cache prefetch (F5)
         chk_prefetch = QCheckBox(
             "Prefetch OHLCV cache at launch "
@@ -5499,6 +5770,7 @@ class MainWindow(QMainWindow):
             "EARNINGS_HISTORY_YEARS": spin_earn.value(),
             "REFERENCE_TICKERS": tickers,
             "PREFETCH_OHLCV_AT_LAUNCH": chk_prefetch.isChecked(),
+            **{k: s.value() for k, s in bridge_spins.items()},
         }):
             QMessageBox.warning(
                 self, "Write Error",
@@ -5511,9 +5783,14 @@ class MainWindow(QMainWindow):
             f"{config.EARNINGS_HISTORY_YEARS}y, "
             f"{len(config.REFERENCE_TICKERS)} reference ticker(s), "
             "launch prefetch="
-            f"{'on' if config.PREFETCH_OHLCV_AT_LAUNCH else 'off'}. "
+            f"{'on' if config.PREFETCH_OHLCV_AT_LAUNCH else 'off'}, "
+            "bridging beats/growth/accel="
+            f"{config.SERIES_MAX_BRIDGED_BEATS}/"
+            f"{config.SERIES_MAX_BRIDGED_GROWTH}/"
+            f"{config.SERIES_MAX_BRIDGED_ACCEL}. "
             "OHLCV depth applies to new downloads only; the prefetch "
-            "toggle takes effect at the next launch."
+            "toggle takes effect at the next launch. Bridging applies to "
+            "the next scan."
         )
 
     def _confirm_history_depth_decrease(

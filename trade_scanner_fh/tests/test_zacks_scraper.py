@@ -595,3 +595,137 @@ def test_session_works_without_stored_cookies(tmp_cookie_storage):
     with patch.object(zs.requests, "Session", return_value=_FakeSession()):
         with zs.ZacksSession() as s:
             assert captured == []
+
+
+# ----------------------------------------------------------------------
+# 2026-09-18: `http_error` split into kinds that mean different things
+# ----------------------------------------------------------------------
+
+def _fetch_with(resp_or_exc, symbol="TEST"):
+    """Drive one fetch() against a canned response or a raised exception,
+    returning the live session so the test can read its failure state."""
+    with patch("trade_scanner_fh.zacks_scraper.requests.Session") as mock_cls:
+        sess = mock_cls.return_value
+        sess.headers = {}
+        if isinstance(resp_or_exc, Exception):
+            sess.get.side_effect = resp_or_exc
+        else:
+            sess.get.return_value = resp_or_exc
+        sess.close.return_value = None
+        with zs.ZacksSession() as scraper:
+            rows = scraper.fetch(symbol)
+            return rows, scraper
+
+
+@pytest.mark.parametrize("code, expected_kind", [
+    (404, zs.FAIL_HTTP_4XX),
+    (403, zs.FAIL_HTTP_4XX),
+    (410, zs.FAIL_HTTP_4XX),
+    (429, zs.FAIL_HTTP_429),
+    (500, zs.FAIL_HTTP_5XX),
+    (503, zs.FAIL_HTTP_5XX),
+])
+def test_status_codes_classify_into_distinct_kinds(code, expected_kind):
+    """The single `http_error` bucket reported 38 failures as "transient" on
+    2026-09-18 when most were 404s. A 404 and a 503 are not the same event and
+    must not share a bucket."""
+    rows, sess = _fetch_with(_FakeResp("", status_code=code))
+    assert rows is None
+    assert sess.last_failure_kind == expected_kind
+    assert sess.last_failure_detail == f"HTTP {code}"
+    assert sess.last_status_code == code
+
+
+def test_network_exception_is_its_own_kind_and_names_the_exception():
+    """Must use curl_cffi's exception tree, not the stdlib-style `requests`
+    package: this module's `requests` IS curl_cffi's drop-in, and the two
+    hierarchies are unrelated."""
+    from curl_cffi.requests import exceptions as cex
+    rows, sess = _fetch_with(cex.ReadTimeout("too slow"))
+    assert rows is None
+    assert sess.last_failure_kind == zs.FAIL_NETWORK
+    assert sess.last_failure_detail == "ReadTimeout"
+
+
+def test_the_network_handler_catches_curl_cffis_real_base_class():
+    """Regression for the wrong-spelling bug: `requests.RequestException`
+    does not exist on curl_cffi, so evaluating that except clause raised
+    AttributeError at the exact moment a network error occurred and every
+    one of them escaped classification."""
+    from curl_cffi import requests as ccr
+    assert not hasattr(ccr, "RequestException")
+    assert hasattr(ccr, "RequestsError")
+    for name in ("ConnectTimeout", "ReadTimeout", "ConnectionError",
+                 "DNSError", "ProxyError"):
+        exc_cls = getattr(ccr.exceptions, name)
+        rows, sess = _fetch_with(exc_cls("boom"))
+        assert rows is None
+        assert sess.last_failure_kind == zs.FAIL_NETWORK, name
+        assert sess.last_failure_detail == name
+
+
+def test_rejected_symbol_is_permanent_not_an_http_error():
+    """The allowlist refusal never reaches the network, so calling it an
+    HTTP error (and then 'transient') was doubly wrong."""
+    rows, sess = _fetch_with(_FakeResp(""), symbol="../etc/passwd")
+    assert rows is None
+    assert sess.last_failure_kind == zs.FAIL_REJECTED_SYMBOL
+    assert zs.FAIL_REJECTED_SYMBOL in zs.PERMANENT_FAIL_KINDS
+
+
+def test_oversized_body_is_its_own_kind():
+    from trade_scanner_fh import config as cfg
+    big = "x" * (cfg.ZACKS_MAX_RESPONSE_BYTES + 1)
+    rows, sess = _fetch_with(_FakeResp(big))
+    assert rows is None
+    assert sess.last_failure_kind == zs.FAIL_OVERSIZED
+    assert "MB" in (sess.last_failure_detail or "")
+
+
+def test_transient_and_permanent_sets_are_disjoint_and_populated():
+    assert zs.TRANSIENT_FAIL_KINDS and zs.PERMANENT_FAIL_KINDS
+    assert not (zs.TRANSIENT_FAIL_KINDS & zs.PERMANENT_FAIL_KINDS)
+    # A 4xx must never be advertised as worth retrying.
+    assert zs.FAIL_HTTP_4XX not in zs.TRANSIENT_FAIL_KINDS
+
+
+def test_success_clears_kind_detail_and_status():
+    rows, sess = _fetch_with(_FakeResp(_load_fixture()), symbol="AAPL")
+    assert rows
+    assert sess.last_failure_kind is None
+    assert sess.last_failure_detail is None
+    assert sess.last_status_code is None
+
+
+def test_failed_cb_arity_probe_supports_two_and_three_arg_callbacks():
+    """The fill now reports (symbol, kind, detail). Two-arg callbacks are
+    everywhere in this suite and must keep working — and the probe must not
+    be fooled by a TypeError raised from INSIDE a three-arg callback."""
+    from trade_scanner_fh.earnings_history import _as_three_arg_failed_cb
+
+    two = []
+    adapted = _as_three_arg_failed_cb(lambda s, k: two.append((s, k)))
+    adapted("AAPL", "http_4xx", "HTTP 404")
+    assert two == [("AAPL", "http_4xx")]
+
+    three = []
+    adapted = _as_three_arg_failed_cb(
+        lambda s, k, d: three.append((s, k, d)))
+    adapted("MSFT", "network", "ReadTimeout")
+    assert three == [("MSFT", "network", "ReadTimeout")]
+
+    assert _as_three_arg_failed_cb(None) is None
+
+    def raises_type_error(s, k, d):
+        raise TypeError("from inside the callback")
+    adapted = _as_three_arg_failed_cb(raises_type_error)
+    with pytest.raises(TypeError):
+        adapted("X", "y", "z")   # must propagate, not be retried as 2-arg
+
+
+def test_star_args_callback_is_treated_as_three_arg():
+    from trade_scanner_fh.earnings_history import _as_three_arg_failed_cb
+    seen = []
+    adapted = _as_three_arg_failed_cb(lambda *a: seen.append(a))
+    adapted("AAPL", "network", "ReadTimeout")
+    assert seen == [("AAPL", "network", "ReadTimeout")]

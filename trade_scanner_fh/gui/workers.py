@@ -932,6 +932,11 @@ class ZacksFillWorker(QThread):
     # (legitimate, blacklist candidates) from Imperva blocks (cookie
     # refresh needed) from network glitches.
     failure_breakdown = pyqtSignal(dict)
+    # Per-TICKER specifics for the same run: {symbol: "HTTP 404"}. The
+    # breakdown above says which bucket a ticker landed in; this says what
+    # actually happened to it, which is the difference between "38 transient
+    # errors" and "31 of them are 404s that will never succeed".
+    failure_details = pyqtSignal(dict)
 
     def __init__(
         self,
@@ -990,12 +995,17 @@ class ZacksFillWorker(QThread):
         # the fill, emitted via failure_breakdown signal at end. Keys
         # are FAIL_* sentinels; values are ticker lists.
         self._failures_by_kind: dict[str, list[str]] = {}
+        # {symbol: detail} for the same run — see the failure_details signal.
+        self._failure_details: dict[str, str] = {}
 
-    def _on_ticker_failed(self, symbol: str, kind: str):
+    def _on_ticker_failed(
+        self, symbol: str, kind: str, detail: "str | None" = None,
+    ):
         """Worker-thread callback invoked once per failed ticker by
         `_fill_via_zacks` via the `failed_cb` parameter. Stashes the
         symbol into `_failures_by_kind[kind]` so we can surface a
-        breakdown to the GUI at end of run.
+        breakdown to the GUI at end of run, and the optional `detail`
+        into `_failure_details[symbol]` for the per-ticker view.
 
         Wrapped in try/except as belt-and-suspenders: the fill loop
         already catches exceptions from this callback (per the
@@ -1007,6 +1017,8 @@ class ZacksFillWorker(QThread):
         try:
             bucket = self._failures_by_kind.setdefault(kind, [])
             bucket.append(symbol)
+            if detail:
+                self._failure_details[symbol] = str(detail)
         except Exception as exc:
             log.warning("_on_ticker_failed(%s, %s) raised: %s",
                         symbol, kind, exc)
@@ -1162,11 +1174,20 @@ class ZacksFillWorker(QThread):
                     failed_cb=self._on_ticker_failed,
                 )
 
-            # Per spec §5.2 step 4 / §4.2: belt-and-suspenders reconcile
-            # of every candidate touched in this run, even ones that
-            # errored — keeps earnings_dates.parquet aligned.
-            if candidates:
-                reconcile_earnings_dates(affected_tickers=candidates)
+            # NO reconcile here. Every zacks fill path runs through
+            # `_fill_via_zacks`, which ends in `_finalize_fill` -> a reconcile
+            # of the tickers that actually gained rows. This spot used to
+            # reconcile the whole candidate list again "belt-and-suspenders per
+            # spec §5.2 step 4", which cost a second full read/recompute/write
+            # of earnings_dates.parquet on every fill and could never add
+            # anything: a ticker that errored gained no history rows, so
+            # reconciling it is a no-op. Observed 2026-09-18 — two reconciles
+            # five seconds apart, both reporting z=1, y=72, aug=0.
+            #
+            # It was not a crash guard either, despite the name: it sits on the
+            # success path, so a fill that RAISED skipped it entirely and went
+            # straight to `except`. That is the case where `_finalize_fill`
+            # genuinely never ran, so the reconcile now lives there instead.
 
             # Surface the per-kind breakdown before finished — the
             # GUI's "Show Last Zacks Failures" menu reads it.
@@ -1179,6 +1200,7 @@ class ZacksFillWorker(QThread):
                     f"Zacks fill failures by kind: {breakdown_summary}"
                 )
             self.failure_breakdown.emit(dict(self._failures_by_kind))
+            self.failure_details.emit(dict(self._failure_details))
 
             self.log_msg.emit(
                 f"Zacks fill done: {filled} filled, {errors} errors "
@@ -1188,9 +1210,22 @@ class ZacksFillWorker(QThread):
         except Exception as exc:
             log.error("ZacksFillWorker crashed: %s", exc, exc_info=True)
             self.log_msg.emit(f"Zacks fill error: {exc}")
+            # The fill raised before `_finalize_fill` could reconcile, but
+            # per-flush saves may already have landed rows on disk. Reconcile
+            # what was in flight so earnings_dates.parquet isn't left behind
+            # the history it was built from. Never allowed to mask the
+            # original error.
+            try:
+                if self._last_candidates:
+                    reconcile_earnings_dates(
+                        affected_tickers=list(self._last_candidates)
+                    )
+            except Exception:
+                log.debug("post-crash reconcile failed", exc_info=True)
             # Surface partial breakdown captured before the crash so
             # the user can still see what was hit.
             self.failure_breakdown.emit(dict(self._failures_by_kind))
+            self.failure_details.emit(dict(self._failure_details))
             # Audit L9: surface the candidate list that was in flight
             # when the crash happened so the slot can still report which
             # tickers were attempted (and the GUI can offer a retry).

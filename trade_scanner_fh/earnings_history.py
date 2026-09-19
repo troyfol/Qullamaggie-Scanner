@@ -66,7 +66,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -1168,29 +1168,102 @@ def find_cross_source_disagreements(
     )
 
 
-def _comparable_slot_count(df: Optional[pd.DataFrame]) -> int:
-    """Number of ``(ticker, period_ending)`` slots carrying more than one
-    SOURCE — the only slots ``find_cross_source_disagreements`` can evaluate.
+def _slot_key(tickers: pd.Series, periods: pd.Series) -> pd.Series:
+    """``ticker|YYYY-MM-DD`` join key for one (ticker, period_ending) slot.
 
-    Zero means the scan had nothing to compare, which is emphatically NOT the
-    same as "compared everything and found it consistent". See
+    The disagreement CSV round-trips through text, so a slot read back off
+    disk carries a *string* period_ending while a freshly-scanned one carries
+    a Timestamp. Both sides are normalised through this helper so the merge in
+    ``report_cross_source_disagreements`` compares like with like — without it
+    every prior row looks "not evaluated" and the report grows forever.
+    """
+    tk = tickers.astype(str).str.strip().str.upper()
+    pe = pd.to_datetime(periods, errors="coerce").dt.strftime("%Y-%m-%d")
+    return tk.str.cat(pe, sep="|", na_rep="")
+
+
+def _comparable_slots(df: Optional[pd.DataFrame]) -> set[str]:
+    """The ``(ticker, period_ending)`` slot keys carrying more than one
+    SOURCE — the only slots ``find_cross_source_disagreements`` can evaluate,
+    and therefore the only slots a given save is entitled to an opinion about.
+
+    An empty set means the scan had nothing to compare, which is emphatically
+    NOT the same as "compared everything and found it consistent". See
     ``report_cross_source_disagreements`` for why the difference matters.
     """
     if df is None or df.empty:
-        return 0
+        return set()
     if not {"ticker", "period_ending", "source"}.issubset(df.columns):
-        return 0
+        return set()
     pe = pd.to_datetime(df["period_ending"], errors="coerce")
     ok = pe.notna()
     if not ok.any():
-        return 0
+        return set()
     key = pd.DataFrame({
-        "ticker": df.loc[ok, "ticker"].astype(str),
-        "period_ending": pe.loc[ok],
+        "slot": _slot_key(df.loc[ok, "ticker"], pe.loc[ok]),
         "source": df.loc[ok, "source"].astype(str).str.lower(),
     }).drop_duplicates()
-    per_slot = key.groupby(["ticker", "period_ending"], sort=False)["source"].size()
-    return int((per_slot > 1).sum())
+    per_slot = key.groupby("slot", sort=False)["source"].size()
+    return set(per_slot.loc[per_slot > 1].index.astype(str))
+
+
+def _comparable_slot_count(df: Optional[pd.DataFrame]) -> int:
+    """Count of ``_comparable_slots`` — kept as the narrow numeric form used
+    in log lines and by the existing tests."""
+    return len(_comparable_slots(df))
+
+
+def _merge_disagreement_report(
+    prior: Optional[pd.DataFrame],
+    found: pd.DataFrame,
+    evaluated_slots: set[str],
+) -> pd.DataFrame:
+    """Fold this save's findings into the standing report.
+
+    A save only ever compared the slots in ``evaluated_slots`` (the ones its
+    own frame carried on more than one source). Those slots it may speak for:
+    whatever it found replaces whatever was on file. Every OTHER prior row is
+    carried forward untouched, because this save had no view of it at all.
+
+    That scoping is the whole fix. The previous version wrote the scan result
+    over the entire file whenever the frame had *any* comparable slot, so in a
+    concurrent smart refresh the source that finalized LAST — typically with a
+    handful of freshly-fetched rows and nothing contested among them — spoke
+    for the whole store and blanked the other source's findings.
+    """
+    cols = DISAGREEMENT_COLUMNS
+    found = found if found is not None else pd.DataFrame(columns=cols)
+    if prior is None or prior.empty:
+        keep = pd.DataFrame(columns=cols)
+    else:
+        prior = prior.reindex(columns=cols)
+        prior_slots = _slot_key(prior["ticker"], prior["period_ending"])
+        # Drop only the rows this save actually re-examined; it has no
+        # opinion on the rest and must not clear them.
+        keep = prior.loc[~prior_slots.isin(evaluated_slots)]
+    parts = [f for f in (keep, found.reindex(columns=cols))
+             if f is not None and not f.empty]
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    out = pd.concat(parts, ignore_index=True)
+    out = out.drop_duplicates(subset=["ticker", "period_ending",
+                                      "source_a", "source_b"], keep="last")
+    return out.sort_values(["ticker", "period_ending"],
+                           kind="stable").reset_index(drop=True)
+
+
+def _load_prior_disagreements() -> Optional[pd.DataFrame]:
+    """The report already on disk, or None when absent/unreadable. A damaged
+    file degrades to "no prior findings" rather than blocking the save."""
+    path = _disagreements_csv_path()
+    if not path.exists():
+        return None
+    try:
+        return pd.read_csv(path)
+    except (OSError, UnicodeDecodeError, ValueError, pd.errors.ParserError):
+        log.debug("prior %s unreadable — treating as empty",
+                  config.EARNINGS_DISAGREEMENTS_CSV_NAME)
+        return None
 
 
 def report_cross_source_disagreements(
@@ -1198,41 +1271,55 @@ def report_cross_source_disagreements(
 ) -> pd.DataFrame:
     """Run the disagreement scan and persist the result to
     scanner_data/earnings_disagreements.csv. Logs loudly when any
-    disagreement is found; silent when clean. Returns the report frame.
+    disagreement is found; silent when clean. Returns the persisted report.
 
-    The CSV is rewritten ONLY when the frame actually held cross-source slots
-    to evaluate. Without that gate the report destroyed itself: this runs on
-    every canonical save, immediately BEFORE ``dedupe_history`` collapses each
-    slot to one source — so the save that finds the disagreements also removes
-    the evidence, and the very next canonical save (whose frame comes off the
-    now-deduped parquet) sees zero comparable slots and overwrote the file with
-    a bare header. Observed 2026-08-13: 701 real finviz-vs-zacks findings
-    written at 19:59 were gone by 20:01, two minutes later, when the next fill
-    finalized. The findings were only recoverable because a rolling .autobak
-    still held the pre-dedup frame.
+    The report is a STANDING record merged across saves, not a snapshot of the
+    last one — see ``_merge_disagreement_report``. Each canonical save speaks
+    only for the slots its own frame could compare; everything else on file is
+    carried forward.
 
-    A frame with comparable slots and no disagreements still clears the file —
-    that is a genuine "previously reported, now resolved" signal, and the
-    self-clearing behaviour it provides is the reason the gate keys on
-    comparability rather than simply refusing to write an empty report.
+    Why any of this exists: the scan runs on every canonical save, immediately
+    BEFORE ``dedupe_history`` collapses each slot to one source — so the save
+    that finds the disagreements is also the one that removes the evidence.
+
+      * 2026-08-13: the next save's frame had ZERO comparable slots and
+        overwrote the file with a bare header. 701 real findings lived two
+        minutes. Fixed by refusing to write when nothing was comparable.
+      * 2026-09-18: the smart refresh runs finviz + zacks CONCURRENTLY, so two
+        sources finalize independently. Zacks wrote 221 findings at 21:23;
+        finviz finalized at 21:26 on the already-deduped store plus its own 64
+        fresh rows, which re-created a *few* comparable slots — enough to clear
+        the "nothing comparable" guard — found none of them contested, and
+        blanked the file. The count-based guard cannot catch this; only
+        scoping the write to the slots actually evaluated can.
+
+    A slot that WAS contested and is now clean still clears, because the save
+    that re-examined it is entitled to say so. That keeps the self-clearing
+    "previously reported, now resolved" behaviour the guard was protecting.
     """
     rep = find_cross_source_disagreements(history_df)
-    comparable = _comparable_slot_count(history_df)
-    if comparable == 0:
+    slots = _comparable_slots(history_df)
+    if not slots:
         log.debug(
             "cross-source disagreement scan skipped — no multi-source slots "
             "to compare; leaving %s as-is",
             config.EARNINGS_DISAGREEMENTS_CSV_NAME,
         )
         return rep
-    config.atomic_write_csv(rep, _disagreements_csv_path(), index=False)
+    merged = _merge_disagreement_report(_load_prior_disagreements(), rep, slots)
+    config.atomic_write_csv(merged, _disagreements_csv_path(), index=False)
+    # Gated on THIS pass's findings, not the standing total: the report now
+    # accumulates across saves, so keying the warning off `merged` would
+    # re-announce the same backlog on every canonical save forever. A pass
+    # that contributed nothing stays silent even while the file holds rows.
     if len(rep):
         log.warning(
-            "%d cross-source EPS disagreements across %d comparable slot(s) "
-            "— see %s",
-            len(rep), comparable, config.EARNINGS_DISAGREEMENTS_CSV_NAME,
+            "%d cross-source EPS disagreements on file (%d from this pass "
+            "across %d comparable slot(s)) — see %s",
+            len(merged), len(rep), len(slots),
+            config.EARNINGS_DISAGREEMENTS_CSV_NAME,
         )
-    return rep
+    return merged
 
 
 def get_ticker_history(ticker: str, history_df: Optional[pd.DataFrame]) -> pd.DataFrame:
@@ -1988,8 +2075,155 @@ def verify_integrity(
     return findings
 
 
+# ── Quarter-gap re-fetch ledger ────────────────────────────────────────
+#
+# Mirrors data_engine's OHLCV gap-attempt ledger deliberately — same file
+# shape, same "an unreadable ledger costs a repeated fetch, never data"
+# degradation, same recheck-window semantics. Two parallel implementations
+# beat one shared abstraction here only because the two stores are refreshed
+# by unrelated code paths; if a third appears, fold them together.
+
+def _earnings_gap_attempts_path() -> Path:
+    """Resolved at call time so tests that monkeypatch config.DATA_DIR are
+    honoured (mirrors the migration-flag path helpers)."""
+    return config.DATA_DIR / config.EARNINGS_GAP_ATTEMPTS_FILE
+
+
+def load_earnings_gap_attempts() -> dict:
+    """``{ticker: ISO date of last quarter-gap re-fetch attempt}``. Any
+    unreadable or malformed file degrades to "no attempts recorded"."""
+    import json
+    try:
+        data = json.loads(_earnings_gap_attempts_path().read_text(
+            encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if k}
+
+
+def record_earnings_gap_attempts(symbols, *, today=None) -> None:
+    """Stamp today against each ticker just offered to a re-fetch. Never
+    raises — losing the stamp costs a repeated attempt, nothing more."""
+    import json
+    if not symbols:
+        return
+    stamp = (today or date.today()).isoformat()
+    data = load_earnings_gap_attempts()
+    for s in symbols:
+        data[str(s)] = stamp
+    try:
+        config.atomic_write_text(
+            _earnings_gap_attempts_path(),
+            json.dumps(data, indent=1, sort_keys=True),
+        )
+    except OSError as exc:
+        log.debug("earnings gap attempt ledger write failed: %s", exc)
+
+
+def clear_earnings_gap_attempts(symbols=None) -> int:
+    """Forget attempts so the tickers become eligible again immediately.
+    ``None`` clears the whole ledger. Returns how many stamps were removed."""
+    import json
+    data = load_earnings_gap_attempts()
+    if not data:
+        return 0
+    if symbols is None:
+        removed = len(data)
+        data = {}
+    else:
+        wanted = {str(s) for s in symbols}
+        removed = sum(1 for k in data if k in wanted)
+        data = {k: v for k, v in data.items() if k not in wanted}
+    try:
+        config.atomic_write_text(
+            _earnings_gap_attempts_path(),
+            json.dumps(data, indent=1, sort_keys=True),
+        )
+    except OSError as exc:
+        log.debug("earnings gap attempt ledger clear failed: %s", exc)
+        return 0
+    return removed
+
+
+def _gap_attempt_is_recent(prior: Optional[str], cutoff: date) -> bool:
+    """True when `prior` is a parseable stamp strictly after `cutoff`. An
+    unparseable stamp counts as NOT recent, so a corrupted ledger re-offers
+    the ticker rather than hiding it forever."""
+    if not prior:
+        return False
+    try:
+        return datetime.fromisoformat(str(prior)).date() > cutoff
+    except (TypeError, ValueError):
+        return False
+
+
+def find_quarter_gap_tickers(
+    history_df: Optional[pd.DataFrame], *, years: Optional[int] = None,
+) -> "dict[str, int]":
+    """``{ticker: widest gap in days}`` for every ticker with a
+    >``_MAX_QUARTER_GAP_DAYS`` hole between consecutive quarters inside the
+    recent window. The single source of truth behind both the
+    ``missing_quarter`` integrity finding and the GUI's re-fetch action, so
+    the list offered can never drift from the list reported.
+    """
+    if history_df is None or history_df.empty:
+        return {}
+    if not {"ticker", "period_ending"}.issubset(history_df.columns):
+        return {}
+    span = years if years is not None else config.EARNINGS_GAP_CHECK_YEARS
+    cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(years=span)
+    pe = pd.to_datetime(history_df["period_ending"], errors="coerce")
+    recent = pd.DataFrame({
+        "ticker": history_df["ticker"].astype(str),
+        "period_ending": pe,
+    }).dropna()
+    recent = recent.loc[recent["period_ending"] >= cutoff]
+    if recent.empty:
+        return {}
+    recent = (recent.drop_duplicates()
+                    .sort_values(["ticker", "period_ending"], kind="stable"))
+    gap_days = recent.groupby("ticker", sort=False)["period_ending"].diff().dt.days
+    holed = recent.loc[gap_days > _MAX_QUARTER_GAP_DAYS].copy()
+    if holed.empty:
+        return {}
+    holed["gap_days"] = gap_days.loc[holed.index].astype(int)
+    worst = holed.groupby("ticker", sort=False)["gap_days"].max()
+    return {str(k): int(v) for k, v in worst.items()}
+
+
+def select_quarter_gap_refetches(
+    gaps: "dict[str, int]",
+    *,
+    limit: Optional[int] = None,
+    recheck_days: Optional[int] = None,
+    today=None,
+) -> list[str]:
+    """Widest-hole-first, skipping anything re-fetched inside the recheck
+    window. ``limit=None`` means no cap — a quarter-gap re-fetch is a
+    deliberate, user-initiated action against a list the user just saw, not a
+    background sweep, so it does not need the OHLCV path's per-run ceiling."""
+    if not gaps:
+        return []
+    days = (recheck_days if recheck_days is not None
+            else config.EARNINGS_GAP_RECHECK_DAYS)
+    ref = today or date.today()
+    cutoff = ref - timedelta(days=int(days))
+    attempts = load_earnings_gap_attempts()
+    eligible = [
+        (sym, width) for sym, width in gaps.items()
+        if not _gap_attempt_is_recent(attempts.get(str(sym)), cutoff)
+    ]
+    eligible.sort(key=lambda kv: (-kv[1], str(kv[0])))
+    if limit is not None and limit >= 0:
+        eligible = eligible[:int(limit)]
+    return [s for s, _ in eligible]
+
+
 def _quarter_gap_finding(
     history_df: pd.DataFrame, *, years: Optional[int] = None,
+    apply_attempt_ledger: bool = True,
 ) -> Optional[IntegrityFinding]:
     """Flag tickers with a >135-day hole between consecutive quarters inside
     the recent window. Returns None when clean.
@@ -2001,52 +2235,55 @@ def _quarter_gap_finding(
     quarter followed by nothing. Inside a 3-year window a hole bracketed by
     real quarters on BOTH sides is a much stronger indication that something
     was lost.
+
+    ``apply_attempt_ledger`` (default on) hides tickers re-fetched within
+    ``config.EARNINGS_GAP_RECHECK_DAYS``. Without it the finding is a
+    standing ~525-ticker wall that reports the same names every run whether or
+    not anything was done about them, so it can never show progress and the
+    legitimately-gapped names (dark companies, fiscal-year changes) drown the
+    ones actually worth chasing. Pass False for the unfiltered truth.
     """
-    if history_df is None or history_df.empty:
+    gaps = find_quarter_gap_tickers(history_df, years=years)
+    if not gaps:
         return None
-    if not {"ticker", "period_ending"}.issubset(history_df.columns):
-        return None
-
     span = years if years is not None else config.EARNINGS_GAP_CHECK_YEARS
-    cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(years=span)
-    pe = pd.to_datetime(history_df["period_ending"], errors="coerce")
-    recent = pd.DataFrame({
-        "ticker": history_df["ticker"].astype(str),
-        "period_ending": pe,
-    }).dropna()
-    recent = recent.loc[recent["period_ending"] >= cutoff]
-    if recent.empty:
-        return None
 
-    recent = (recent.drop_duplicates()
-                    .sort_values(["ticker", "period_ending"], kind="stable"))
-    gap_days = recent.groupby("ticker", sort=False)["period_ending"].diff().dt.days
-    holed = recent.loc[gap_days > _MAX_QUARTER_GAP_DAYS].copy()
-    if holed.empty:
-        return None
+    resting = 0
+    if apply_attempt_ledger:
+        eligible = set(select_quarter_gap_refetches(gaps))
+        resting = len(gaps) - len(eligible)
+        gaps = {t: w for t, w in gaps.items() if t in eligible}
+        if not gaps:
+            return None
 
-    holed["gap_days"] = gap_days.loc[holed.index].astype(int)
-    tickers = sorted(holed["ticker"].unique())
+    tickers = sorted(gaps)
     sample = [
-        {"ticker": r.ticker,
-         "period_ending": r.period_ending.isoformat(),
-         "gap_days": int(r.gap_days)}
-        for r in holed.nlargest(5, "gap_days").itertuples(index=False)
+        {"ticker": t, "gap_days": int(gaps[t])}
+        for t in sorted(gaps, key=lambda k: -gaps[k])[:5]
     ]
+    rested_note = (
+        f" A further {resting} ticker(s) are resting — they were re-fetched "
+        f"within the last {config.EARNINGS_GAP_RECHECK_DAYS} days and are "
+        f"hidden until that window expires."
+        if resting else ""
+    )
     return IntegrityFinding(
         check="missing_quarter",
         severity="warning",
-        affected_rows=int(len(holed)),
+        affected_rows=int(len(tickers)),
         sample=sample,
         auto_fixable=False,
         description=(
             f"{len(tickers)} ticker(s) have a >{_MAX_QUARTER_GAP_DAYS}-day hole "
             f"between consecutive quarters inside the last {span} year(s) — a "
             f"quarter that should be there is missing. NOT auto-fixable: the "
-            f"data has to be re-fetched, so run a targeted/gap fill for these "
-            f"tickers. Some gaps are legitimate (a company that went dark, a "
-            f"fiscal-year change), so treat this as a list to investigate "
-            f"rather than a defect count."
+            f"data has to be re-fetched. Use the Re-fetch button below to run "
+            f"a targeted finviz + zacks fill against exactly these tickers; "
+            f"each one is then rested for "
+            f"{config.EARNINGS_GAP_RECHECK_DAYS} days so the list shrinks to "
+            f"what you have not yet tried. Some gaps are legitimate (a company "
+            f"that went dark, a fiscal-year change), so treat this as a list "
+            f"to investigate rather than a defect count.{rested_note}"
         ),
     )
 
@@ -2256,6 +2493,36 @@ def _update_earnings_dates_for_tickers(
 # ──────────────────────────────────────────────────────────────────────
 # Bulk + targeted fills via Zacks
 # ──────────────────────────────────────────────────────────────────────
+
+def _as_three_arg_failed_cb(failed_cb):
+    """Return ``failed_cb`` adapted to ``(symbol, kind, detail)``, or None.
+
+    The fill loop learned to report a per-failure detail string ("HTTP 404",
+    "ReadTimeout") alongside the coarse kind. Plenty of existing callers pass a
+    two-argument callback, so the arity is resolved once here rather than by
+    catching TypeError at each call — which would misread a TypeError thrown
+    from inside a three-arg callback as an arity mismatch.
+
+    Anything unintrospectable (a C callable, a mock) is assumed to take the
+    new three-argument form and falls back to two on the first TypeError.
+    """
+    if failed_cb is None:
+        return None
+    import inspect
+    try:
+        params = inspect.signature(failed_cb).parameters.values()
+    except (TypeError, ValueError):
+        return failed_cb
+    if any(p.kind is p.VAR_POSITIONAL for p in params):
+        return failed_cb
+    positional = sum(
+        1 for p in params
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    )
+    if positional >= 3:
+        return failed_cb
+    return lambda sym, kind, _detail, _cb=failed_cb: _cb(sym, kind)
+
 
 def _row_to_history_dict(row: dict, ticker: str, source: str, now: datetime) -> dict:
     """Convert one zacks_scraper row dict into an earnings_history row.
@@ -2715,6 +2982,13 @@ def _fill_via_zacks(
 
     log.info("%s: %d tickers to process", label, len(work))
 
+    # Normalise `failed_cb` to a 3-arg (symbol, kind, detail) form once.
+    # Older callers — and a pile of test doubles — take (symbol, kind), and
+    # probing the signature here beats try/except around the call: a TypeError
+    # raised INSIDE a 3-arg callback would otherwise look like an arity
+    # mismatch and get silently retried with two.
+    _failed3 = _as_three_arg_failed_cb(failed_cb)
+
     # Cap consumer rows on period_ending, same as finviz/finnhub, so the
     # per-(ticker, period_ending) dedup sees an identical date window across
     # sources (the Zacks scraper bounds by `years` on the report date, which
@@ -2800,10 +3074,11 @@ def _fill_via_zacks(
                 # vs Imperva blocks vs network errors). `last_failure_kind`
                 # may be None for unexpected exceptions; we tag those
                 # as "unknown" so the caller can still see them.
-                if failed_cb is not None:
+                if _failed3 is not None:
                     kind = session.last_failure_kind or "unknown"
+                    detail = getattr(session, "last_failure_detail", None)
                     try:
-                        failed_cb(sym, kind)
+                        _failed3(sym, kind, detail)
                     except Exception:
                         pass  # never let failed_cb crash the fill
             else:

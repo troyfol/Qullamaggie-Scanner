@@ -355,23 +355,47 @@ class EarningsRefreshCoordinator(QObject):
             return self.win._kick_off_nasdaq_auto_refresh()
         return False
 
-    def _trim_all_blocked_candidates(self, candidates: list[str]) -> list[str]:
-        """Drop candidates that EVERY earnings source has permanently
-        blacklisted (finnhub ∩ finviz ∩ zacks) — no source can refresh them,
-        so they are pure dead weight. Without this, no-history names no source
-        covers (warrants, preferreds, foreign OTC, SPACs) re-trip Rule A every
-        launch: they inflate the flagged count ~20×, false-fire the bulk-run
-        warning, and make a prompt promise far more work than the per-source
-        workers (which skip every one of them) actually queue. `candidates`
-        already excludes the OHLCV blacklist + ETF/ADR, so the raw per-source
-        blacklist intersection is exactly "blocked everywhere". Returns the
-        filtered list and logs how many were trimmed. Shared by the auto
-        (launch) and manual ("Run Earnings Smart Refresh Now") paths."""
-        all_blocked = (
-            getattr(self.win, "_finnhub_blacklist", set())
-            & getattr(self.win, "_finviz_blacklist", set())
-            & getattr(self.win, "_zacks_blacklist", set())
-        )
+    # Which MainWindow attribute holds each source's permanent skip set.
+    _SOURCE_BLACKLIST_ATTRS = {
+        "finviz": "_finviz_blacklist",
+        "zacks": "_zacks_blacklist",
+        "finnhub": "_finnhub_blacklist",
+    }
+
+    def _trim_all_blocked_candidates(
+        self, candidates: list[str], sources: "tuple[str, ...] | None" = None,
+    ) -> list[str]:
+        """Drop candidates that every source in ``sources`` has permanently
+        blacklisted — no source that is about to RUN can refresh them, so they
+        are pure dead weight. Without this, no-history names no source covers
+        (warrants, preferreds, foreign OTC, SPACs) re-trip Rule A every launch:
+        they inflate the flagged count ~20×, false-fire the bulk-run warning,
+        and make a prompt promise far more work than the per-source workers
+        (which skip every one of them) actually queue. `candidates` already
+        excludes the OHLCV blacklist + ETF/ADR, so the raw per-source blacklist
+        intersection is exactly "blocked everywhere". Returns the filtered list
+        and logs how many were trimmed.
+
+        ``sources`` names the sources this run will actually start; it defaults
+        to all three. Passing the real set matters — the intersection is only
+        meaningful over sources that run. The auto cycle excludes finnhub
+        (config.FINNHUB_IN_AUTO_REFRESH=False), so folding finnhub's blacklist
+        into the AND meant a ticker finviz and zacks had both given up on
+        survived the trim whenever finnhub happened not to list it. Measured on
+        the live store 2026-09-18: 1,090 such tickers, every one of them
+        counted into the announced "N due" and then silently dropped by both
+        workers — the exact over-promise this helper exists to prevent.
+        """
+        names = tuple(sources) if sources else tuple(self._SOURCE_BLACKLIST_ATTRS)
+        sets = [
+            getattr(self.win, self._SOURCE_BLACKLIST_ATTRS[n], set())
+            for n in names if n in self._SOURCE_BLACKLIST_ATTRS
+        ]
+        if not sets:
+            return list(candidates)
+        all_blocked = set(sets[0])
+        for s in sets[1:]:
+            all_blocked &= s
         if not all_blocked:
             return list(candidates)
         before_n = len(candidates)
@@ -380,8 +404,9 @@ class EarningsRefreshCoordinator(QObject):
         if trimmed:
             self.win.log_panel.write_line(
                 f"Earnings smart refresh: skipped {trimmed:,} no-history "
-                f"ticker(s) all three sources have blacklisted "
-                f"(uncoverable — warrants / preferreds / foreign OTC / SPACs)."
+                f"ticker(s) every running source ({' + '.join(names)}) has "
+                f"blacklisted (uncoverable — warrants / preferreds / foreign "
+                f"OTC / SPACs)."
             )
         return filtered
 
@@ -412,8 +437,13 @@ class EarningsRefreshCoordinator(QObject):
         cand_skip = set(win._blacklist) | win._etf_adr_auto_skip_set()
         from ..earnings_history import find_smart_refresh_candidates
         candidates = find_smart_refresh_candidates(universe_syms, cand_skip)
-        # Drop names every source has permanently blacklisted (see helper).
-        candidates = win._trim_all_blocked_candidates(candidates)
+        # Drop names every RUNNING source has permanently blacklisted. The
+        # auto cycle is finviz + zacks only, so finnhub's list must not
+        # participate in the AND (see helper).
+        auto_sources = ("finviz", "zacks") + (
+            ("finnhub",) if config.FINNHUB_IN_AUTO_REFRESH else ()
+        )
+        candidates = win._trim_all_blocked_candidates(candidates, auto_sources)
         if not candidates:
             return
 
@@ -535,10 +565,13 @@ class EarningsRefreshCoordinator(QObject):
         cand_skip = set(win._blacklist) | win._etf_adr_auto_skip_set()
         from ..earnings_history import find_smart_refresh_candidates
         candidates = find_smart_refresh_candidates(universe_syms, cand_skip)
-        # Apply the same all-three-sources-blocked trim the auto path uses, so
-        # the manual prompt's count reflects what will actually be fetched
-        # (not thousands of permanently-uncoverable names every source skips).
-        candidates = win._trim_all_blocked_candidates(candidates)
+        # Same trim the auto path uses, so the manual prompt's count reflects
+        # what will actually be fetched (not thousands of permanently-
+        # uncoverable names every source skips). The manual path DOES start
+        # finnhub, so all three legitimately participate in the intersection.
+        candidates = win._trim_all_blocked_candidates(
+            candidates, ("finviz", "zacks", "finnhub"),
+        )
 
         if candidates:
             threshold = config.ZACKS_SMART_REFRESH_BULK_THRESHOLD
@@ -781,6 +814,8 @@ class EarningsRefreshCoordinator(QObject):
         )
         win._zacks_worker.finished.connect(win._on_zacks_done)
         win._zacks_worker.failure_breakdown.connect(win._on_zacks_failures)
+        win._zacks_worker.failure_details.connect(
+            win._on_zacks_failure_details)
         win._zacks_worker.imperva_block_detected.connect(
             win._on_imperva_block_detected
         )
@@ -812,12 +847,20 @@ class EarningsRefreshCoordinator(QObject):
             from ..zacks_scraper import (
                 FAIL_BLOCKED, FAIL_NOT_FOUND,
                 FAIL_HTTP_ERROR, FAIL_PARSE_ERROR,
+                FAIL_REJECTED_SYMBOL, FAIL_NETWORK, FAIL_HTTP_4XX,
+                FAIL_HTTP_429, FAIL_HTTP_5XX, FAIL_OVERSIZED,
+                TRANSIENT_FAIL_KINDS, PERMANENT_FAIL_KINDS,
             )
             n_block = len(breakdown.get(FAIL_BLOCKED, []))
             n_nf = len(breakdown.get(FAIL_NOT_FOUND, []))
             n_http = len(breakdown.get(FAIL_HTTP_ERROR, []))
             n_parse = len(breakdown.get(FAIL_PARSE_ERROR, []))
             n_unk = len(breakdown.get("unknown", []))
+            n_transient = sum(
+                len(breakdown.get(k, [])) for k in TRANSIENT_FAIL_KINDS)
+            n_permanent = sum(
+                len(breakdown.get(k, [])) for k in PERMANENT_FAIL_KINDS)
+            n_oversized = len(breakdown.get(FAIL_OVERSIZED, []))
 
             added = int(getattr(win, "_auto_added_zacks_skips", 0))
             if n_nf:
@@ -832,9 +875,47 @@ class EarningsRefreshCoordinator(QObject):
                     f"  ↳ {n_block} Imperva block(s) "
                     "(auto-recovered with cookie refresh)"
                 )
+            # Split out by what the failure actually MEANS. The old single
+            # "HTTP / network error(s) (transient)" line asserted something
+            # nobody had measured: on 2026-09-18 it covered 38 failures that
+            # were mostly 404s — permanent, not transient at all.
+            if n_permanent:
+                parts = []
+                for k, word in ((FAIL_HTTP_4XX, "HTTP 4xx"),
+                                (FAIL_REJECTED_SYMBOL, "rejected symbol")):
+                    c = len(breakdown.get(k, []))
+                    if c:
+                        parts.append(f"{c} {word}")
+                win.log_panel.write_line(
+                    f"  ↳ {n_permanent} PERMANENT failure(s) "
+                    f"({', '.join(parts)}) — these will fail the same way "
+                    f"next run; consider the Zacks skip list"
+                )
+            if n_transient:
+                parts = []
+                for k, word in ((FAIL_NETWORK, "network"),
+                                (FAIL_HTTP_5XX, "HTTP 5xx"),
+                                (FAIL_HTTP_429, "HTTP 429 rate-limit")):
+                    c = len(breakdown.get(k, []))
+                    if c:
+                        parts.append(f"{c} {word}")
+                win.log_panel.write_line(
+                    f"  ↳ {n_transient} transient failure(s) "
+                    f"({', '.join(parts)}) — worth a retry"
+                )
+            if len(breakdown.get(FAIL_HTTP_429, [])):
+                win.log_panel.write_line(
+                    "     Rate-limited: raise the Zacks per-request delay "
+                    "rather than re-running immediately."
+                )
+            if n_oversized:
+                win.log_panel.write_line(
+                    f"  ↳ {n_oversized} oversized response(s) — almost "
+                    f"always a block page, not real content"
+                )
             if n_http:
                 win.log_panel.write_line(
-                    f"  ↳ {n_http} HTTP / network error(s) (transient)"
+                    f"  ↳ {n_http} unclassified HTTP error(s)"
                 )
             if n_parse:
                 win.log_panel.write_line(

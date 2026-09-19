@@ -403,3 +403,83 @@ def test_report_function_returns_frame(tmp_parquets):
     csv_rep = pd.read_csv(_csv_path(tmp_parquets))
     assert len(csv_rep) == 1
     assert csv_rep.iloc[0]["ticker"] == "AAPL"
+
+
+# ── 2026-09-18: concurrent finalize blanked the report ──────────────────
+
+def test_a_later_narrow_save_cannot_blank_another_sources_findings(tmp_parquets):
+    """The 2026-09-18 live failure, in miniature.
+
+    The smart refresh runs finviz + zacks CONCURRENTLY, so each finalizes on
+    its own. Zacks finalized first and wrote 221 findings. Finviz finalized
+    three minutes later on the already-deduped store plus its own freshly
+    fetched rows — which re-created a FEW comparable slots, none of them
+    contested. That was enough to clear the "nothing comparable" guard, so the
+    scan result (empty) was written over the whole file. All 221 were gone.
+
+    The later save must speak only for the slots it actually compared.
+    """
+    # Zacks finalizes: AAPL is contested, and the save dedups the store.
+    eh.save_earnings_history(pd.DataFrame([
+        _row("AAPL", "2026-03-01", "finviz", eps=1.00),
+        _row("AAPL", "2026-03-01", "zacks", eps=2.00),
+    ]))
+    assert len(pd.read_csv(_csv_path(tmp_parquets))) == 1
+
+    # Finviz finalizes: the deduped store, plus its own new rows for a
+    # DIFFERENT ticker that agree with each other. Comparable > 0, contested
+    # == 0 — precisely the shape that used to blank the file.
+    on_disk = eh.load_earnings_history()
+    eh.save_earnings_history(pd.concat([on_disk, pd.DataFrame([
+        _row("MSFT", "2026-03-01", "finviz", eps=3.00),
+        _row("MSFT", "2026-03-01", "zacks", eps=3.00),
+    ])], ignore_index=True))
+
+    rep = pd.read_csv(_csv_path(tmp_parquets))
+    assert len(rep) == 1, "a later narrow save blanked the standing report"
+    assert rep.iloc[0]["ticker"] == "AAPL"
+
+
+def test_a_save_that_re_examines_a_slot_may_clear_it(tmp_parquets):
+    """The other half: scoping must not make findings immortal. A save that
+    genuinely re-compared the contested slot and found it clean still clears
+    that row — the self-clearing 'previously reported, now resolved' signal."""
+    eh.save_earnings_history(pd.DataFrame([
+        _row("AAPL", "2026-03-01", "finviz", eps=1.00),
+        _row("AAPL", "2026-03-01", "zacks", eps=2.00),
+    ]))
+    assert len(pd.read_csv(_csv_path(tmp_parquets))) == 1
+
+    # Same slot, both sources, now agreeing.
+    eh.save_earnings_history(pd.DataFrame([
+        _row("AAPL", "2026-03-01", "finviz", eps=2.00, updated="2026-07-01"),
+        _row("AAPL", "2026-03-01", "zacks", eps=2.00, updated="2026-07-01"),
+    ]))
+    assert pd.read_csv(_csv_path(tmp_parquets)).empty, (
+        "a re-examined slot that is now clean should clear"
+    )
+
+
+def test_findings_from_two_sources_accumulate(tmp_parquets):
+    """Two independent finalizes, two different contested tickers — the
+    report must end up holding BOTH, which the old last-writer-wins
+    behaviour could never do."""
+    eh.save_earnings_history(pd.DataFrame([
+        _row("AAPL", "2026-03-01", "finviz", eps=1.00),
+        _row("AAPL", "2026-03-01", "zacks", eps=2.00),
+    ]))
+    eh.save_earnings_history(pd.DataFrame([
+        _row("TSLA", "2026-03-01", "finviz", eps=5.00),
+        _row("TSLA", "2026-03-01", "zacks", eps=9.00),
+    ]))
+    rep = pd.read_csv(_csv_path(tmp_parquets))
+    assert sorted(rep["ticker"]) == ["AAPL", "TSLA"]
+
+
+def test_slot_key_matches_across_the_csv_round_trip():
+    """The merge compares a freshly-scanned slot (Timestamp period_ending)
+    against one read back off disk (string). If those keys don't match, every
+    prior row looks un-evaluated and the report grows without bound."""
+    fresh = eh._slot_key(pd.Series(["aapl"]), pd.Series([pd.Timestamp("2026-03-01")]))
+    from_csv = eh._slot_key(pd.Series(["AAPL"]), pd.Series(["2026-03-01"]))
+    assert fresh.iloc[0] == from_csv.iloc[0] == "AAPL|2026-03-01"

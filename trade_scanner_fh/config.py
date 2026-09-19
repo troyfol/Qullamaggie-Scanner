@@ -866,6 +866,37 @@ OHLCV_ANOMALIES_CSV_NAME = "ohlcv_anomalies.csv"
 # 2,700 gap events across 1,262 of 4,858 tickers store-wide, largely benign.
 EARNINGS_GAP_CHECK_YEARS = 3
 
+# -- Quarter-gap re-fetch ledger -------------------------------------------
+# `missing_quarter` is a list to INVESTIGATE, not a defect count: a fair share
+# of the holes are legitimate (a company went dark, a fiscal-year change, a
+# genuine non-filer). Re-fetching those changes nothing, so without a memory
+# of what has already been tried the same ~525 tickers are re-offered on every
+# single integrity check forever, and the count never tells you whether you
+# are making progress.
+#
+# One quarter is the natural rest period: a ticker whose hole is real cannot
+# gain the missing quarter until its next filing, so re-asking sooner is pure
+# traffic. 100 days is a quarter plus the usual reporting lag. Same shape as
+# OHLCV_GAP_RECHECK_DAYS / SKIP_RECHECK_DAYS.
+EARNINGS_GAP_RECHECK_DAYS = 100
+EARNINGS_GAP_ATTEMPTS_FILE = ".earnings_gap_attempts.json"
+
+# -- Series filters: missing-quarter bridging allowance --------------------
+# How many consecutive missing fiscal quarters a run may bridge, per filter
+# TYPE. The three types have always disagreed about this and the disagreement
+# was hardcoded: `compute_consecutive_beats` broke on ANY hole, while the
+# growth and accelerating filters bridged exactly one (spec 3.1). v6.3.0 makes
+# it a setting per type (Settings -> Advanced...), with defaults that reproduce
+# each type's prior behaviour exactly, so an upgrade changes nothing until the
+# user chooses otherwise.
+#
+# 0 = any missing quarter ends the run. 1 = one may be skipped. Raising it
+# past 1 makes a "consecutive" run increasingly notional — a value of 4 lets a
+# run span a full year of non-reporting — which is why the range is capped.
+SERIES_MAX_BRIDGED_BEATS = 0
+SERIES_MAX_BRIDGED_GROWTH = 1
+SERIES_MAX_BRIDGED_ACCEL = 1
+
 # -- Universe staleness (days) ---------------------------------------------
 UNIVERSE_STALE_DAYS = 7
 # Refuse to write a universe.csv that shrank by more than this percentage
@@ -1375,6 +1406,9 @@ _USER_CONFIG_DEFAULTS: dict = {
     "EARNINGS_HISTORY_YEARS": EARNINGS_HISTORY_YEARS,
     "REFERENCE_TICKERS": tuple(REFERENCE_TICKERS),
     "PREFETCH_OHLCV_AT_LAUNCH": PREFETCH_OHLCV_AT_LAUNCH,
+    "SERIES_MAX_BRIDGED_BEATS": SERIES_MAX_BRIDGED_BEATS,
+    "SERIES_MAX_BRIDGED_GROWTH": SERIES_MAX_BRIDGED_GROWTH,
+    "SERIES_MAX_BRIDGED_ACCEL": SERIES_MAX_BRIDGED_ACCEL,
 }
 
 # Clamp ranges for the integer overrides (years of history). Public — the
@@ -1383,7 +1417,21 @@ _USER_CONFIG_DEFAULTS: dict = {
 USER_CONFIG_INT_RANGES: dict = {
     "OHLCV_HISTORY_YEARS": (1, 25),
     "EARNINGS_HISTORY_YEARS": (1, 25),
+    # 4 is a deliberate ceiling: bridging a full year of missing quarters is
+    # about as far as "consecutive" can be stretched before the word stops
+    # meaning anything.
+    "SERIES_MAX_BRIDGED_BEATS": (0, 4),
+    "SERIES_MAX_BRIDGED_GROWTH": (0, 4),
+    "SERIES_MAX_BRIDGED_ACCEL": (0, 4),
 }
+
+# The int overrides that are plain clamped ints (as opposed to the history
+# depths, which have their own coercion path). Iterated by the loader.
+SERIES_BRIDGE_KEYS: tuple = (
+    "SERIES_MAX_BRIDGED_BEATS",
+    "SERIES_MAX_BRIDGED_GROWTH",
+    "SERIES_MAX_BRIDGED_ACCEL",
+)
 
 # Plausible exchange ticker: leading letter, then letters/digits/dot/hyphen,
 # 10 chars max (covers BRK.B / BF-B style class shares). \Z (not $) so a
@@ -1484,6 +1532,21 @@ def _validated_user_overrides(raw: dict) -> dict:
                 )
             else:
                 out[key] = val
+    for key in SERIES_BRIDGE_KEYS:
+        if key not in raw:
+            continue
+        lo, hi = USER_CONFIG_INT_RANGES[key]
+        try:
+            val = int(raw[key])
+        except (TypeError, ValueError):
+            log.debug("user_config %s invalid (%r) — using default %r",
+                      key, raw[key], _USER_CONFIG_DEFAULTS[key])
+            continue
+        if not (lo <= val <= hi):
+            log.debug("user_config %s out of range (%r) — clamping to [%d, %d]",
+                      key, val, lo, hi)
+            val = max(lo, min(hi, val))
+        out[key] = val
     if "REFERENCE_TICKERS" in raw:
         val = _coerce_reference_tickers(raw["REFERENCE_TICKERS"])
         if val is None:

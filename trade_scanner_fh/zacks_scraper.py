@@ -66,6 +66,26 @@ FAIL_NOT_FOUND = "not_found"
 FAIL_HTTP_ERROR = "http_error"
 FAIL_PARSE_ERROR = "parse_error"
 
+# 2026-09-18: `http_error` was a single bucket collapsing five unrelated
+# outcomes, all logged at DEBUG so none of them reached the GUI. A run
+# reporting "38 HTTP / network error(s) (transient)" was therefore asserting
+# something nobody had measured — a rejected symbol is permanent, a 404 is
+# permanent, a 429 means back off, and only a RequestException is actually
+# transient. These split that bucket; `FAIL_HTTP_ERROR` stays as the
+# catch-all so any path not yet classified still lands somewhere known.
+FAIL_REJECTED_SYMBOL = "rejected_symbol"   # our own allowlist refused it
+FAIL_NETWORK = "network"                   # timeout / DNS / reset — transient
+FAIL_HTTP_4XX = "http_4xx"                 # 404 / 403 / 410 — permanent-ish
+FAIL_HTTP_429 = "http_429"                 # rate-limited — slow down
+FAIL_HTTP_5XX = "http_5xx"                 # server-side — retryable
+FAIL_OVERSIZED = "oversized"               # body past the sanity cap
+
+# Kinds that mean "stop asking for this ticker" vs "try again later". Used by
+# the GUI to phrase the summary honestly instead of calling everything
+# transient.
+TRANSIENT_FAIL_KINDS = frozenset({FAIL_NETWORK, FAIL_HTTP_5XX, FAIL_HTTP_429})
+PERMANENT_FAIL_KINDS = frozenset({FAIL_REJECTED_SYMBOL, FAIL_HTTP_4XX})
+
 # curl_cffi browser-impersonation profile. chrome131 is widely tested and
 # stable; bump to a newer profile (chrome146 etc.) only if Zacks's Imperva
 # starts flagging chrome131. Available profiles change with curl_cffi
@@ -1053,9 +1073,25 @@ class ZacksSession:
         # the failure was a real Imperva block, not "ticker not on Zacks"
         # / network glitch / parse hiccup. None when last fetch succeeded.
         self.last_failure_kind: Optional[str] = None
+        # Human-readable specifics for the last failure ("HTTP 404",
+        # "ConnectTimeout", "body 41.2 MB"). The kind says which bucket; this
+        # says what actually happened, and is what the GUI shows per ticker.
+        self.last_failure_detail: Optional[str] = None
+        # HTTP status of the last response, when there was one.
+        self.last_status_code: Optional[int] = None
         # Audit 2026-08-16: per-fetch merge drop counts (see
         # _merge_and_filter's `stats`). Volatile — read it after each fetch().
         self.last_merge_stats: dict = {}
+
+    def _set_failure(self, kind: Optional[str], detail: Optional[str] = None):
+        """Record one fetch outcome. `kind` buckets it for the tally and the
+        auto-pause / auto-blacklist heuristics; `detail` carries the specifics
+        a human needs ("HTTP 404", "ReadTimeout"). Passing kind=None clears
+        both, which is what a successful fetch does."""
+        self.last_failure_kind = kind
+        self.last_failure_detail = detail
+        if kind is None:
+            self.last_status_code = None
 
     def __enter__(self) -> "ZacksSession":
         # impersonate=<chrome version> is the secret sauce — libcurl
@@ -1133,21 +1169,44 @@ class ZacksSession:
         safe_symbol = config.url_safe_ticker(symbol)
         if not safe_symbol:
             log.warning("[%s] refusing implausible symbol", symbol)
-            self.last_failure_kind = FAIL_HTTP_ERROR
+            self._set_failure(FAIL_REJECTED_SYMBOL, "symbol failed allowlist")
             return None
         url = _BASE_URL.format(ticker=quote(safe_symbol, safe=""))
         cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(years=years)
 
         try:
             resp = self._session.get(url, timeout=self._timeout, allow_redirects=True)
-        except requests.RequestException as exc:
-            log.debug("[%s] HTTP error: %s", symbol, exc)
-            self.last_failure_kind = FAIL_HTTP_ERROR
+        except requests.RequestsError as exc:
+            # NOT `requests.RequestException`. This module's `requests` is
+            # curl_cffi's drop-in, which exports the base as `RequestsError`
+            # — the class is *internally* named RequestException, which is
+            # exactly why the wrong spelling read as correct. Evaluating a
+            # missing attribute in an `except` clause raises AttributeError at
+            # the moment an error actually occurs, so every network failure
+            # escaped this handler unclassified and landed in the fill loop's
+            # catch-all "unknown" bucket instead of being counted as network.
+            # Caught 2026-09-18 while splitting the http_error bucket.
+            # INFO, not DEBUG: this is the only record that the request was
+            # even attempted, and the per-kind tally alone can't tell a DNS
+            # failure from a read timeout.
+            log.info("[%s] network error: %s: %s",
+                     symbol, type(exc).__name__, exc)
+            self._set_failure(FAIL_NETWORK, type(exc).__name__)
             return None
 
         if resp.status_code != 200:
-            log.debug("[%s] HTTP %d", symbol, resp.status_code)
-            self.last_failure_kind = FAIL_HTTP_ERROR
+            code = int(resp.status_code)
+            self.last_status_code = code
+            if code == 429:
+                kind = FAIL_HTTP_429
+            elif 400 <= code < 500:
+                kind = FAIL_HTTP_4XX
+            elif code >= 500:
+                kind = FAIL_HTTP_5XX
+            else:
+                kind = FAIL_HTTP_ERROR
+            log.info("[%s] HTTP %d (%s)", symbol, code, kind)
+            self._set_failure(kind, f"HTTP {code}")
             return None
 
         text = resp.text
@@ -1157,9 +1216,10 @@ class ZacksSession:
         # buffer + a hundreds-of-millions-iteration scan (audit M23). Real
         # Zacks pages are tens of KB; 25 MB never trips on a legit page.
         if len(text) > config.ZACKS_MAX_RESPONSE_BYTES:
-            log.debug("[%s] response too large (%d chars) — rejecting",
-                      symbol, len(text))
-            self.last_failure_kind = FAIL_HTTP_ERROR
+            log.warning("[%s] response too large (%d chars) — rejecting",
+                        symbol, len(text))
+            self._set_failure(
+                FAIL_OVERSIZED, f"body {len(text) / 1_048_576:.1f} MB")
             return None
         obj_data = _extract_obj_data(text)
         if not obj_data:
@@ -1171,7 +1231,7 @@ class ZacksSession:
             # for them.
             if any(marker in text for marker in _INTERSTITIAL_MARKERS):
                 log.debug("[%s] Imperva interstitial detected", symbol)
-                self.last_failure_kind = FAIL_BLOCKED
+                self._set_failure(FAIL_BLOCKED, "Imperva interstitial")
                 return None
             # B2 resilience: not a block page — before classifying, try
             # the drift-tolerant fallback extractor in case Zacks changed
@@ -1201,17 +1261,17 @@ class ZacksSession:
                 # a parser break must never poison the skip list.
                 log.warning("[%s] obj_data present but unparseable — "
                             "page-format break suspected", symbol)
-                self.last_failure_kind = FAIL_PARSE_ERROR
+                self._set_failure(FAIL_PARSE_ERROR, "obj_data unparseable")
                 return None
             else:
                 log.debug("[%s] obj_data not found in page (Zacks may not cover this ticker)", symbol)
-                self.last_failure_kind = FAIL_NOT_FOUND
+                self._set_failure(FAIL_NOT_FOUND, "no obj_data on page")
                 return None
 
         eps_raw = obj_data.get(_EPS_KEY) or []
         rev_raw = obj_data.get(_REV_KEY) or []
         if not eps_raw and not rev_raw:
-            self.last_failure_kind = FAIL_NOT_FOUND
+            self._set_failure(FAIL_NOT_FOUND, "no EPS or revenue tables")
             return None
 
         eps_rows = [d for r in eps_raw if (d := _row_to_dict(r, kind="eps")) is not None]
@@ -1230,7 +1290,7 @@ class ZacksSession:
             log.warning("[%s] merge dropped/collided rows: %s", symbol, odd)
         log.debug("[%s] fetched %d quarters (within %d-yr window)",
                   symbol, len(merged), years)
-        self.last_failure_kind = None
+        self._set_failure(None)
         return merged
 
 

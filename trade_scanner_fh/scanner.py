@@ -441,11 +441,20 @@ class ScanParams:
     # scanner populates / the table renders for the EPS side. 0 = no
     # cap (use the full MAX_BEATS_QUARTERS=20 ceiling). e.g. 4 limits
     # to Q-1..Q-4 even if the ticker has 20 quarters of history.
+    #
+    # v6.3.0: `_selection` / `_backward_only` are the same controls the
+    # accelerating filters carry, and they DEFAULT TO THE HISTORICAL
+    # BEHAVIOUR — `backward_only=True` is precisely the trailing-streak
+    # semantic `compute_consecutive_beats` has always had, so an existing
+    # preset selects exactly as it did before. Unticking it lets a beats
+    # streak that ended a few quarters ago still qualify.
     consec_eps_beats_enabled: bool = False
     consec_eps_beats_display_only: bool = False
     consec_eps_beats_min: int = 3
     consec_eps_beats_threshold_pct: float = 0.0
     consec_eps_beats_quarter_cap: int = 0
+    consec_eps_beats_selection: str = "longest"
+    consec_eps_beats_backward_only: bool = True
 
     # #27  Consecutive Revenue Beats (min)
     consec_rev_beats_enabled: bool = False
@@ -453,6 +462,8 @@ class ScanParams:
     consec_rev_beats_min: int = 3
     consec_rev_beats_threshold_pct: float = 0.0
     consec_rev_beats_quarter_cap: int = 0
+    consec_rev_beats_selection: str = "longest"
+    consec_rev_beats_backward_only: bool = True
 
     # --- Consecutive YoY Growth (earnings-filters-spec Part 1) ---
     # A straight port of Consecutive Beats onto the YoY metrics: a
@@ -468,12 +479,21 @@ class ScanParams:
     # `_quarter_cap` is pool-defining: the N most recently reported
     # quarters, 0 = no cap.
 
+    #
+    # v6.3.0: `_selection` / `_backward_only`, defaulting to the historical
+    # behaviour — longest run anywhere in the pool, no anchor. Ticking
+    # Backward Only makes the run trailing-only, which is what "the streak
+    # must still be live" actually requires; before this the only way to
+    # approximate it was to set Q Cap equal to Min.
+
     # #28  Consecutive YoY EPS Growth (min)
     consec_eps_growth_enabled: bool = False
     consec_eps_growth_display_only: bool = False
     consec_eps_growth_min: int = 3
     consec_eps_growth_threshold_pct: float = 0.0
     consec_eps_growth_quarter_cap: int = 0
+    consec_eps_growth_selection: str = "longest"
+    consec_eps_growth_backward_only: bool = False
 
     # #29  Consecutive YoY Revenue Growth (min)
     consec_rev_growth_enabled: bool = False
@@ -481,6 +501,8 @@ class ScanParams:
     consec_rev_growth_min: int = 3
     consec_rev_growth_threshold_pct: float = 0.0
     consec_rev_growth_quarter_cap: int = 0
+    consec_rev_growth_selection: str = "longest"
+    consec_rev_growth_backward_only: bool = False
 
     # --- Consecutive Accelerating Quarters (spec Part 2) ---
     # Four instantiations of one algorithm, differing only in which
@@ -1078,9 +1100,8 @@ def _compute_ticker(
                 _eps_pool = past_pref if _eps_cap <= 0 else past_pref.head(_eps_cap)
                 _rev_pool = past_pref if _rev_cap <= 0 else past_pref.head(_rev_cap)
                 if params.consec_eps_beats_enabled or params.consec_eps_beats_display_only:
-                    from .earnings_history import compute_consecutive_beats
-                    row["consec_eps_beats"] = compute_consecutive_beats(
-                        _eps_pool, "eps", params.consec_eps_beats_threshold_pct,
+                    row["consec_eps_beats"] = _beats_run(
+                        _eps_pool, "surprise_eps_pct", params, "consec_eps_beats",
                     )
                     for k, (_, q) in enumerate(
                         past_pref.head(_eps_n).iterrows(), 1
@@ -1098,9 +1119,8 @@ def _compute_ticker(
                         row[f"q{k}_surprise_eps_pct"] = q.get("surprise_eps_pct")
                         row[f"q{k}_yoy_eps_pct"] = q.get("yoy_eps_pct")
                 if params.consec_rev_beats_enabled or params.consec_rev_beats_display_only:
-                    from .earnings_history import compute_consecutive_beats
-                    row["consec_rev_beats"] = compute_consecutive_beats(
-                        _rev_pool, "rev", params.consec_rev_beats_threshold_pct,
+                    row["consec_rev_beats"] = _beats_run(
+                        _rev_pool, "surprise_rev_pct", params, "consec_rev_beats",
                     )
                     for k, (_, q) in enumerate(
                         past_pref.head(_rev_n).iterrows(), 1
@@ -1169,6 +1189,48 @@ _ACCEL_FILTERS: tuple[tuple[str, str], ...] = (
 
 # The two Consecutive YoY Growth filters, as
 # (param prefix, history column).
+def _beats_run(
+    pool, metric_col: str, params, prefix: str,
+) -> int:
+    """Consecutive-beats streak length, via the shared series primitive.
+
+    Replaces the old direct call to `compute_consecutive_beats` so that beats,
+    growth and acceleration all resolve through one implementation and the
+    Series / Backward Only controls mean the same thing on all three.
+
+    Two settings make the default identical to the historical behaviour:
+
+      * ``keep_valueless=True`` — a quarter present in the history with a NaN
+        surprise is a MISS, not a hole. `surprise_*_pct` is null often enough
+        that treating those as absent would move 2.56% of EPS streaks (AFRM
+        would report a live 13-quarter streak on a ticker whose newest quarter
+        has no surprise figure at all).
+      * ``inclusive=False`` — beats has always been a strict `>`, so a
+        dead-on-estimate quarter breaks the streak.
+
+    `pool` arrives already sliced to the Q Cap by the caller, so no
+    `quarter_cap` is passed here — doing both would cap twice.
+
+    Residual difference from `compute_consecutive_beats`: the cadence test is
+    `_period_steps` month arithmetic rather than a >135-day span. Measured
+    across the live store that moves 6 of 5,931 tickers per metric (0.10%),
+    all of them 52/53-week filers whose period_ending drifts — the case
+    `_period_steps` exists to handle correctly.
+    """
+    from . import earnings_series as es
+    points = es.build_quarter_points(pool, metric_col, keep_valueless=True)
+    res = es.run_series(
+        points,
+        threshold=getattr(params, f"{prefix}_threshold_pct"),
+        min_count=getattr(params, f"{prefix}_min"),
+        inclusive=False,
+        max_bridged=config.SERIES_MAX_BRIDGED_BEATS,
+        selection=getattr(params, f"{prefix}_selection"),
+        backward_only=getattr(params, f"{prefix}_backward_only"),
+    )
+    return 0 if res is None else res.length
+
+
 _GROWTH_FILTERS: tuple[tuple[str, str], ...] = (
     ("consec_eps_growth", "yoy_eps_pct"),
     ("consec_rev_growth", "yoy_rev_pct"),
@@ -1254,6 +1316,9 @@ def _populate_quarter_series(row: dict, params: "ScanParams", past_pref) -> None
         )
         row[prefix] = es.consecutive_growth_run(
             points, getattr(params, f"{prefix}_threshold_pct"),
+            max_bridged=config.SERIES_MAX_BRIDGED_GROWTH,
+            selection=getattr(params, f"{prefix}_selection"),
+            backward_only=getattr(params, f"{prefix}_backward_only"),
         )
 
     for prefix, metric_key in _ACCEL_FILTERS:
@@ -1271,6 +1336,7 @@ def _populate_quarter_series(row: dict, params: "ScanParams", past_pref) -> None
             min_count=getattr(params, f"{prefix}_min_count"),
             selection=getattr(params, f"{prefix}_selection"),
             backward_only=getattr(params, f"{prefix}_backward_only"),
+            max_bridged=config.SERIES_MAX_BRIDGED_ACCEL,
         )
         if result is None:
             # No quarter in the pool carries this metric at all. Leave
@@ -1945,10 +2011,18 @@ def _build_filter_stages(params: ScanParams) -> list[tuple[str, Callable]]:
     # "include_no_data" behavior. Phase 8 §8.5: when display-only,
     # the streak is computed and shown but no filter is appended.
 
+    # The mode belongs in the funnel label: "4 passed" means something
+    # different under a live-streak requirement than under "a streak anywhere",
+    # and the log is the only place that distinction is visible after the run.
+    def _series_mode(prefix: str) -> str:
+        return ("backward" if getattr(params, f"{prefix}_backward_only")
+                else getattr(params, f"{prefix}_selection"))
+
     if eps_beats_is_active_filter:
         stages.append((
             f"Consec EPS Beats >= {params.consec_eps_beats_min} "
-            f"(>{params.consec_eps_beats_threshold_pct:g}%)",
+            f"(>{params.consec_eps_beats_threshold_pct:g}%, "
+            f"{_series_mode('consec_eps_beats')})",
             lambda df, p=params: (
                 df["consec_eps_beats"] >= p.consec_eps_beats_min
                 if "consec_eps_beats" in df.columns
@@ -1959,7 +2033,8 @@ def _build_filter_stages(params: ScanParams) -> list[tuple[str, Callable]]:
     if rev_beats_is_active_filter:
         stages.append((
             f"Consec Rev Beats >= {params.consec_rev_beats_min} "
-            f"(>{params.consec_rev_beats_threshold_pct:g}%)",
+            f"(>{params.consec_rev_beats_threshold_pct:g}%, "
+            f"{_series_mode('consec_rev_beats')})",
             lambda df, p=params: (
                 df["consec_rev_beats"] >= p.consec_rev_beats_min
                 if "consec_rev_beats" in df.columns
@@ -1995,7 +2070,8 @@ def _build_filter_stages(params: ScanParams) -> list[tuple[str, Callable]]:
             _min = getattr(params, f"{_prefix}_min")
             _thr = getattr(params, f"{_prefix}_threshold_pct")
             stages.append((
-                f"{_label} >= {_min} (>={_thr:g}%)",
+                f"{_label} >= {_min} (>={_thr:g}%, "
+                f"{_series_mode(_prefix)})",
                 _series_stage(_prefix, _min),
             ))
 

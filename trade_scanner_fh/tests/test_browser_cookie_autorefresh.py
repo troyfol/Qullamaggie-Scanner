@@ -677,6 +677,7 @@ def test_bulk_threshold_prompt_yes_kicks_off_targeted_worker(
             self.progress = MagicMock()
             self.finished = MagicMock()
             self.failure_breakdown = MagicMock()
+            self.failure_details = MagicMock()
             self.imperva_block_detected = MagicMock()
         def isRunning(self):
             return False
@@ -824,6 +825,7 @@ def test_under_threshold_skips_prompt_and_starts_directly(
             self.progress = MagicMock()
             self.finished = MagicMock()
             self.failure_breakdown = MagicMock()
+            self.failure_details = MagicMock()
             self.imperva_block_detected = MagicMock()
         def isRunning(self):
             return False

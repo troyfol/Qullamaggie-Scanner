@@ -340,3 +340,105 @@ def test_kickoff_no_trim_when_blacklists_disjoint(manual):
     assert len(launches) == 1
     cands, due, inc = launches[0]
     assert cands == ["AAA", "BBB", "CCC"]
+
+
+# ----------------------------------------------------------------------
+# 2026-09-18: the trim intersected a source that wasn't going to run
+# ----------------------------------------------------------------------
+
+class _TrimWin:
+    """Bare stand-in carrying just the attributes the trim helper reads."""
+    def __init__(self, finviz=(), zacks=(), finnhub=()):
+        self._finviz_blacklist = set(finviz)
+        self._zacks_blacklist = set(zacks)
+        self._finnhub_blacklist = set(finnhub)
+        self.lines: list[str] = []
+        self.log_panel = type(
+            "P", (), {"write_line": lambda _s, m, _o=self: _o.lines.append(m)},
+        )()
+
+
+def _coord_for(win):
+    from trade_scanner_fh.gui.earnings_coordinator import (
+        EarningsRefreshCoordinator,
+    )
+    coord = EarningsRefreshCoordinator.__new__(EarningsRefreshCoordinator)
+    coord.win = win
+    return coord
+
+
+def test_trim_keeps_a_ticker_that_a_non_running_source_would_have_saved():
+    """The live defect. BLOCKED is blacklisted by finviz AND zacks — the only
+    two sources the auto cycle starts — but not by finnhub, which the auto
+    cycle never runs (FINNHUB_IN_AUTO_REFRESH=False). Folding finnhub's list
+    into the AND kept BLOCKED in the candidate set, where it inflated the
+    announced "N due" and was then silently dropped by both workers.
+    Measured on the live store: 1,090 tickers in exactly this state.
+    """
+    win = _TrimWin(finviz={"BLOCKED"}, zacks={"BLOCKED"}, finnhub=set())
+    coord = _coord_for(win)
+
+    # Old behaviour, reproduced by asking for all three: survives the trim.
+    assert coord._trim_all_blocked_candidates(
+        ["AAPL", "BLOCKED"], ("finviz", "zacks", "finnhub"),
+    ) == ["AAPL", "BLOCKED"]
+
+    # Scoped to the sources that actually run: correctly dropped.
+    assert coord._trim_all_blocked_candidates(
+        ["AAPL", "BLOCKED"], ("finviz", "zacks"),
+    ) == ["AAPL"]
+
+
+def test_trim_keeps_tickers_one_running_source_can_still_cover():
+    """Only names EVERY running source has given up on may be dropped."""
+    win = _TrimWin(finviz={"HALF"}, zacks=set())
+    coord = _coord_for(win)
+    assert coord._trim_all_blocked_candidates(
+        ["HALF"], ("finviz", "zacks"),
+    ) == ["HALF"]
+
+
+def test_trim_defaults_to_all_three_sources_when_unscoped():
+    win = _TrimWin(finviz={"X"}, zacks={"X"}, finnhub={"X"})
+    coord = _coord_for(win)
+    assert coord._trim_all_blocked_candidates(["X", "Y"]) == ["Y"]
+
+
+def test_trim_log_line_names_the_sources_it_actually_intersected():
+    win = _TrimWin(finviz={"X"}, zacks={"X"})
+    coord = _coord_for(win)
+    coord._trim_all_blocked_candidates(["X"], ("finviz", "zacks"))
+    assert win.lines and "finviz + zacks" in win.lines[0]
+    assert "finnhub" not in win.lines[0]
+
+
+def test_auto_cycle_scopes_the_trim_to_its_real_source_set(monkeypatch):
+    """End-to-end on the wiring: with finnhub excluded from auto cycles, the
+    kick-off must not let finnhub's blacklist participate in the AND."""
+    from trade_scanner_fh import config as cfg
+    from trade_scanner_fh.gui import earnings_coordinator as ec
+
+    monkeypatch.setattr(cfg, "FINNHUB_IN_AUTO_REFRESH", False)
+    monkeypatch.setattr(cfg, "ZACKS_SMART_REFRESH_BULK_THRESHOLD", 10_000)
+    monkeypatch.setattr(
+        "trade_scanner_fh.earnings_history.find_smart_refresh_candidates",
+        lambda u, b: ["AAPL", "BLOCKED"],
+    )
+
+    seen = {}
+    win = _TrimWin(finviz={"BLOCKED"}, zacks={"BLOCKED"}, finnhub=set())
+    win._universe_df = None
+    win._symbols = ["AAPL", "BLOCKED"]
+    win._blacklist = set()
+    win._get_universe_symbols = lambda: ["AAPL", "BLOCKED"]
+    win._etf_adr_auto_skip_set = lambda: set()
+    win._launch_smart_refresh_workers = (
+        lambda c, **kw: seen.update(candidates=list(c), kwargs=kw))
+
+    coord = _coord_for(win)
+    win._trim_all_blocked_candidates = coord._trim_all_blocked_candidates
+    coord._kick_off_smart_refresh()
+
+    assert seen["candidates"] == ["AAPL"], (
+        "a ticker both running sources have blacklisted was still announced"
+    )

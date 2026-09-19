@@ -237,12 +237,14 @@ def test_delegate_finviz_blacklist_round_trip(tmp_path):
     inst1._finviz_blacklist = {"SPY", "QQQ"}
     inst1._save_finviz_blacklist()
     # One entry per line, sorted — TICKER<TAB>ADDED_ON<TAB>REASON since INT-5.
-    # Entries with no recorded fill reason are stamped "manual": they came from
-    # the editor dialog, not from an automated skip.
+    # Entries with no recorded fill reason are stamped "unknown". This was
+    # "manual" until 2026-09-18, which claimed the user had curated them and
+    # so exempted them from the stale-skip re-check — the reason the zacks
+    # list reached 10,143 permanently-unreviewable entries.
     body = [ln for ln in (tmp_path / "finviz_blacklist.txt").read_text(
         encoding="utf-8").splitlines() if ln.strip() and not ln.startswith("#")]
     assert [ln.split("\t")[0] for ln in body] == ["QQQ", "SPY"]
-    assert all(ln.split("\t")[2] == "manual" for ln in body)
+    assert all(ln.split("\t")[2] == "unknown" for ln in body)
 
     inst2 = _bare_main_window()
     inst2._FINVIZ_BLACKLIST_FILE = tmp_path / "finviz_blacklist.txt"

@@ -360,6 +360,16 @@ _ACCEL_ROW_KEYS: tuple[str, ...] = (
 )
 
 
+# Every row carrying the Series / Backward Only pair. The accelerating rows
+# had them first; v6.3.0 added them to beats and growth so all three series
+# filter types answer the same questions the same way.
+_SERIES_ROW_KEYS: tuple = (
+    "consec_eps_beats", "consec_rev_beats",
+    "consec_eps_growth", "consec_rev_growth",
+    "accel_eps_surp", "accel_rev_surp", "accel_eps_yoy", "accel_rev_yoy",
+)
+
+
 def _accel_scan_params(rows: dict) -> dict:
     """Read the four accelerating rows into their ScanParams kwargs."""
     out: dict = {}
@@ -717,15 +727,34 @@ class IndicatorPanel(QScrollArea):
             {"name": "min_count", "label": "Min", "type": "int", "default": 3, "min": 0, "max": 50},
             {"name": "threshold_pct", "label": "Threshold %", "type": "float", "default": 0.0, "min": -9999.0, "max": 9999.0, "step": 0.5},
             {"name": "quarter_cap", "label": "Q Cap", "type": "int", "default": 0, "min": 0, "max": 20},
+            # v6.3.0: the same Series / Backward Only pair the accelerating
+            # rows carry. Backward Only DEFAULTS ON here, which is exactly the
+            # trailing-streak behaviour beats always had — an existing preset
+            # selects identically. Unticking it lets a streak that ended a few
+            # quarters ago still qualify.
+                {"name": "selection", "label": "Series", "type": "combo",
+                 "default": "longest", "width": 120,
+                 "choices": [("longest", "Longest"),
+                             ("most_recent", "Most Recent")]},
+                {"name": "backward_only", "label": "Backward Only",
+                 "type": "checkbox", "default": True},
         ])
         self.rows["consec_eps_beats"].set_enabled(False)
+        self._wire_backward_only_fields("consec_eps_beats")
 
         self._add("consec_rev_beats", "Consecutive Rev Beats", [
             {"name": "min_count", "label": "Min", "type": "int", "default": 3, "min": 0, "max": 50},
             {"name": "threshold_pct", "label": "Threshold %", "type": "float", "default": 0.0, "min": -9999.0, "max": 9999.0, "step": 0.5},
             {"name": "quarter_cap", "label": "Q Cap", "type": "int", "default": 0, "min": 0, "max": 20},
+                {"name": "selection", "label": "Series", "type": "combo",
+                 "default": "longest", "width": 120,
+                 "choices": [("longest", "Longest"),
+                             ("most_recent", "Most Recent")]},
+                {"name": "backward_only", "label": "Backward Only",
+                 "type": "checkbox", "default": True},
         ])
         self.rows["consec_rev_beats"].set_enabled(False)
+        self._wire_backward_only_fields("consec_rev_beats")
 
         # Wire grey-out behavior — beats checkbox disables the matching
         # individual filter rows, and emits beats_filter_toggled so the
@@ -747,19 +776,37 @@ class IndicatorPanel(QScrollArea):
         # most recently reported quarters.
         self._section("Consecutive YoY Growth")
 
+        # v6.3.0: Series / Backward Only, defaulting to the historical
+        # behaviour — longest run ANYWHERE in the pool, no anchor. Ticking
+        # Backward Only is what "the streak must still be live" requires;
+        # before this the only approximation was Q Cap == Min.
         self._add("consec_eps_growth", "Consecutive YoY EPS Growth", [
             {"name": "min_count", "label": "Min", "type": "int", "default": 3, "min": 0, "max": 50},
             {"name": "threshold_pct", "label": "Growth %", "type": "float", "default": 0.0, "min": -9999.0, "max": 9999.0, "step": 1.0},
             {"name": "quarter_cap", "label": "Q Cap", "type": "int", "default": 0, "min": 0, "max": 40},
+                {"name": "selection", "label": "Series", "type": "combo",
+                 "default": "longest", "width": 120,
+                 "choices": [("longest", "Longest"),
+                             ("most_recent", "Most Recent")]},
+                {"name": "backward_only", "label": "Backward Only",
+                 "type": "checkbox", "default": False},
         ])
         self.rows["consec_eps_growth"].set_enabled(False)
+        self._wire_backward_only_fields("consec_eps_growth")
 
         self._add("consec_rev_growth", "Consecutive YoY Rev Growth", [
             {"name": "min_count", "label": "Min", "type": "int", "default": 3, "min": 0, "max": 50},
             {"name": "threshold_pct", "label": "Growth %", "type": "float", "default": 0.0, "min": -9999.0, "max": 9999.0, "step": 1.0},
             {"name": "quarter_cap", "label": "Q Cap", "type": "int", "default": 0, "min": 0, "max": 40},
+                {"name": "selection", "label": "Series", "type": "combo",
+                 "default": "longest", "width": 120,
+                 "choices": [("longest", "Longest"),
+                             ("most_recent", "Most Recent")]},
+                {"name": "backward_only", "label": "Backward Only",
+                 "type": "checkbox", "default": False},
         ])
         self.rows["consec_rev_growth"].set_enabled(False)
+        self._wire_backward_only_fields("consec_rev_growth")
 
         # --- Accelerating Quarters (spec Part 2) ---
         # Four discrete rows rather than one row with a metric selector,
@@ -770,7 +817,7 @@ class IndicatorPanel(QScrollArea):
         # quarter contains no acceleration step and cannot mean anything.
         # `Step pp` is in PERCENTAGE POINTS — 20 -> 25 is +5, not +25%.
         # `Backward Only` greys out `Selection`; see
-        # `_wire_accel_backward_only_fields`.
+        # `_wire_backward_only_fields`.
         self._section("Consecutive Accelerating Quarters")
 
         for _key, _label in (
@@ -796,7 +843,7 @@ class IndicatorPanel(QScrollArea):
                  "type": "checkbox", "default": False},
             ])
             self.rows[_key].set_enabled(False)
-            self._wire_accel_backward_only_fields(_key)
+            self._wire_backward_only_fields(_key)
 
         self.vbox.addStretch()
         self.setWidget(container)
@@ -844,9 +891,9 @@ class IndicatorPanel(QScrollArea):
 
     # ── Accelerating-quarters field greyout ──────────────────────────
 
-    def _wire_accel_backward_only_fields(self, key: str):
-        """Grey out an accelerating row's `Series` selector while
-        `Backward Only` is checked.
+    def _wire_backward_only_fields(self, key: str):
+        """Grey out a series row's `Series` selector while `Backward Only`
+        is checked. Shared by all eight series rows (beats, growth, accel).
 
         Backward Only anchors the series on the newest quarter that has
         data and builds only that candidate, so there is never more than
@@ -872,8 +919,8 @@ class IndicatorPanel(QScrollArea):
         backward.toggled.connect(lambda _on: _apply())
         _apply()  # Apply once with the default (Backward Only off)
 
-    def _sync_accel_backward_only(self):
-        """Re-apply every accelerating row's Backward-Only greyout.
+    def _sync_backward_only(self):
+        """Re-apply every series row's Backward-Only greyout.
 
         `set_value` drives the checkbox through `setChecked`, which only
         emits `toggled` on an actual state change — a preset that
@@ -881,8 +928,7 @@ class IndicatorPanel(QScrollArea):
         the Series combo in the wrong enabled state. Mirrors the same
         post-load resync the beats and surge rows already do.
         """
-        for key in ("accel_eps_surp", "accel_rev_surp",
-                    "accel_eps_yoy", "accel_rev_yoy"):
+        for key in _SERIES_ROW_KEYS:
             row = self.rows.get(key)
             if row is None:
                 continue
@@ -1157,11 +1203,15 @@ class IndicatorPanel(QScrollArea):
             consec_eps_beats_min=int(r["consec_eps_beats"].value("min_count")),
             consec_eps_beats_threshold_pct=r["consec_eps_beats"].value("threshold_pct"),
             consec_eps_beats_quarter_cap=int(r["consec_eps_beats"].value("quarter_cap")),
+            consec_eps_beats_selection=r["consec_eps_beats"].value("selection"),
+            consec_eps_beats_backward_only=bool(r["consec_eps_beats"].value("backward_only")),
             consec_rev_beats_enabled=r["consec_rev_beats"].is_enabled(),
             consec_rev_beats_display_only=r["consec_rev_beats"].is_display_only(),
             consec_rev_beats_min=int(r["consec_rev_beats"].value("min_count")),
             consec_rev_beats_threshold_pct=r["consec_rev_beats"].value("threshold_pct"),
             consec_rev_beats_quarter_cap=int(r["consec_rev_beats"].value("quarter_cap")),
+            consec_rev_beats_selection=r["consec_rev_beats"].value("selection"),
+            consec_rev_beats_backward_only=bool(r["consec_rev_beats"].value("backward_only")),
 
             # --- Consecutive YoY Growth (spec Part 1) ---
             consec_eps_growth_enabled=r["consec_eps_growth"].is_enabled(),
@@ -1169,11 +1219,15 @@ class IndicatorPanel(QScrollArea):
             consec_eps_growth_min=int(r["consec_eps_growth"].value("min_count")),
             consec_eps_growth_threshold_pct=r["consec_eps_growth"].value("threshold_pct"),
             consec_eps_growth_quarter_cap=int(r["consec_eps_growth"].value("quarter_cap")),
+            consec_eps_growth_selection=r["consec_eps_growth"].value("selection"),
+            consec_eps_growth_backward_only=bool(r["consec_eps_growth"].value("backward_only")),
             consec_rev_growth_enabled=r["consec_rev_growth"].is_enabled(),
             consec_rev_growth_display_only=r["consec_rev_growth"].is_display_only(),
             consec_rev_growth_min=int(r["consec_rev_growth"].value("min_count")),
             consec_rev_growth_threshold_pct=r["consec_rev_growth"].value("threshold_pct"),
             consec_rev_growth_quarter_cap=int(r["consec_rev_growth"].value("quarter_cap")),
+            consec_rev_growth_selection=r["consec_rev_growth"].value("selection"),
+            consec_rev_growth_backward_only=bool(r["consec_rev_growth"].value("backward_only")),
 
             # --- Accelerating Quarters (spec Part 2) ---
             **_accel_scan_params(r),
@@ -1241,7 +1295,7 @@ class IndicatorPanel(QScrollArea):
         # Same reason: a preset that re-asserts a Backward Only value the
         # row already holds emits no `toggled`, so the Series combo's
         # enabled state has to be re-derived explicitly.
-        self._sync_accel_backward_only()
+        self._sync_backward_only()
         # Resync surge field-greyout after loading. Mirror
         # `_wire_surge_mode_dependent_fields` — apply the same explicit
         # muted style so a preset that lands on trend mode greys days

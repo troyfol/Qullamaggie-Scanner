@@ -6,7 +6,7 @@ rebuild tickers, manual input) live inline inside MainWindow methods because
 they're small and tightly coupled to that window's state."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 
 from PyQt6.QtCore import QDate, Qt, pyqtSignal
@@ -768,3 +768,229 @@ class ColumnsManagerDialog(QDialog):
             for r in range(self._list.count())
             if self._list.item(r).checkState() != Qt.CheckState.Checked
         ]
+
+
+class StaleSkipDialog(QDialog):
+    """Configure a "Re-check Stale Skips" run before it happens.
+
+    The action used to be a single hardcoded rule — reason == "empty" and
+    older than ``SKIP_RECHECK_DAYS``, across all three earnings sources — and
+    it silently excluded the largest list in the store. On 2026-09-18 the
+    zacks skip list held 10,143 entries, every one labelled ``manual``, which
+    is the fallback stamped on an entry that arrived with NO recorded reason
+    rather than evidence of a user decision. The old filter therefore treated
+    all 10,143 as permanent curation and re-checked exactly none of them.
+
+    So the reason codes are a visible, selectable filter here instead of a
+    constant in the code, and the eligible counts update live as the settings
+    change — the point being that you can SEE what a filter would do before
+    running it.
+
+    Scope is the three earnings skip lists. The OHLCV blacklist is deliberately
+    absent: it is stored as one comma-joined line with no dates and no reasons,
+    so "older than N days" has nothing to read.
+    """
+
+    def __init__(
+        self,
+        entries_by_source: dict,
+        live_by_source: dict,
+        *,
+        labels: dict,
+        default_days: int,
+        default_max: int,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Re-check Stale Skips")
+        self.setMinimumWidth(640)
+        self._entries = entries_by_source
+        self._live = live_by_source
+        self._labels = labels
+
+        root = QVBoxLayout(self)
+        intro = QLabel(
+            "Remove long-standing entries from the earnings skip lists so the "
+            "next fill tries them again. Nothing is fetched now — run the "
+            "relevant Gap Fill afterwards.<br><br>"
+            "An entry that is still uncovered goes back on the list with a "
+            "fresh date, so this is a self-correcting cycle rather than a "
+            "permanent deletion."
+        )
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(intro)
+
+        # ── what counts as stale ───────────────────────────────────────
+        age_box = QGroupBox("Staleness")
+        age_grid = QGridLayout(age_box)
+        age_grid.addWidget(QLabel("Re-check entries older than:"), 0, 0)
+        self.sp_days = QSpinBox()
+        self.sp_days.setRange(0, 3650)
+        self.sp_days.setValue(int(default_days))
+        self.sp_days.setSuffix(" days")
+        self.sp_days.setToolTip(
+            "0 re-checks everything regardless of age. The default matches "
+            "config.SKIP_RECHECK_DAYS."
+        )
+        age_grid.addWidget(self.sp_days, 0, 1)
+
+        age_grid.addWidget(QLabel("Cap per list:"), 1, 0)
+        self.sp_max = QSpinBox()
+        self.sp_max.setRange(1, 100000)
+        self.sp_max.setValue(int(default_max))
+        self.sp_max.setToolTip(
+            "Oldest entries are taken first. The cap keeps one click from "
+            "queueing a multi-hour fill."
+        )
+        age_grid.addWidget(self.sp_max, 1, 1)
+
+        self.cb_undated = QCheckBox(
+            "Include undated legacy entries (no added-on date recorded)")
+        self.cb_undated.setToolTip(
+            "Legacy bare-ticker lines carry neither a date nor a reason. They "
+            "cannot be aged, so they are excluded by default — including them "
+            "ignores the age setting for those entries."
+        )
+        age_grid.addWidget(self.cb_undated, 2, 0, 1, 2)
+        age_grid.setColumnStretch(2, 1)
+        root.addWidget(age_box)
+
+        # ── which sources ──────────────────────────────────────────────
+        src_box = QGroupBox("Sources to re-check")
+        src_row = QHBoxLayout(src_box)
+        self.src_checks: dict = {}
+        for key in entries_by_source:
+            cb = QCheckBox(
+                f"{labels.get(key, key)}  "
+                f"({len(entries_by_source[key]):,})"
+            )
+            cb.setChecked(True)
+            cb.stateChanged.connect(self._refresh_counts)
+            self.src_checks[key] = cb
+            src_row.addWidget(cb)
+        src_row.addStretch()
+        root.addWidget(src_box)
+
+        # ── which reason codes ─────────────────────────────────────────
+        reason_box = QGroupBox("Reason codes to re-check")
+        reason_grid = QGridLayout(reason_box)
+        self.reason_checks: dict = {}
+        all_reasons: dict = {}
+        for _src, entries in entries_by_source.items():
+            for _tk, (_added, reason) in entries.items():
+                r = reason or "(none)"
+                all_reasons[r] = all_reasons.get(r, 0) + 1
+        for i, (reason, count) in enumerate(
+                sorted(all_reasons.items(), key=lambda kv: -kv[1])):
+            cb = QCheckBox(f"{reason}  ({count:,})")
+            # "empty" is the auto-added "source returned no data" code and is
+            # the historical default. Everything else is opt-in: a genuinely
+            # hand-curated entry should not be silently re-queued.
+            cb.setChecked(reason == "empty")
+            cb.stateChanged.connect(self._refresh_counts)
+            self.reason_checks[reason] = cb
+            reason_grid.addWidget(cb, i // 3, i % 3)
+        if not all_reasons:
+            reason_grid.addWidget(QLabel("(no entries on any list)"), 0, 0)
+        root.addWidget(reason_box)
+
+        hint = QLabel(
+            "<i>Note: <b>manual</b> is also the fallback recorded when an "
+            "entry arrived with no reason at all, so a list that is 100% "
+            "manual is usually an artifact rather than your curation — check "
+            "the counts above before trusting one.</i>"
+        )
+        hint.setWordWrap(True)
+        hint.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(hint)
+
+        # ── live preview ───────────────────────────────────────────────
+        self.lbl_counts = QLabel()
+        self.lbl_counts.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_counts.setWordWrap(True)
+        root.addWidget(self.lbl_counts)
+
+        self.sp_days.valueChanged.connect(self._refresh_counts)
+        self.sp_max.valueChanged.connect(self._refresh_counts)
+        self.cb_undated.stateChanged.connect(self._refresh_counts)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttons.button(
+            QDialogButtonBox.StandardButton.Ok).setText("Re-enable")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        root.addWidget(self.buttons)
+
+        self._refresh_counts()
+
+    # ── selection logic (pure + in-memory: no file I/O per keystroke) ──
+
+    def _selected_reasons(self) -> set:
+        return {r for r, cb in self.reason_checks.items() if cb.isChecked()}
+
+    def selection(self) -> dict:
+        """``{source_key: [tickers]}`` under the current settings."""
+        days = self.sp_days.value()
+        cap = self.sp_max.value()
+        reasons = self._selected_reasons()
+        allow_undated = self.cb_undated.isChecked()
+        cutoff = date.today() - timedelta(days=int(days))
+        out: dict = {}
+        for src, entries in self._entries.items():
+            if not self.src_checks[src].isChecked():
+                out[src] = []
+                continue
+            live = self._live.get(src, set())
+            stale = []
+            for tk, (added, reason) in entries.items():
+                # Only entries still on the in-memory list can be removed
+                # from it; a stale row for a ticker already re-enabled is
+                # bookkeeping, not a candidate.
+                if tk not in live:
+                    continue
+                if (reason or "(none)") not in reasons:
+                    continue
+                if added is None:
+                    if allow_undated:
+                        # No date to sort on. Order these last, after every
+                        # dated entry, so the cap is spent on the entries we
+                        # can actually reason about.
+                        stale.append((date.max, tk))
+                    continue
+                if added <= cutoff:
+                    stale.append((added, tk))
+            stale.sort()
+            out[src] = [tk for _a, tk in stale[:cap]]
+        return out
+
+    def settings(self) -> dict:
+        """The knob values, for the log line."""
+        return {
+            "days": self.sp_days.value(),
+            "max_per_list": self.sp_max.value(),
+            "reasons": sorted(self._selected_reasons()),
+            "include_undated": self.cb_undated.isChecked(),
+            "sources": [s for s, cb in self.src_checks.items()
+                        if cb.isChecked()],
+        }
+
+    def _refresh_counts(self):
+        sel = self.selection()
+        total = sum(len(v) for v in sel.values())
+        parts = []
+        for src, tickers in sel.items():
+            listed = len(self._entries.get(src, {}))
+            parts.append(
+                f"{self._labels.get(src, src)}: <b>{len(tickers):,}</b> "
+                f"of {listed:,}"
+            )
+        self.lbl_counts.setText(
+            f"Would re-enable <b>{total:,}</b> ticker(s) &nbsp;—&nbsp; "
+            + " &nbsp;|&nbsp; ".join(parts)
+        )
+        self.buttons.button(
+            QDialogButtonBox.StandardButton.Ok).setEnabled(total > 0)

@@ -68,6 +68,21 @@ features at a live order-entry platform.
   enough that a -50% day would fake it, the step must be an outlier against the
   ticker's own volatility. **64 tickers excluded → 41 listed, 31 dropped by a
   default scan.**
+- **One series engine under all eight quarter-run filters** (v6.3.0): beats,
+  consecutive YoY growth and accelerating quarters now share a primitive and
+  all carry the same `Series` (Longest / Most Recent) and `Backward Only`
+  controls, plus a per-type missing-quarter bridging allowance you can set.
+  Backward Only is the "is the streak still *live*?" question — without it a
+  growth filter passes a stock whose qualifying run ended eighteen months ago.
+  Defaults reproduce each filter's prior behaviour exactly.
+- **Diagnostics you can act on, and that remember what you did** (v6.3.0):
+  the `missing_quarter` finding gained a re-fetch button and an attempt ledger,
+  so a 525-ticker wall becomes a work queue that shrinks; the Zacks failure
+  bucket `http_error` split into kinds that mean different things (a 404 is not
+  a timeout); the stale-skip re-check became a dialog with a live count instead
+  of a hardcoded rule that could not reach the 10,143-entry list it most needed
+  to; and the cross-source disagreement report stopped erasing itself when two
+  sources finalize in the same refresh.
 - **Local-first**: everything lives in `scanner_data/` beside the executable.
   No account, no telemetry, no cloud dependency.
 
@@ -91,7 +106,7 @@ features at a live order-entry platform.
 - [Key data structures](#key-data-structures)
 - [Filter / indicator semantics — the three-state model](#filter--indicator-semantics--the-three-state-model)
 - [Display-only mode & red-on-fail coloring](#display-only-mode--red-on-fail-coloring)
-- [Quarter-series filters — consecutive growth & accelerating quarters](#quarter-series-filters--consecutive-growth--accelerating-quarters)
+- [Quarter-series filters — beats, consecutive growth & accelerating quarters](#quarter-series-filters--beats-consecutive-growth--accelerating-quarters)
 - [Match-color anchoring system](#match-color-anchoring-system)
 
 ### Extending it
@@ -105,6 +120,7 @@ features at a live order-entry platform.
 ### Subsystems
 
 - [The Zacks scraper subsystem](#the-zacks-scraper-subsystem)
+  - [Failure taxonomy](#failure-taxonomy-v630)
 - [The Finviz earnings scraper](#the-finviz-earnings-scraper-top-priority-source)
 - [Cookie acquisition flow](#cookie-acquisition-flow-firefox--mid-flight-capture)
 - [GUI subsystem](#gui-subsystem)
@@ -248,8 +264,10 @@ auto-reconciles the tickers it touched.
 `Data → Diagnostics → Earnings Coverage Report` shows per-source coverage
 (overlapping sets, since gap-fill lets one ticker carry rows from several
 sources), the tickers with no coverage at all, and the most-recent reported
-quarter per source. `Verify earnings_history Integrity` runs 14 schema /
-policy checks with one-click auto-fix.
+quarter per source. `Verify earnings_history Integrity` runs 15 schema /
+policy checks with one-click auto-fix for the fixable ones, plus a dedicated
+**Re-fetch these (N)…** action on `missing_quarter` — the one finding whose
+remedy is a fetch rather than a rewrite.
 
 ---
 
@@ -552,12 +570,37 @@ period_ending)` rows from *different* sources and flags pairs whose
 `reported_eps` differ by more than `config.EPS_DISAGREEMENT_ABS_TOL`
 ($0.10) or whose `surprise_eps_pct` differ by more than
 `config.SURPRISE_DISAGREEMENT_PP_TOL` (2.0 pp). Findings are atomically
-rewritten to `scanner_data/earnings_disagreements.csv`
-(`config.EARNINGS_DISAGREEMENTS_CSV_NAME`) — the file always reflects the
-latest save, so stale findings self-clear on the next run; an empty scan
-writes a header-only CSV. **Report-only**: it never changes which row
-wins dedup, and a failure inside the report never blocks the save. Loud
-log line when non-empty, silent when clean. Tests in
+written to `scanner_data/earnings_disagreements.csv`
+(`config.EARNINGS_DISAGREEMENTS_CSV_NAME`).
+
+**The file is a standing record merged across saves, not a snapshot of the
+last one (v6.3.0).** Each canonical save speaks only for the `(ticker,
+period_ending)` slots *its own frame* carried on more than one source; every
+other row already on file is carried forward untouched. A slot that was
+contested and is now clean still clears, because the save that re-examined it
+is entitled to say so — the self-clearing "previously reported, now resolved"
+signal survives.
+
+That scoping exists because this report has now destroyed itself twice, both
+times for the same underlying reason: the scan runs immediately BEFORE
+`dedupe_history` collapses each slot to one source, so the save that finds the
+disagreements is also the one that removes the evidence.
+
+- **2026-08-13** — the next save's frame had *zero* comparable slots and
+  overwrote the file with a bare header. 701 real findings lived two minutes.
+  Fixed in v5.5.1 by refusing to write when nothing was comparable.
+- **2026-09-18** — the smart refresh runs finviz + zacks concurrently, so two
+  sources finalize independently. Zacks wrote 221 findings at 21:23; finviz
+  finalized at 21:26 on the already-deduped store plus its own 64 fresh rows,
+  which re-created a *few* comparable slots — enough to clear the v5.5.1 guard
+  — found none of them contested, and blanked the file. A count-based guard
+  cannot catch this; only scoping the write to the slots actually evaluated
+  can.
+
+The loud log line is gated on what **this pass** found, not the standing
+total, so a backlog does not re-announce itself on every save.
+**Report-only**: it never changes which row wins dedup, and a failure inside
+the report never blocks the save. Tests in
 [`tests/test_disagreements.py`](trade_scanner_fh/tests/test_disagreements.py).
 
 ---
@@ -1327,22 +1370,32 @@ and [`tests/test_adr_dollar_stops.py`](trade_scanner_fh/tests/test_adr_dollar_st
 
 ---
 
-## Quarter-series filters — consecutive growth & accelerating quarters
+## Quarter-series filters — beats, consecutive growth & accelerating quarters
 
-Six earnings filters that read a **run of quarters** rather than the most
-recent one. All six share one primitive in
-[`earnings_series.py`](trade_scanner_fh/earnings_series.py) and read the
-same point-in-time-correct slice the beats streak does (`report_date <=`
-scan end, real announcements preferred over finnhub calendar proxies).
+Eight earnings filters that read a **run of quarters** rather than the most
+recent one. Since v6.3.0 all eight share one primitive in
+[`earnings_series.py`](trade_scanner_fh/earnings_series.py) and read the same
+point-in-time-correct slice (`report_date <=` scan end, real announcements
+preferred over finnhub calendar proxies).
 
 | Row | Metric | Reports |
 |-----|--------|---------|
-| Consecutive YoY EPS Growth | `yoy_eps_pct` | longest qualifying run length |
-| Consecutive YoY Rev Growth | `yoy_rev_pct` | longest qualifying run length |
+| Consecutive EPS Beats | `surprise_eps_pct` | qualifying run length |
+| Consecutive Rev Beats | `surprise_rev_pct` | qualifying run length |
+| Consecutive YoY EPS Growth | `yoy_eps_pct` | qualifying run length |
+| Consecutive YoY Rev Growth | `yoy_rev_pct` | qualifying run length |
 | Accel Quarters — EPS Surprise | `surprise_eps_pct` | series length + span + values |
 | Accel Quarters — Rev Surprise | `surprise_rev_pct` | " |
 | Accel Quarters — YoY EPS Growth | `yoy_eps_pct` | " |
 | Accel Quarters — YoY Rev Growth | `yoy_rev_pct` | " |
+
+Before v6.3.0 the three types were three implementations that quietly
+disagreed about the same questions — which run counts, whether it has to be
+live, and what a missing quarter does. Beats was trailing-only and broke on
+any hole; growth took the longest run anywhere and bridged one; only the
+accelerating rows let you choose. Now every row carries the same two controls
+and the bridging allowance is a setting, with **defaults that reproduce each
+type's original behaviour exactly** — an existing preset selects identically.
 
 ### The quarter pool
 
@@ -1356,22 +1409,87 @@ value for that metric — the two are indistinguishable by design.
 
 ### Shared step rules
 
-- **One missing quarter may be bridged**; two or more break the run. A
-  bridged quarter does not count toward the length.
+- **Missing quarters may be bridged up to the per-type allowance**; one more
+  than that breaks the run. Configurable in Settings → Advanced… (see
+  [Missing-quarter bridging](#missing-quarter-bridging)).
+- **A missing quarter never counts toward a length**, wherever it sits. Length
+  is a count of quarters that actually carry data, so bridging only relaxes
+  the *continuity test* between two real quarters — it never adds a unit. A
+  run of 3 spanning a bridged hole covers four calendar quarters and reports
+  **3**. A hole at the *start* of the pool is additionally invisible: there is
+  no earlier quarter to measure the gap against, so a leading hole plus one
+  hit is a run of **1**, never 2. That is the right answer — the pool boundary
+  is arbitrary (Q Cap, the history window), so "a quarter is missing before
+  the oldest one in view" is not something the data can support.
 - **Negative → positive breaks the run**, however large the move: `-5 →
   +10` is a swing out of contraction, not acceleration within a trend.
   Zero is neither positive nor negative, so `-5 → 0` and `0 → +5` both
   hold.
-- **Every threshold is inclusive** (`>=`).
+- **Growth and acceleration thresholds are inclusive** (`>=`). **Beats is
+  strict** (`>`) — that is deliberate and long-standing: at `threshold=0`
+  only a positive surprise counts, and a dead-on-estimate quarter breaks the
+  streak.
+
+### Series and Backward Only
+
+Every one of the eight rows carries the same two controls.
+
+**Series** decides which run is reported when more than one qualifies:
+
+| Mode | Picks |
+|------|-------|
+| `Longest` | the greatest quarter count; ties go to the newer run |
+| `Most Recent` | the run with the newest terminal quarter, however short |
+
+**Backward Only** requires the run to **terminate on the newest quarter in
+the pool** — the "is the streak still live?" question. If that quarter is not
+a hit the ticker fails outright; the anchor is never stepped back to hunt for
+an earlier run. It greys out `Series`, because anchoring leaves at most one
+candidate and there is then nothing to choose between.
+
+This matters more than it sounds. Without it, a growth filter reporting "6
+consecutive quarters of YoY EPS growth" will happily pass a stock whose six
+qualifying quarters ended eighteen months ago and whose last six are all
+declines — because the pass condition is "there *exists* a run of length ≥ N".
+The only prior workaround was setting Q Cap equal to Min, which is blunt and
+still admits a run that misses the newest quarter.
+
+**Defaults, chosen to preserve each type's prior behaviour:**
+
+| Type | Series | Backward Only | Bridging | Threshold |
+|------|--------|---------------|----------|-----------|
+| Beats | `Longest` | **on** | 0 | strict `>` |
+| Growth | `Longest` | off | 1 | inclusive `>=` |
+| Accelerating | `Longest` | off | 1 | inclusive `>=` |
+
+The funnel log names the active mode, so `Consec EPS Beats >= 3 (>0%,
+backward)` and `… (longest)` are distinguishable after the fact — "4 passed"
+means very different things under the two.
+
+### Missing-quarter bridging
+
+How many consecutive **missing** fiscal quarters a run may span before it
+breaks, set per filter type in Settings → Advanced… and persisted to
+`user_config.json` as `SERIES_MAX_BRIDGED_BEATS` / `_GROWTH` / `_ACCEL`
+(range 0–4; defaults 0 / 1 / 1).
+
+0 means any hole ends the run. The ceiling of 4 is deliberate: bridging a
+full year of non-reporting is about as far as "consecutive" can be stretched
+before the word stops meaning anything.
+
+Note the interaction with the pool: a quarter counts as *missing* when it has
+no row **or** its row has a NaN value for that metric — except for beats,
+where a present row with a null surprise is treated as a **miss that breaks
+the run**, not as a hole. `surprise_*_pct` is null often enough that the other
+reading would rewrite history: measured across the live store it moves 2.56%
+of EPS streaks, and AFRM would report a live 13-quarter beat streak on a
+ticker whose newest quarter has no surprise figure at all.
 
 ### Consecutive YoY Growth
 
-A quarter is a hit when its YoY growth clears the Growth % threshold; the
-filter reports the length of the **longest qualifying run anywhere in the
-pool**. Two deliberate differences from Consecutive Beats, both required
-by the spec: beats counts only the *trailing* streak and breaks on any
-missing quarter, whereas these bridge a single hole and will find a run
-that ended several quarters ago.
+A quarter is a hit when its YoY growth clears the Growth % threshold. By
+default the filter reports the **longest qualifying run anywhere in the
+pool** — tick Backward Only to require a live run instead.
 
 ### Accelerating Quarters
 
@@ -1819,7 +1937,51 @@ Live at `zacks_scraper.py`. Key facts:
 - **HTTP-only — no browser engine**. Playwright was tried and dropped (see comments at scraper.py:7-22). Every browser engine (headless or headful Chromium / Firefox / patchright) gets caught at the TLS layer.
 - **Parses the embedded `document.obj_data = {...}` JS object** rather than scraping the rendered DOM. Faster, more robust to layout changes.
 - **Cookie jar**: file-backed at `scanner_data/zacks_cookies.txt`. Stored as a `name=value; name=value; ...` header string (matches the format used to inject into `curl_cffi.Session.cookies`).
-- **Failure classification** (FAIL_BLOCKED / FAIL_NOT_FOUND / FAIL_HTTP_ERROR / FAIL_PARSE_ERROR): drives the auto-pause heuristic. Only confirmed Imperva blocks count toward the consecutive-failure threshold. Since 2026-06, `FAIL_PARSE_ERROR` is live and reserved for **genuinely unparseable pages** — the `obj_data` token is present but neither the strict nor the fallback parser can read it. A readable-but-empty `obj_data = {}` (Zacks has no data for the ticker) still classifies as FAIL_NOT_FOUND.
+- **Failure classification** (see the taxonomy below): drives the auto-pause heuristic. Only confirmed Imperva blocks count toward the consecutive-failure threshold. Since 2026-06, `FAIL_PARSE_ERROR` is live and reserved for **genuinely unparseable pages** — the `obj_data` token is present but neither the strict nor the fallback parser can read it. A readable-but-empty `obj_data = {}` (Zacks has no data for the ticker) still classifies as FAIL_NOT_FOUND.
+
+### Failure taxonomy (v6.3.0)
+
+`FAIL_HTTP_ERROR` used to be one bucket collapsing five unrelated outcomes,
+every one of them logged at DEBUG so none reached the GUI. The end-of-run line
+then reported the lot as "HTTP / network error(s) (transient)" — an assertion
+nobody had measured. On 2026-09-18 that line covered 38 failures out of 111
+attempts, and they were mostly 404s: permanent, not transient at all.
+
+| Kind | Raised by | Means |
+|------|-----------|-------|
+| `FAIL_BLOCKED` | Imperva interstitial markers | Cookie refresh needed; the only kind that counts toward auto-pause |
+| `FAIL_NOT_FOUND` | no `obj_data`, or empty EPS+Rev tables | Zacks does not cover it. **Auto-blacklisted** after the run |
+| `FAIL_REJECTED_SYMBOL` | `config.url_safe_ticker` refused it | Never reached the network. **Permanent** |
+| `FAIL_HTTP_4XX` | status 400–499 except 429 | Gone or forbidden. **Permanent** — will fail identically next run |
+| `FAIL_HTTP_429` | status 429 | Rate limited. Raise the per-request delay; do not just retry |
+| `FAIL_HTTP_5XX` | status ≥ 500 | Zacks server-side. Retryable |
+| `FAIL_NETWORK` | `curl_cffi` `RequestsError` subclass | Timeout / DNS / reset. Genuinely transient |
+| `FAIL_OVERSIZED` | body past `ZACKS_MAX_RESPONSE_BYTES` | Almost always a block page, not content |
+| `FAIL_PARSE_ERROR` | `obj_data` present but unreadable | Page-format break. Never blacklisted |
+| `FAIL_HTTP_ERROR` | anything unclassified | Catch-all, so no path goes unrecorded |
+
+`TRANSIENT_FAIL_KINDS` and `PERMANENT_FAIL_KINDS` group these for the GUI, so
+the summary can say which failures are worth retrying instead of calling them
+all transient. Each failure also records a **detail** string
+(`ZacksSession.last_failure_detail` — `"HTTP 404"`, `"ReadTimeout"`,
+`"body 41.2 MB"`) that rides through `failed_cb` to
+`Data → Show Last Zacks Failures…`, which now lists the per-ticker detail and
+leads each section with a tally of the distinct causes.
+
+> **Fixed in passing:** the network handler read `except
+> requests.RequestException`, but this module's `requests` is curl_cffi's
+> drop-in, which exports that base class as **`RequestsError`**. Evaluating a
+> missing attribute in an `except` clause raises `AttributeError` at the moment
+> an error actually occurs, so every genuine network failure escaped
+> classification and landed in the fill loop's catch-all `"unknown"` bucket.
+> It read as correct because the class is *internally* named
+> `RequestException`.
+
+`failed_cb` is now `(symbol, kind, detail)`. Two-argument callbacks still work
+— `_as_three_arg_failed_cb` resolves the arity once, by signature, before the
+loop starts. Deliberately not try/except around the call: a `TypeError` thrown
+from *inside* a three-arg callback would otherwise look like an arity mismatch
+and get silently retried with two.
 
 ### Drift-tolerant parsing + parse-failure spike alarm (2026-06)
 
@@ -1902,11 +2064,29 @@ After an OHLCV update completes (and only on the real-update path — a
 fresh-cache skip never reaches it), `_kick_off_smart_refresh` computes one
 shared per-ticker candidate set (`find_smart_refresh_candidates` — tickers
 due for a new quarter, minus the OHLCV blacklist + ETF/ADR auto-skip) and
-launches **all three history sources against it concurrently** (finviz +
-zacks + finnhub, each on its own `QThread`). Each source then applies its
-own per-source skip set; whichever lands a quarter first wins the
-`finviz > zacks > finnhub` dedup. A bulk-sized candidate set (>
-`ZACKS_SMART_REFRESH_BULK_THRESHOLD`) prompts Run / Skip / Disable first.
+launches the history sources against it concurrently, each on its own
+`QThread`. Each source then applies its own per-source skip set; whichever
+lands a quarter first wins the `finviz > zacks > finnhub` dedup. A bulk-sized
+candidate set (> `ZACKS_SMART_REFRESH_BULK_THRESHOLD`) prompts Run / Skip /
+Disable first.
+
+**The automatic cycle is finviz + zacks only.** Finnhub is excluded by
+`config.FINNHUB_IN_AUTO_REFRESH = False` — least-effective source, manual-only
+via its own Bulk/Gap/Spot actions or `Run Earnings Smart Refresh Now` (which
+does start all three).
+
+**The all-blocked trim is scoped to the sources that will actually run
+(v6.3.0).** `_trim_all_blocked_candidates` drops candidates every running
+source has permanently blacklisted, because a name no source can cover is pure
+dead weight: it inflates the flagged count, false-fires the bulk-run warning,
+and makes the prompt promise far more work than the workers will queue. It
+previously intersected all three blacklists unconditionally — *including
+finnhub's, on a cycle that never starts finnhub* — so a ticker finviz and zacks
+had both given up on survived the trim whenever finnhub happened not to list
+it. Measured on the live store 2026-09-18: **1,090 such tickers**, each one
+counted into the announced "N due" and then silently dropped by both workers.
+The helper now takes the source set as an argument; the auto path passes
+`("finviz", "zacks")` and the manual path all three.
 
 **Daily calendar + same-launch capture (2026-06-06).** The candidate
 selector keys off the earnings calendar's `last_earnings`
@@ -2231,7 +2411,8 @@ grouping reflects the five-source architecture plus diagnostics:
 
 — Diagnostics —
     Earnings Coverage Report...
-    Verify earnings_history Integrity...
+    Verify earnings_history Integrity...     (+ Re-fetch these (N)... on missing_quarter)
+    Re-check Stale Skips...
     Data Coverage Gaps...
 ```
 
@@ -2262,8 +2443,12 @@ Advanced…
 - **Advanced…** — user-configurable tunables persisted to the gitignored
   `scanner_data/user_config.json`: `OHLCV_HISTORY_YEARS` (1–25, default 5),
   `EARNINGS_HISTORY_YEARS` (1–25, default 10), the
-  `REFERENCE_TICKERS` benchmark list, and the launch-time OHLCV prefetch
-  toggle (`PREFETCH_OHLCV_AT_LAUNCH`, default off). `config.load_user_config()`
+  `REFERENCE_TICKERS` benchmark list, the launch-time OHLCV prefetch
+  toggle (`PREFETCH_OHLCV_AT_LAUNCH`, default off), and the per-type
+  series bridging allowances `SERIES_MAX_BRIDGED_BEATS` / `_GROWTH` /
+  `_ACCEL` (0–4; defaults 0 / 1 / 1 — see
+  [Missing-quarter bridging](#missing-quarter-bridging)). Bridging applies
+  to the next scan; no restart. `config.load_user_config()`
   applies valid overrides at module import (the bottom of `config.py`);
   the dialog's OK applies them to the live config module immediately — no
   restart. Values are clamped to their ranges, and a corrupt / non-object
@@ -2553,10 +2738,11 @@ never touched by a rebuild.
 | `earnings_dates_by_source.parquet` | DataFrame | `nasdaq_fill`, `yahoo_fill`, finviz's forward-date flush | **v6.0.0.** Each date source's own observation, keyed `(ticker, source)`. Before it, all three wrote into the single row above, so the last fill to run won and the priority chain never applied to the date-backed sources. The reconciler reads this and still writes the 1:1 consumer file, so readers are unaffected |
 | `earnings_history.parquet` | DataFrame | Finviz scrape + Zacks scraper + Finnhub `/stock/earnings` | Per-quarter EPS / revenue history (`EARNINGS_HISTORY_YEARS`, default 10); per-slot priority dedup (finviz > zacks > finnhub), with reported actuals merged across sources and estimate/surprise figures finviz-only (v6.0.0) |
 | `earnings_raw/{source}/<run_id>.parquet` | DataFrame | Each fill's raw response | Append-only audit/replay layer. **v6.0.0:** 365 d for every source (`RAW_RETENTION_DAYS`) plus a keep-newest-N floor (`RAW_MIN_RUNS_KEPT`, 5) that survives any quiet stretch. finviz/zacks were on 30 d, which is where the truncation guard falls back — and an age-only rule empties the directory exactly when the store has sat untouched |
-| `earnings_disagreements.csv` | CSV | `report_cross_source_disagreements` (rewritten at every canonical history save) | Report-only cross-source EPS disagreement findings; always reflects the latest save |
+| `earnings_disagreements.csv` | CSV | `report_cross_source_disagreements` (merged at every canonical history save) | Report-only cross-source EPS disagreement findings. **v6.3.0:** a standing record, not a snapshot — each save rewrites only the slots it could actually compare, so two sources finalizing in the same refresh no longer blank each other's findings |
 | `ohlcv_anomalies.csv` | CSV | `data_engine.write_anomaly_report` (end of every OHLCV update) | **v6.0.0.** One row per (ticker, anomaly) from `validate_ticker` — zero/negative prices, OHLC-bound violations, duplicate dates, price jumps, date gaps. Previously computed, logged at INFO and discarded. A run that flags nothing leaves the file alone rather than erasing a full sweep's findings |
 | `.finviz_bulk_checkpoint.json` / `.finnhub_bulk_checkpoint.json` / `.zacks_bulk_checkpoint.json` | JSON | `fill_framework` | Resumable bulk-fill progress; cleared only on natural completion (preserved on stop / block-halt / spike-halt). **The zacks one is v6.0.0** — that fill had no resume at all, so a killed bulk restarted ~6.5 h of work |
 | `.ohlcv_gap_attempts.json` | JSON | `data_engine.record_gap_attempts` | **v6.0.0.** Ledger of interior-gap repair attempts, so a hole that survives a rebuild (a real trading halt, or bars the provider lacks) isn't rebuilt again for `OHLCV_GAP_RECHECK_DAYS` (90) |
+| `.earnings_gap_attempts.json` | JSON | `earnings_history.record_earnings_gap_attempts` | **v6.3.0.** The same idea for quarter gaps: `{ticker: ISO date}` of the last `missing_quarter` re-fetch, so a ticker rests for `EARNINGS_GAP_RECHECK_DAYS` (100 — a quarter plus reporting lag) before it can re-enter the finding. A legitimately-gapped name (went dark, fiscal-year change) cannot gain the missing quarter until its next filing, so re-asking sooner is pure traffic. Unreadable file → "no attempts recorded" |
 | `.gap_fill_dedup_v1.done` | sentinel | `migrate_to_gap_fill_dedup` | One-time gap-fill dedup migration marker |
 | `.acl_hardened_v2.done` | sentinel | `harden_data_dir_acl` | ACL hardening marker. Bumped to v2 in v5.5.0 so installs that ran the broken v1 repair themselves |
 | `zacks_cookies.txt` | text | Firefox cookie capture | Imperva session tokens (DPAPI-encrypted at rest) |
@@ -2581,16 +2767,44 @@ never touched by a rebuild.
 no metadata at all, which made a re-check cadence impossible to implement — a
 single "empty" response (for finviz, a bare HTTP 404) excluded a ticker
 *forever*, including a brand-new IPO with no earnings yet or a symbol 404-ing
-during a site migration. Data → **Re-check Stale Skips…** now re-offers entries
-auto-added more than `SKIP_RECHECK_DAYS` (90) ago, capped at
-`SKIP_RECHECK_MAX` (500) per list; anything still uncovered is re-added on the
-next fill. Manual entries are never re-checked. The loader reads legacy
-bare-ticker files unchanged, so upgrading loses nothing.
+during a site migration. Data → **Re-check Stale Skips…** re-offers aged
+entries so the next Gap Fill tries them; anything still uncovered is re-added
+on the next fill. The loader reads legacy bare-ticker files unchanged, so
+upgrading loses nothing.
 
-> A consequence worth knowing: because manual entries are never re-offered, a
-> list whose entries all carry `REASON=manual` is a permanent exclusion set. If
-> a list was bulk-stamped `manual` by an older build, re-stamping those rows to
-> `empty` is what puts them back in the re-check rotation.
+**v6.3.0 — the re-check is a dialog, not a hardcoded rule.** It was fixed at
+"`REASON=empty`, older than `SKIP_RECHECK_DAYS` (90), capped at
+`SKIP_RECHECK_MAX` (500) per list", and as a fixed rule it could not reach the
+list that most needed it. On 2026-09-18 the zacks skip list held **10,143
+entries, 100% labelled `manual`** — and `manual` was the fallback stamped on
+any entry that arrived with *no recorded reason*, not evidence of curation. The
+rule read them as the user's deliberate exclusions and re-checked **none** of
+them.
+
+Two changes:
+
+1. **The fallback label is now `unknown`.** `manual` claimed an intent nobody
+   expressed. Entries already on disk keep the label they were written with —
+   relabelling them would be guessing at intent we do not have.
+2. **Every part of the filter is selectable at run time**: the staleness
+   window, the per-list cap, which of the three earnings sources participate,
+   which reason codes count, and whether undated legacy rows are included
+   (off by default — they sort last so the cap is spent on entries that can
+   actually be aged). Eligible counts update live as you change any of them,
+   so you can see what a filter would do before running it.
+
+Against the live lists that reads:
+
+| Setting | zacks | finviz | finnhub |
+|---|---:|---:|---:|
+| Default (`empty` only, cap 500) | **0** | 500 | 500 |
+| Tick `manual` | **500** | 500 | 500 |
+| Cap raised to 10,000 | **10,000** | 4,515 | 3,019 |
+
+Scope is the three **earnings** skip lists. The universal OHLCV `blacklist.txt`
+is deliberately absent: it is one comma-joined line with no dates and no
+reasons, so "older than N days" has nothing to read. The dialog re-enables
+entries only — it fetches nothing, same as before.
 
 Relatedly, the universal `blacklist.txt` is no longer *unioned into* the finviz
 and finnhub lists. That merge was irreversible — removing a ticker from
@@ -2613,7 +2827,7 @@ data directory.
 
 ## Testing
 
-Test suite at `trade_scanner_fh/tests/` — **1,498 tests, all passing** as of 2026-08-16 (v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
+Test suite at `trade_scanner_fh/tests/` — **1,852 tests, all passing** as of 2026-09-18 (v6.3.0 added 93 across the disagreement merge, the failure taxonomy, the trim scoping, both new features and the unified series engine; v6.2.0 brought it to 1,759; v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
 
 ```bash
 cd c:/python/EDA_Project/Trade_Scanner_FH
@@ -2656,7 +2870,7 @@ client's rate limiter).
 | `test_earnings_reconcile.py` | Multi-source priority chain (nasdaq → yahoo → finviz → zacks → finnhub), aug-label generation, stale-date filtering, finnhub-as-last-resort |
 | `test_earnings_aligned_dates.py` | Date-alignment + match-color anchoring |
 | `test_earnings_raw.py` | Raw audit/replay layer per source |
-| `test_zacks_scraper.py` | curl_cffi parser, fetch, session |
+| `test_zacks_scraper.py` | curl_cffi parser, fetch, session, **failure taxonomy** (status-code → kind, curl_cffi's real exception base, detail strings, `failed_cb` arity probe) |
 | `test_finnhub_client.py` | Finnhub REST primitives, rate limiter, key storage |
 | `test_finnhub_fill.py` | Bulk/gap/spot fills, period_ending day-1 normalization, fiscal-year multi-record dedup, canonicalization handling |
 | `test_nasdaq_fill.py` | finance-calendars bulk fill |
@@ -2667,11 +2881,15 @@ client's rate limiter).
 | `test_cookie_dialog_smoke.py` | Cookie-paste dialog |
 | `test_zacks_failure_breakdown.py` | FAIL_* sentinel classification |
 | `test_smart_refresh.py` | Candidate selection (gap / just-reported / long-stale) |
-| `test_smart_refresh_workers.py` | Concurrent smart-refresh worker bringup (targeted mode) |
+| `test_smart_refresh_workers.py` | Concurrent smart-refresh worker bringup (targeted mode); **all-blocked trim scoped to the sources that actually run** |
 | `test_earnings_coordinator_spawns.py` | EarningsRefreshCoordinator delegate parity + worker spawn wiring |
-| `test_blacklist_manager.py` | `gui/blacklists.py` load/save/normalize plumbing |
+| `test_blacklist_manager.py` | `gui/blacklists.py` load/save/normalize plumbing (incl. the `unknown` no-reason fallback) |
+| `test_skip_recheck.py` | Stale-skip re-check: configurable window / reasons / sources / cap, undated opt-in, failed-save rollback, and `StaleSkipDialog.selection()` driven directly |
 | `test_parse_spike.py` | Parse-failure spike alarm (threshold math, checkpoint preservation, no-blacklist guarantee) |
-| `test_disagreements.py` | Cross-source EPS disagreement report (detection tolerances, CSV rewrite, report-only guarantee) |
+| `test_disagreements.py` | Cross-source EPS disagreement report (detection tolerances, report-only guarantee, **slot-scoped merge** — concurrent finalize cannot blank another source's findings, a re-examined slot still clears, findings accumulate, CSV round-trip key match) |
+| `test_quarter_gap_refetch.py` | **v6.3.0.** `missing_quarter` detector ↔ finding agreement, attempt ledger round-trip / corruption degradation / clear, resting window incl. the edge day, widest-hole-first ordering |
+| `test_series_selectors.py` | **v6.3.0.** The shared series engine: selection modes, Backward Only, bridging allowance, strict-vs-inclusive thresholds, `keep_valueless`, beats-default-equals-legacy parity, the report_date-ordering phantom gap, the config knobs, and the GUI controls on all eight rows |
+| `test_quarter_gap_refetch_gui.py` | **v6.3.0.** The re-fetch action row: offers exactly the detected tickers, stamps the ledger before launching, hands finviz + zacks (never finnhub) to the fill, refuses while a fill runs, reset button |
 | `test_rvol_atr_stop.py` | RVOL indicator + funnel stage + panel row; ATR Stop derived column |
 | `test_adr_dollar_stops.py` | ADR% ratio-form formula + lookback-20 default; $ADR indicator/filter/panel row; ADR Stop column; configurable stop multipliers; preset back-compat |
 | `test_watchlist_diff.py` | scan_history persistence, Chg column stamping, baseline-poisoning guards, 90-day prune |
@@ -2747,14 +2965,24 @@ rm -rf build
 find . -name __pycache__ -type d -not -path "./venv/*" -not -path "./dist/*" \
        -exec rm -rf {} + 2>/dev/null
 
-# 4. Build.
+# 4. Build to a SCRATCH output dir — never straight into dist/.
+#    --noconfirm deletes the output directory first, and scanner_data/ lives
+#    inside dist/Trade_Scanner_FH/. See the preservation section below.
 c:/python/envs/eda-pipeline/python.exe -m PyInstaller \
-    Trade_Scanner_FH.spec --clean --noconfirm
+    Trade_Scanner_FH.spec --clean --noconfirm --distpath dist_build
 
-# 5. Verify.
-ls -lh dist/Trade_Scanner_FH/Trade_Scanner_FH.exe   # ~25 MB stub
-du -sh dist/Trade_Scanner_FH                        # ~294 MB total
-ls dist/Trade_Scanner_FH/scanner_data/              # data intact
+# 5. Verify the fresh bundle BEFORE it touches dist/.
+ls -lh dist_build/Trade_Scanner_FH/Trade_Scanner_FH.exe   # ~25 MB stub
+powershell -Command "(Get-Item dist_build/Trade_Scanner_FH/Trade_Scanner_FH.exe).VersionInfo.FileVersion"
+
+# 6. Swap in only the two build outputs; scanner_data/ never moves.
+rm -rf dist/Trade_Scanner_FH/_internal
+mv dist_build/Trade_Scanner_FH/_internal          dist/Trade_Scanner_FH/_internal
+mv -f dist_build/Trade_Scanner_FH/Trade_Scanner_FH.exe dist/Trade_Scanner_FH/
+rm -rf dist_build
+
+# 7. Confirm the store is untouched (compare against the count from step 0).
+find dist/Trade_Scanner_FH/scanner_data -type f | wc -l
 ```
 
 ### `--onedir`, and why the data directory moved
@@ -2858,24 +3086,36 @@ A naive rebuild destroys the whole store (43,869 files at the time of
 writing: every OHLCV parquet, the earnings history, cookies, the SEC contact
 email, and every saved preset).
 
-Move it out first, and move it back after:
+**Do not park the store and move it back.** That was the original drill and
+it does not work: `firefox_zacks_profile/` holds an open directory handle even
+with no Firefox process running and no file locked, so the `mv` fails
+part-way — and that directory is ~76% of the store's files, so a partial move
+is the worst possible outcome. It is also unnecessary.
+
+**Build to a scratch `--distpath` and swap the two outputs in.** The store
+never moves at all, so nothing can go wrong with moving it:
 
 ```bash
-# 1. Park the data OUTSIDE the build output path (same-volume rename; instant)
-mv dist/Trade_Scanner_FH/scanner_data dist/_scanner_data_SAFE
+# 0. Record the baseline so step 3 can prove nothing was lost.
+find dist/Trade_Scanner_FH/scanner_data -type f | wc -l
 
-# 2. Build (see above)
+# 1. Build into a scratch directory (see "Build the bundle" above).
+c:/python/envs/eda-pipeline/python.exe -m PyInstaller \
+    Trade_Scanner_FH.spec --clean --noconfirm --distpath dist_build
 
-# 3. Restore
-mv dist/_scanner_data_SAFE dist/Trade_Scanner_FH/scanner_data
+# 2. Swap ONLY the exe and _internal/.
+rm -rf dist/Trade_Scanner_FH/_internal
+mv dist_build/Trade_Scanner_FH/_internal          dist/Trade_Scanner_FH/_internal
+mv -f dist_build/Trade_Scanner_FH/Trade_Scanner_FH.exe dist/Trade_Scanner_FH/
+rm -rf dist_build
 
-# 4. Verify the file count matches what you parked
+# 3. Same count as step 0.
 find dist/Trade_Scanner_FH/scanner_data -type f | wc -l
 ```
 
-Step 2 is also the right moment to cut a release archive — the bundle at that
-point is provably just `Trade_Scanner_FH.exe` + `_internal/`, with no user
-data anywhere near it.
+`dist_build/Trade_Scanner_FH/` right after step 1 is also the right thing to
+cut a release archive from — it is provably just `Trade_Scanner_FH.exe` +
+`_internal/`, with no user data anywhere near it.
 
 Beyond that, a rebuild may freely delete `build/`, `__pycache__/`
 directories, and the previous `_internal/`.
@@ -2883,6 +3123,105 @@ directories, and the previous `_internal/`.
 ---
 
 ## Changelog
+
+### v6.3.0 — diagnostics that can be acted on (2026-09-18)
+
+Prompted by reading one nightly cache-update log closely. Four defects, a
+visibility gap, and the two features the defects made obvious.
+
+**The cross-source disagreement report was erasing itself again.** 221 findings
+were written at 21:23 and were a bare header by 21:26. The v5.5.1 guard refused
+to write when a frame had *zero* comparable slots, which stops the failure it
+was written for but not this one: the smart refresh runs finviz + zacks
+concurrently, so the second source to finalize did so on the already-deduped
+store plus its own 64 fresh rows, re-created a handful of comparable slots —
+enough to clear the guard — found none contested, and wrote the empty result
+over the whole file. The report is now a **standing record merged across
+saves**: each save rewrites only the slots its own frame could compare. A slot
+that was contested and is now clean still clears. The 221 findings were
+recovered from the rolling `.autobak1`; all were finviz-vs-zacks, and a cluster
+of them look like split-adjustment mismatches (NTRP is exactly 10× on three
+separate quarters) rather than noise.
+
+**`http_error` was one bucket for five unrelated outcomes**, all logged at
+DEBUG, and the end-of-run summary called the lot "transient". In the observed
+run that covered 38 of 111 attempts, mostly 404s. Split into `http_4xx` /
+`http_429` / `http_5xx` / `network` / `rejected_symbol` / `oversized`, each
+carrying a detail string, with permanent and transient reported separately and
+`Show Last Zacks Failures…` listing per-ticker causes. See
+[Failure taxonomy](#failure-taxonomy-v630).
+
+**The network handler caught an exception that does not exist.** `except
+requests.RequestException` — but this module's `requests` is curl_cffi's
+drop-in, which exports the base as `RequestsError`. A missing attribute in an
+`except` clause raises `AttributeError` *when an error occurs*, so every
+genuine network failure escaped classification into the catch-all "unknown"
+bucket. It read as correct because the class is internally named
+`RequestException`.
+
+**The smart-refresh trim intersected a source that wasn't going to run.**
+`_trim_all_blocked_candidates` ANDed all three blacklists including finnhub's,
+on a cycle that excludes finnhub — so a ticker finviz and zacks had both given
+up on survived the trim. **1,090 tickers** on the live store, each counted into
+the announced "N due" and then dropped by both workers: exactly the
+over-promise the helper exists to prevent. It now takes the running source set
+as an argument.
+
+**Zacks reconciled twice per fill**, five seconds apart, both reporting
+`z=1, y=72, aug=0`. The worker's "belt-and-suspenders per spec §5.2" reconcile
+duplicated the one `_finalize_fill` already does, and could not add anything —
+a ticker that errored gained no rows, so reconciling it is a no-op. It was not
+a crash guard either, despite the name: it sat on the success path, so a fill
+that *raised* skipped it entirely. Moved to the `except` branch, where
+`_finalize_fill` genuinely never ran.
+
+**New — `missing_quarter` is a work queue, not a wall.** The finding reported
+525 tickers and offered no way to act on them, and no memory of what had been
+tried, so the same names returned every run whether or not anything was done.
+It now has a **Re-fetch these (N)…** button (targeted finviz + zacks against
+exactly the detected tickers) backed by a `.earnings_gap_attempts.json` ledger
+mirroring the OHLCV one: each attempt rests the ticker for
+`EARNINGS_GAP_RECHECK_DAYS` (100 — a quarter plus reporting lag, since a real
+hole cannot fill before the next filing). Stamping happens *before* the fill,
+so a permanently-uncoverable name still rests; **Reset rested (N)** is the
+escape hatch, and `apply_attempt_ledger=False` still gives the unfiltered
+truth. `find_quarter_gap_tickers` is now the single source of truth behind both
+the finding and the button, so the queued list cannot drift from the reported
+one.
+
+**New — the stale-skip re-check is a dialog.** The fixed `empty`-only rule
+could not reach the zacks list's 10,143 entries, every one labelled `manual` —
+which was the fallback for *no recorded reason*, not curation. The no-reason
+fallback is now `unknown`, and the window, cap, sources and reason codes are
+all selectable with live eligible counts. Existing entries are **not**
+relabelled. Earnings lists only: the OHLCV blacklist has no dates to age. See
+[Skip-list format](#storage-layout).
+
+**New — one series engine under all eight quarter-run filters.** Beats,
+consecutive YoY growth and accelerating quarters were three implementations
+quietly disagreeing about the same three questions. They now share
+`earnings_series.run_series` / `accelerating_series`, and every row carries
+`Series` (Longest / Most Recent) and `Backward Only`. Defaults reproduce each
+type's prior behaviour exactly — beats `backward_only=True` / bridge 0 /
+strict `>`, growth and accel `longest` / bridge 1 / inclusive `>=` — so an
+existing preset selects identically. The missing-quarter bridging allowance is
+now a per-type setting in Settings → Advanced… (`SERIES_MAX_BRIDGED_BEATS` /
+`_GROWTH` / `_ACCEL`, 0–4). The funnel log names the active mode, because "4
+passed" means very different things under `backward` and `longest`. See
+[Series and Backward Only](#series-and-backward-only).
+
+**Fixed while unifying them: the beats streak was truncated by a phantom
+missing quarter.** `compute_consecutive_beats` measures the `period_ending`
+gap across a frame ordered by **`report_date`** — the right metric over the
+wrong ordering. When a late filing puts two quarters out of fiscal sequence,
+that diff spans two quarters and reads as a hole that does not exist. ALRM's
+2019 quarters arrive `2019-09, 2019-03, 2019-06` under report_date DESC; the
+measured gap was 184 days and a real 35-quarter streak was reported as 28.
+The series path sorts into fiscal order before measuring, so the hole never
+appears. Five tickers across both metrics were affected (0.05% of 5,931) —
+every divergence is this bug, and every one restores a real streak.
+
+1,852 tests, plus a 20-check end-to-end smoketest against the live store.
 
 ### v6.2.0 — quarter-series filters + three point-in-time fixes (2026-09-07)
 
@@ -2896,7 +3235,7 @@ large. Each accelerating row reports its series as three condensed cells
 (quarter count, fiscal-period span, `V(start) -> V(end)`), and all three
 carry the series' report dates as match-colour anchors — the one place a
 cell pairs on *two* candidate dates rather than one. See
-[Quarter-series filters](#quarter-series-filters--consecutive-growth--accelerating-quarters).
+[Quarter-series filters](#quarter-series-filters--beats-consecutive-growth--accelerating-quarters).
 
 Verified three ways: the spec's own T1–T8 acceptance cases, a full-universe
 invariant sweep, and a differential check against a brute-force oracle
@@ -3364,6 +3703,19 @@ These are properties the codebase depends on. Breaking any one is a regression w
 61. **Gap repair is bounded and remembers its attempts.** Unbounded, the first sweep of a holed cache queues thousands of full re-downloads at provider pacing. And a hole that survives a rebuild is source-level — a real halt, or bars the provider lacks — so it must not be retried every launch.
 62. **A report that finds nothing leaves its file alone.** Applies to `ohlcv_anomalies.csv` exactly as it does to `earnings_disagreements.csv`: rewriting unconditionally lets a two-ticker run erase a full sweep's findings.
 63. **Every `DATA_DIR`-derived path used by a test must be redirected by the fixture.** Module-level `Path` constants bake the real `scanner_data/` at import, so patching `DATA_DIR` alone is not enough — tests wrote into the live tree twice during this audit. Prefer a call-time helper (`config.earnings_source_parquet()`) over a new module constant.
+
+### 2026-09 additions (v6.3.0)
+
+64. **A save may only rewrite the disagreement rows it actually compared.** Invariant 62 ("a report that finds nothing leaves its file alone") is necessary but not sufficient: a save with a *handful* of comparable slots passes it and still speaks for the whole file. Two concurrent sources finalize independently, so the write must be scoped to `_comparable_slots(frame)` — not gated on its count. Any future report that runs per-save and persists globally needs the same treatment.
+65. **A blacklist intersection is only meaningful over the sources that will run.** `_trim_all_blocked_candidates` drops names *every* source has given up on; including a source the cycle never starts turns the AND into a filter that passes work nobody will do. Pass the real source set, and keep it in step with `config.FINNHUB_IN_AUTO_REFRESH`.
+66. **A fill reconciles exactly once, at `_finalize_fill`.** Errored tickers gained no rows, so reconciling them adds nothing; a second pass is pure duplicate I/O. The crash path is the one place that legitimately needs its own reconcile, because `_finalize_fill` never ran there.
+67. **A failure kind must distinguish permanent from transient.** A single HTTP bucket cannot, and reporting 404s as "transient" invites re-running work that will fail identically. New kinds belong in `TRANSIENT_FAIL_KINDS` or `PERMANENT_FAIL_KINDS`, and every classification site sets a detail string — the kind is for tallies, the detail is for humans.
+68. **`manual` is a claim about intent — never use it as a fallback.** The re-check deliberately leaves curated entries alone, so a default of `manual` silently makes every unlabelled entry permanent. Unknown provenance is `unknown`. Existing labels are not rewritten: relabelling guesses at intent the code does not have.
+69. **An attempt ledger stamps BEFORE the work, and degrades to "never tried".** Stamping after would re-queue every permanently-uncoverable name on each run, which is the churn the ledger exists to stop; an unreadable or corrupt ledger must re-offer rather than hide, so losing it costs a repeated fetch and never data. Both ledgers (`.ohlcv_gap_attempts.json`, `.earnings_gap_attempts.json`) follow this.
+70. **A diagnostic that offers an action derives the action's targets from the same function that produced the finding.** `find_quarter_gap_tickers` backs both the `missing_quarter` count and the re-fetch button, so what is queued is by construction what was reported.
+71. **Unifying filters must not change their defaults.** Beats, growth and acceleration now share one primitive, and each type's defaults are set so the shared implementation reproduces its prior behaviour exactly (beats `backward_only=True` / bridge 0 / strict `>`; the other two `longest` / bridge 1 / inclusive `>=`). A saved preset is a user's committed intent — a refactor may widen what is *possible*, never silently change what an existing configuration selects. `test_series_selectors.py` pins the parity against `compute_consecutive_beats` on real-shaped frames.
+72. **Measure a series gap in fiscal order, never in arrival order.** `period_ending` is the right metric, but only over a frame sorted by `period_ending`. Measuring it across a `report_date`-ordered frame — which `compute_consecutive_beats` does — fabricates a hole whenever a late filing puts two quarters out of sequence, silently truncating a real streak.
+73. **A null metric value is a hole for some filters and a miss for others, and the difference is load-bearing.** `build_quarter_points(keep_valueless=...)` makes it explicit rather than implicit. `surprise_*_pct` is null often enough that reading a null as "quarter absent" would let a dead streak look live on 2.56% of tickers.
 
 ---
 
