@@ -608,13 +608,23 @@ class MainWindow(QMainWindow):
         act_bulk_zacks.triggered.connect(self._bulk_fill_zacks)
         data_menu.addAction(act_bulk_zacks)
 
-        act_tgt_zacks = QAction("Targeted Fill Earnings (Zacks)", self)
+        act_tgt_zacks = QAction("Gap Fill Earnings (Zacks)", self)
         act_tgt_zacks.setToolTip(
-            "Re-pull earnings history from Zacks for tickers with no rows in "
-            "earnings_history.parquet. Skips tickers already covered."
+            "Run Zacks against tickers that have NO Zacks-source rows yet in "
+            "earnings_history.parquet. Tickers finviz / Finnhub already cover "
+            "ARE included — Zacks coverage is independent."
         )
-        act_tgt_zacks.triggered.connect(self._targeted_fill_zacks)
+        act_tgt_zacks.triggered.connect(self._gap_fill_zacks)
         data_menu.addAction(act_tgt_zacks)
+
+        act_spot_zacks = QAction("Spot Fill Earnings (Zacks)...", self)
+        act_spot_zacks.setToolTip(
+            "Fetch ONE ticker from Zacks on demand. Bypasses the ETF/ADR "
+            "auto-skip (you typed the symbol); only the user-curated skip "
+            "lists block it."
+        )
+        act_spot_zacks.triggered.connect(self._spot_fill_zacks)
+        data_menu.addAction(act_spot_zacks)
 
         act_stop_zacks = QAction("Stop Zacks Fill", self)
         act_stop_zacks.setToolTip("Stop a running Zacks fill operation.")
@@ -4187,14 +4197,20 @@ class MainWindow(QMainWindow):
             log.warning("Pre-skip save failed: %s", exc)
         return len(new)
 
-    def _targeted_fill_zacks(self):
-        """Menu: pull Zacks history for tickers with no rows in
-        earnings_history.parquet (gap fill)."""
+    def _gap_fill_zacks(self):
+        """Menu: pull Zacks history for tickers with no ZACKS-source rows.
+
+        v6.3.3: this used to select on "no rows from ANY source", so a ticker
+        finviz or Finnhub already covered was never offered to Zacks — 3,370
+        tickers (25.1% of those missing a zacks row) on the live store at the
+        time. It now asks the same question the finviz and Finnhub Gap Fills
+        ask about themselves. The dialog below already claimed this meaning.
+        """
         if self._zacks_worker and self._zacks_worker.isRunning():
             self.log_panel.write_line("Zacks fill already running.")
             return
         from ..zacks_scraper import has_zacks_cookies
-        from ..earnings_history import find_gap_tickers
+        from ..earnings_history import find_zacks_gap_tickers
         if not has_zacks_cookies():
             QMessageBox.warning(
                 self, "Zacks Cookies Required",
@@ -4203,11 +4219,11 @@ class MainWindow(QMainWindow):
             )
             return
         syms = self._get_universe_symbols()
-        self._log_etf_adr_preskip("Zacks targeted fill", syms)
-        # Targeted fill honors the combined Zacks skip set (universe
-        # blacklist + Zacks skip list + ETF/ADR auto-skip) so it
-        # doesn't waste requests on funds or foreign-issuer ADRs.
-        gaps = find_gap_tickers(syms, self._zacks_skip_set())
+        self._log_etf_adr_preskip("Zacks gap fill", syms)
+        # Honors the combined Zacks skip set (universe blacklist + Zacks skip
+        # list + ETF/ADR auto-skip) so it doesn't waste requests on funds or
+        # foreign-issuer ADRs.
+        gaps = find_zacks_gap_tickers(syms, self._zacks_skip_set())
         if not gaps:
             QMessageBox.information(
                 self, "No Gaps",
@@ -4216,10 +4232,74 @@ class MainWindow(QMainWindow):
             )
             return
         self.log_panel.write_line(
-            f"Zacks targeted fill: {len(gaps)} gap ticker(s) identified."
+            f"Zacks gap fill: {len(gaps)} gap ticker(s) identified."
         )
+        # Still mode="targeted": that is the WORKER mode meaning "iterate
+        # exactly this list, no checkpoint resume", which is what finviz and
+        # Finnhub also use for their gap fills. Only the candidate SELECTION
+        # changed, not the primitive.
         self._start_zacks_worker(gaps, mode="targeted",
-                                 label="Zacks targeted fill")
+                                 label="Zacks gap fill")
+
+    def _spot_fill_zacks(self):
+        """Menu: single-ticker Zacks fetch. Bypasses the ETF/ADR auto-skip
+        (the user typed the symbol) — only user-curated skip lists block it.
+        Mirrors `_spot_fill_finviz` / `_spot_fill_finnhub`; Zacks was the one
+        source without a spot fill, so checking one ticker meant running a
+        targeted fill over a one-element list and reading the log."""
+        if self._zacks_worker and self._zacks_worker.isRunning():
+            self.log_panel.write_line("Zacks fill already running.")
+            return
+        from ..zacks_scraper import has_zacks_cookies
+        if not has_zacks_cookies():
+            QMessageBox.warning(
+                self, "Zacks Cookies Required",
+                "Zacks scraping requires a fresh browser cookie string. "
+                "Use Data → Set Zacks Cookies... first.",
+            )
+            return
+        sym, ok = QInputDialog.getText(
+            self, "Spot Fill Earnings (Zacks)", "Ticker:",
+        )
+        if not ok or not sym.strip():
+            return
+        norm = self._normalize_ticker(sym)
+        user_only_skip = self._blacklist | self._zacks_blacklist
+        if norm in user_only_skip:
+            self._info_plain(
+                "Skipped",
+                f"{norm} is on the Zacks skip list — remove it first "
+                "via Edit Zacks Skip List...",
+            )
+            return
+        from ..earnings_history import spot_fill_zacks
+        self.log_panel.write_line(f"Zacks spot fill: {norm}...")
+        try:
+            count, status = spot_fill_zacks(norm, user_only_skip)
+        except Exception as exc:
+            self._log_error(
+                "zacks-spot-fill", f"Zacks spot fill failed: {exc}", exc,
+            )
+            return
+
+        if status == "ok":
+            self.log_panel.write_line(
+                f"Zacks spot fill done: {norm} → {count} quarter(s) written."
+            )
+        elif status in ("empty", "not_found"):
+            self.log_panel.write_line(
+                f"Zacks has no earnings for {norm} (not covered). Add it via "
+                f"Edit Zacks Skip List... if you want future fills to skip it."
+            )
+        elif status == "no_rows_in_window":
+            self.log_panel.write_line(
+                f"Zacks returned quarters for {norm}, but all of them predate "
+                f"the {config.EARNINGS_HISTORY_YEARS}-year history cap."
+            )
+        else:
+            self.log_panel.write_line(
+                f"Zacks spot fill: {norm} → status='{status}'."
+            )
 
     def _stop_zacks_fill(self):
         """Menu: stop a running Zacks fill operation."""

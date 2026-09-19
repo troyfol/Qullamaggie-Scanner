@@ -1970,8 +1970,11 @@ def test_targeted_fill_iterates_only_provided_tickers(tmp_parquets):
     assert set(df["ticker"]) == {"GAP1", "GAP2"}
 
 
-def test_find_gap_tickers(tmp_parquets):
-    """Gap = universe ∩ (not blacklist) − tickers in earnings_history."""
+def test_find_uncovered_tickers(tmp_parquets):
+    """Uncovered = universe ∩ (not blacklist) − tickers in earnings_history.
+
+    Renamed from `find_gap_tickers` in v6.3.3: this asks "any data at all?",
+    which is NOT what the per-source Gap Fills ask."""
     seed = pd.DataFrame([
         _row("HAVE1", "2025-12-01", "2026-01-29"),
         _row("HAVE2", "2025-09-01", "2025-10-30"),
@@ -1980,11 +1983,11 @@ def test_find_gap_tickers(tmp_parquets):
 
     universe = ["HAVE1", "HAVE2", "GAP1", "GAP2", "BANNED"]
     blacklist = {"BANNED"}
-    gaps = eh.find_gap_tickers(universe, blacklist)
+    gaps = eh.find_uncovered_tickers(universe, blacklist)
     assert sorted(gaps) == ["GAP1", "GAP2"]
 
 
-def test_find_gap_tickers_no_history_returns_full_universe_minus_blacklist(tmp_parquets):
+def test_find_uncovered_tickers_no_history_returns_full_universe_minus_blacklist(tmp_parquets):
     universe = ["A", "B", "C"]
-    gaps = eh.find_gap_tickers(universe, blacklist={"B"})
+    gaps = eh.find_uncovered_tickers(universe, blacklist={"B"})
     assert sorted(gaps) == ["A", "C"]

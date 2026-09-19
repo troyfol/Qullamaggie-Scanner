@@ -2412,7 +2412,8 @@ grouping reflects the five-source architecture plus diagnostics:
 
 — Earnings (Zacks — primary) —
     Bulk Fill Earnings (Zacks)
-    Targeted Fill Earnings (Zacks)
+    Gap Fill Earnings (Zacks)
+    Spot Fill Earnings (Zacks)...
     Stop Zacks Fill
     Set Zacks Cookies...
     Refresh Zacks Cookies (Open Browser)...
@@ -2758,6 +2759,64 @@ Loader (`MainWindow._load_preset`) tolerates missing keys via `.get()` for forwa
 
 ---
 
+## What "gap fill" means, per source (v6.3.3)
+
+All three earnings sources now offer **Bulk / Gap / Spot**, and all three
+define a gap the same way: *tickers with no rows from **this** source*. A
+ticker another source already covers is still a gap for the one that is
+missing it — coverage is independent, which is the whole point of having
+several sources and of the cross-source disagreement report.
+
+Zacks did not work that way until v6.3.3. Its menu action was called
+**Targeted** Fill and selected on "no rows from **any** source", so a ticker
+finviz or Finnhub already covered was never offered to Zacks. Measured on the
+live store: **3,370 tickers had no zacks row and were unreachable**, because
+finviz — the top-priority source, run on every auto cycle — already covered
+them.
+
+| Menu action | Selects | Candidates on the live store |
+|---|---|---:|
+| Gap Fill (Zacks) — **was** | no rows from **any** source | 10,041 |
+| Gap Fill (Zacks) — **now** | no **zacks** rows | **13,411** |
+| Gap Fill (Finviz) | no **finviz** rows | 11,566 |
+| Gap Fill (Finnhub) | no **finnhub** rows | 14,837 |
+
+<sub>Measured on the shipped store: 237,210 rows over 6,016 tickers, against a
+16,057-symbol universe. Counts move as fills run; the *shape* is the point —
+finviz holds 187,508 rows to zacks's 45,650, so any-source coverage is
+overwhelmingly finviz coverage, and that is precisely what used to mask a
+zacks gap.</sub>
+
+That also starved the disagreement report, which can only compare a slot where
+two sources both hold a row — the old rule actively prevented zacks from
+acquiring them.
+
+> **The naming collision that caused it.** Two modules exported a
+> `find_gap_tickers` whose signatures differed by one keyword-only argument
+> and whose meanings differed entirely:
+>
+> ```python
+> earnings_history.find_gap_tickers(universe, blacklist)                 # ANY source
+> fill_framework.find_gap_tickers(universe, blacklist, *, source="...")  # ONE source
+> ```
+>
+> Importing the wrong one silently changed what a fill targeted, with no error
+> and nothing at the call site to hint at it. The source-agnostic one is now
+> **`find_uncovered_tickers`** — it answers "has this ticker any earnings data
+> at all?", which is a real question, just not the one a gap fill asks.
+
+`mode="targeted"` survives as the **worker** mode meaning "iterate exactly
+this list, no checkpoint resume" — finviz and Finnhub use it for their gap
+fills too. Only the candidate selection changed, not the fill primitive.
+
+**Spot Fill (Zacks)** closes the last gap in the matrix. It shares
+`_row_to_history_dict`, the history cap, the actual-value ingest gate and the
+raw-layer capture with `_fill_via_zacks`, so a spot row is indistinguishable
+on disk from one a bulk run wrote, and it returns the same
+`(count, status)` shape as the other two sources' spot fills.
+
+---
+
 ## Per-source failure reports (v6.3.2)
 
 `Data → Show Last <Source> Failures…` exists for **all three** earnings
@@ -2951,7 +3010,7 @@ data directory.
 
 ## Testing
 
-Test suite at `trade_scanner_fh/tests/` — **1,908 tests, all passing** as of 2026-09-19 (v6.3.2 added 40, v6.3.1 added 16, v6.3.0 added 93 across the disagreement merge, the failure taxonomy, the trim scoping, both new features and the unified series engine; v6.2.0 brought it to 1,759; v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
+Test suite at `trade_scanner_fh/tests/` — **1,928 tests, all passing** as of 2026-09-19 (v6.3.3 added 18, v6.3.2 added 40, v6.3.1 added 16, v6.3.0 added 93 across the disagreement merge, the failure taxonomy, the trim scoping, both new features and the unified series engine; v6.2.0 brought it to 1,759; v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
 
 ```bash
 cd c:/python/EDA_Project/Trade_Scanner_FH
@@ -3012,6 +3071,7 @@ client's rate limiter).
 | `test_parse_spike.py` | Parse-failure spike alarm (threshold math, checkpoint preservation, no-blacklist guarantee) |
 | `test_disagreements.py` | Cross-source EPS disagreement report (detection tolerances, report-only guarantee, **slot-scoped merge** — concurrent finalize cannot blank another source's findings, a re-examined slot still clears, findings accumulate, CSV round-trip key match) |
 | `test_quarter_gap_refetch.py` | **v6.3.0.** `missing_quarter` detector ↔ finding agreement, attempt ledger round-trip / corruption degradation / clear, resting window incl. the edge day, widest-hole-first ordering |
+| `test_zacks_parity.py` | **v6.3.3.** The per-source Zacks gap rule vs `find_uncovered_tickers`, the resolved name collision, and `spot_fill_zacks` (history cap, actual-value ingest gate, failure-kind passthrough, and that it replaces only the zacks rows) |
 | `test_source_failures.py` | **v6.3.2.** The shared failure taxonomy (incl. a drift guard that every client's `FAIL_*` sentinel is classified), per-source CSV persistence and its degradation modes, the selective-add dialog's defaults and both confirmation gates, and the MainWindow wiring for all three sources |
 | `test_series_selectors.py` | **v6.3.0.** The shared series engine: selection modes, Backward Only, bridging allowance, strict-vs-inclusive thresholds, `keep_valueless`, beats-default-equals-legacy parity, the report_date-ordering phantom gap, the config knobs, and the GUI controls on all eight rows |
 | `test_quarter_gap_refetch_gui.py` | **v6.3.0.** The re-fetch action row: offers exactly the detected tickers, stamps the ledger before launching, hands finviz + zacks (never finnhub) to the fill, refuses while a fill runs, reset button |
@@ -3248,6 +3308,31 @@ directories, and the previous `_internal/`.
 ---
 
 ## Changelog
+
+### v6.3.3 — Zacks brought to parity with the other two sources (2026-09-19)
+
+**Gap Fill (Zacks) now means what the other two mean.** It was called
+*Targeted* Fill and selected on "no rows from **any** source", so a ticker
+finviz or Finnhub already covered was never offered to Zacks — **3,370
+tickers** on the live store, 10,041 candidates where the per-source rule gives
+13,411. Its own "No Gaps" dialog already claimed the per-source meaning
+("Every ticker in the universe already has Zacks history"), so the wording was
+true of the new behaviour and false of the old.
+
+**Renamed the helper that caused it.** `earnings_history.find_gap_tickers`
+collided with `fill_framework.find_gap_tickers` — same name, two modules,
+signatures one keyword-only argument apart, meanings entirely different
+(any-source vs one-source). It is now `find_uncovered_tickers`.
+
+**Added Spot Fill (Zacks).** Zacks was the only source without one, so
+checking a single ticker meant running a targeted fill over a one-element list
+and reading the log. Shares the row builder, history cap, ingest gate and raw
+capture with the bulk path, and returns the same `(count, status)` shape as
+the finviz and Finnhub spot fills.
+
+Every source now offers Bulk / Gap / Spot, with one meaning of "gap".
+
+1,928 tests.
 
 ### v6.3.2 — the same failure report, and selective skip-listing, for all three sources (2026-09-19)
 
@@ -3908,7 +3993,8 @@ These are properties the codebase depends on. Breaking any one is a regression w
 75. **Compare against a within-subject control, not a global one.** Seam steps benchmarked against all same-source steps looked alarming (28.1% vs 16.5%); benchmarked against each ticker's own steps the median seam is *below* normal. Any population whose membership is not randomly assigned needs the within-subject comparison.
 76. **A destructive bulk action must be grouped by consequence, not by convenience.** "Add every failure to the skip list" treats a 404 and a parse error as the same event. They are opposites: one says the source will never cover this ticker, the other says the source just changed its page. `failure_kinds.classify` is the single place that judgement lives, an unknown kind defaults to the dangerous group, and a drift-guard test fails if any client emits a kind the taxonomy does not know.
 77. **Never let the UI undo a safety property the pipeline enforces.** The parse-spike alarm halts a run and blacklists nothing when a format breaks. A one-click "add all failures" would reverse that at scale with no ceremony, so upstream-fault kinds are unchecked by default and take a second confirmation.
-78. **A null metric value is a hole for some filters and a miss for others, and the difference is load-bearing.** `build_quarter_points(keep_valueless=...)` makes it explicit rather than implicit. `surprise_*_pct` is null often enough that reading a null as "quarter absent" would let a dead streak look live on 2.56% of tickers.
+78. **"Gap" means one source's own missing coverage — never "no data anywhere".** Sources are deliberately independent; a ticker finviz covers is still a gap for zacks. The any-source question exists as `find_uncovered_tickers` and must never be wired to a per-source Gap Fill again. Two functions in different modules must not share a name when they answer different questions: the collision here differed by one keyword-only argument and silently changed what a fill targeted.
+79. **A null metric value is a hole for some filters and a miss for others, and the difference is load-bearing.** `build_quarter_points(keep_valueless=...)` makes it explicit rather than implicit. `surprise_*_pct` is null often enough that reading a null as "quarter absent" would let a dead streak look live on 2.56% of tickers.
 
 ---
 

@@ -3470,17 +3470,111 @@ def targeted_fill_zacks(
     )
 
 
-def find_gap_tickers(
+def find_uncovered_tickers(
     universe_symbols: list[str], blacklist: set[str],
 ) -> list[str]:
-    """Return tickers in `universe ∩ (not blacklist)` that have NO rows
-    in earnings_history.parquet. Helper for the targeted-fill menu
-    handler."""
+    """Tickers in ``universe ∩ (not blacklist)`` with NO earnings rows from
+    **any** source.
+
+    Renamed from ``find_gap_tickers`` in v6.3.3, because it is not a gap fill
+    in the sense the three source fills use and the collision was a trap: this
+    module and ``fill_framework`` both exported a ``find_gap_tickers`` whose
+    signatures differed by one keyword-only argument and whose meanings
+    differed entirely (any-source vs one-source). Importing the wrong one
+    silently changed what a fill targeted, with no error and no visible cue at
+    the call site.
+
+    This is the "has this ticker any earnings data at all?" question. For
+    "does SOURCE X cover this ticker?", which is what every per-source Gap
+    Fill wants, use ``fill_framework.find_gap_tickers(..., source=...)`` or
+    one of the ``find_<source>_gap_tickers`` wrappers.
+    """
     have: set[str] = set()
     df = load_earnings_history()
     if df is not None and not df.empty:
         have = set(df["ticker"].astype(str).unique())
     return [t for t in universe_symbols if t not in blacklist and t not in have]
+
+
+def find_zacks_gap_tickers(
+    universe_symbols: list[str], blacklist: set[str],
+) -> list[str]:
+    """Tickers whose ``source=zacks`` row count is 0 — the same question the
+    finviz and finnhub Gap Fills ask about themselves.
+
+    v6.3.3: the Zacks menu action previously used ``find_uncovered_tickers``,
+    so a ticker any *other* source covered was never offered to Zacks. Measured
+    on the live store at the time: **3,370 tickers (25.1%) had no zacks row and
+    were never offered**, because finviz — the top-priority source, run on
+    every auto cycle — already covered them. That also starved the cross-source
+    disagreement report, which can only compare slots where two sources both
+    hold a row.
+
+    The menu's own "No Gaps" message already claimed this per-source meaning
+    ("Every ticker in the universe already has Zacks history"), so the wording
+    was true of the new behaviour and false of the old.
+    """
+    from . import fill_framework
+    return fill_framework.find_gap_tickers(
+        universe_symbols, blacklist, source="zacks")
+
+
+def spot_fill_zacks(
+    symbol: str, blacklist: set[str], *, years: Optional[int] = None,
+) -> tuple:
+    """Fetch ONE ticker from Zacks on demand. Returns ``(filled, status)``
+    with status ∈ {"ok", "empty", "blacklisted", "invalid", FAIL_*}, matching
+    ``finviz_fill.spot_fill_finviz`` / ``finnhub_fill.spot_fill_finnhub``.
+
+    Zacks was the only source without a spot fill, so checking a single
+    ticker meant running a targeted fill over a one-element list and reading
+    the log. Shares `_row_to_history_dict`, the history cap, the actual-value
+    ingest gate and the raw-layer capture with `_fill_via_zacks`, so a spot
+    row is indistinguishable on disk from one a bulk run wrote.
+    """
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return 0, "invalid"
+    if sym in blacklist:
+        return 0, "blacklisted"
+
+    years = int(years) if years else config.EARNINGS_HISTORY_YEARS
+    cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(years=years)
+    run_id = earnings_raw.new_run_id()
+
+    with ZacksSession() as session:
+        try:
+            rows = session.fetch(sym, years=years)
+        except Exception as exc:
+            log.debug("[%s] zacks spot fill raised: %s", sym, exc)
+            return 0, "unknown"
+        if not rows:
+            # `last_failure_kind` is None when the page parsed but held no
+            # usable quarters; report that as "empty" so the caller can treat
+            # it the same way it treats an uncovered finviz/finnhub ticker.
+            return 0, session.last_failure_kind or "empty"
+
+        now = datetime.now()
+        hist_rows = [_row_to_history_dict(r, sym, "zacks", now) for r in rows]
+        keep = [
+            h for h in hist_rows
+            if _has_any_actual(h)
+            and (pd.isna(pd.to_datetime(h.get("period_ending"), errors="coerce"))
+                 or pd.to_datetime(h["period_ending"]) >= cutoff)
+        ]
+        if not keep:
+            return 0, "no_rows_in_window"
+
+        try:
+            earnings_raw.append_zacks_rows(
+                [{"ticker": sym, **r} for r in rows], run_id)
+        except Exception as exc:
+            log.warning("Zacks spot raw-layer write failed: %s", exc)
+
+        if _flush_pending_to_disk({sym: keep}, [sym], is_final=True) is False:
+            return 0, "write_failed"
+    _finalize_fill([sym])
+    return len(keep), "ok"
 
 
 # ──────────────────────────────────────────────────────────────────────
