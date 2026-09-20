@@ -186,6 +186,7 @@ class ExcelExportDialog(QDialog):
     def __init__(
         self, columns,
         periods: list[str] | None = None, parent=None,
+        prechecked=None,
     ):
         """`columns` is a list of (header, key, fmt) tuples (RESULT_COLUMNS).
         Every column in `columns` is pre-checked; the user uses Select
@@ -193,7 +194,15 @@ class ExcelExportDialog(QDialog):
         `periods` is the ordered list of period labels for the most recent
         scan (single-element list for single-timeframe scans). When the
         list has more than one entry, a period multi-select section is
-        shown so the user can export multiple periods (multi-sheet XLSX)."""
+        shown so the user can export multiple periods (multi-sheet XLSX).
+
+        `prechecked` is an optional set of keys to tick on open; anything
+        in `columns` outside it opens unticked. None (the default) keeps the
+        historical "everything checked" behaviour, so callers that do not
+        pass it — and every test that constructs this dialog — are
+        unaffected. The caller that does use it is the Excel export, which
+        passes the on-screen columns while still listing type-hidden ones so
+        they can be ticked back in."""
         super().__init__(parent)
         self.setWindowTitle("Export to Excel / CSV")
         self.setModal(True)
@@ -201,6 +210,8 @@ class ExcelExportDialog(QDialog):
         self.setMinimumHeight(620)
 
         self._columns = list(columns)
+        # None = "no opinion, check everything" (the historical contract).
+        self._prechecked = None if prechecked is None else set(prechecked)
         self._checks: dict[str, QCheckBox] = {}
         self._period_checks: dict[str, QCheckBox] = {}
         # Phase 8 §8.4: optional grouped beats-column toggles. Populated
@@ -209,6 +220,15 @@ class ExcelExportDialog(QDialog):
         self._group_eps_keys: list[str] = []
         self._group_rev_checkbox: Optional[QCheckBox] = None
         self._group_rev_keys: list[str] = []
+        # Second pair of bundles holding the per-quarter columns whose TYPE
+        # is currently hidden on screen. They need their own toggles: the
+        # bundles above are a single all-or-nothing checkbox each, so folding
+        # hidden columns into them would force the export to either lose the
+        # visible ones or silently re-add the hidden ones.
+        self._group_eps_hidden_checkbox: Optional[QCheckBox] = None
+        self._group_eps_hidden_keys: list[str] = []
+        self._group_rev_hidden_checkbox: Optional[QCheckBox] = None
+        self._group_rev_hidden_keys: list[str] = []
         periods = list(periods or [])
 
         layout = QVBoxLayout(self)
@@ -332,6 +352,8 @@ class ExcelExportDialog(QDialog):
         _Q_RE = _re.compile(r"^q(\d+)_(.+)$")
         eps_q_keys: list[str] = []
         rev_q_keys: list[str] = []
+        eps_q_hidden_keys: list[str] = []
+        rev_q_hidden_keys: list[str] = []
         regular_columns: list[tuple] = []
         for entry in self._columns:
             header, key, _fmt = entry
@@ -345,19 +367,21 @@ class ExcelExportDialog(QDialog):
                         or suffix.startswith("surprise_rev")
                         or suffix.startswith("yoy_rev")
                         or suffix == "report_date_rev"):
-                    rev_q_keys.append(key)
+                    (rev_q_keys if self._is_prechecked(key)
+                     else rev_q_hidden_keys).append(key)
                     continue
                 if (suffix.endswith("_eps") or suffix.startswith("reported_eps")
                         or suffix.startswith("surprise_eps")
                         or suffix.startswith("yoy_eps")
                         or suffix == "report_date_eps"):
-                    eps_q_keys.append(key)
+                    (eps_q_keys if self._is_prechecked(key)
+                     else eps_q_hidden_keys).append(key)
                     continue
             regular_columns.append(entry)
 
         for header, key, _fmt in regular_columns:
             cb = QCheckBox(header)
-            cb.setChecked(True)
+            cb.setChecked(self._is_prechecked(key))
             self._checks[key] = cb
             inner_layout.addWidget(cb)
 
@@ -388,6 +412,31 @@ class ExcelExportDialog(QDialog):
             self._group_rev_keys = rev_q_keys
             inner_layout.addWidget(cb)
 
+        # Hidden-type bundles, unticked. Only appear when the caller passed
+        # a `prechecked` set that excludes some per-quarter columns, so a
+        # scan with nothing hidden shows exactly the two bundles it always did.
+        for _keys, _label, _attr_cb, _attr_keys in (
+            (eps_q_hidden_keys, "EPS", "_group_eps_hidden_checkbox",
+             "_group_eps_hidden_keys"),
+            (rev_q_hidden_keys, "Rev", "_group_rev_hidden_checkbox",
+             "_group_rev_hidden_keys"),
+        ):
+            if not _keys:
+                continue
+            cb = QCheckBox(
+                f"Hidden {_label} per-quarter columns ({len(_keys)} cols)"
+            )
+            cb.setToolTip(
+                f"Per-quarter {_label} columns whose type is currently "
+                "hidden in the results table. Unticked so the export "
+                "matches what is on screen — tick to include them anyway. "
+                "The data was never discarded."
+            )
+            cb.setChecked(False)
+            setattr(self, _attr_cb, cb)
+            setattr(self, _attr_keys, _keys)
+            inner_layout.addWidget(cb)
+
         inner_layout.addStretch()
         scroll.setWidget(inner)
         cols_outer.addWidget(scroll)
@@ -403,21 +452,34 @@ class ExcelExportDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
+    def _is_prechecked(self, key: str) -> bool:
+        """Should `key` open ticked? True for everything when the caller
+        expressed no preference, which is the historical behaviour."""
+        if self._prechecked is None:
+            return True
+        return key in self._prechecked
+
+    def _group_checkboxes(self) -> list:
+        """Every bundle toggle that exists on this dialog."""
+        return [
+            cb for cb in (
+                self._group_eps_checkbox, self._group_rev_checkbox,
+                self._group_eps_hidden_checkbox,
+                self._group_rev_hidden_checkbox,
+            ) if cb is not None
+        ]
+
     def _select_all(self):
         for cb in self._checks.values():
             cb.setChecked(True)
-        if self._group_eps_checkbox is not None:
-            self._group_eps_checkbox.setChecked(True)
-        if self._group_rev_checkbox is not None:
-            self._group_rev_checkbox.setChecked(True)
+        for cb in self._group_checkboxes():
+            cb.setChecked(True)
 
     def _select_none(self):
         for cb in self._checks.values():
             cb.setChecked(False)
-        if self._group_eps_checkbox is not None:
-            self._group_eps_checkbox.setChecked(False)
-        if self._group_rev_checkbox is not None:
-            self._group_rev_checkbox.setChecked(False)
+        for cb in self._group_checkboxes():
+            cb.setChecked(False)
 
     def _select_all_periods(self):
         for cb in self._period_checks.values():
@@ -436,12 +498,14 @@ class ExcelExportDialog(QDialog):
             cb = self._checks.get(key)
             if cb is not None and cb.isChecked():
                 included.add(key)
-        if (self._group_eps_checkbox is not None
-                and self._group_eps_checkbox.isChecked()):
-            included.update(self._group_eps_keys)
-        if (self._group_rev_checkbox is not None
-                and self._group_rev_checkbox.isChecked()):
-            included.update(self._group_rev_keys)
+        for cb, keys in (
+            (self._group_eps_checkbox, self._group_eps_keys),
+            (self._group_rev_checkbox, self._group_rev_keys),
+            (self._group_eps_hidden_checkbox, self._group_eps_hidden_keys),
+            (self._group_rev_hidden_checkbox, self._group_rev_hidden_keys),
+        ):
+            if cb is not None and cb.isChecked():
+                included.update(keys)
         return [key for _h, key, _f in self._columns if key in included]
 
     def selected_periods(self) -> list[str]:

@@ -386,6 +386,54 @@ def _accel_scan_params(rows: dict) -> dict:
     return out
 
 
+# The Period Avg / Period Max threshold controls carried by all eight series
+# rows. One spec list appended to each row rather than thirty-two hand-written
+# entries, so the controls cannot drift apart between filters.
+#
+# Each threshold is a CHECKBOX plus a spinbox, not a sentinel value. An
+# earlier cut used 0.0 to mean "off", which quietly made `Avg >= 0` — a
+# perfectly reasonable ask, "every quarter in the run averaged positive" —
+# impossible to express. The checkbox separates "am I filtering on this" from
+# "what is the bar", so every value including 0.0 and negatives is available.
+#
+# Both default to unchecked, so the columns still populate on every scan while
+# no pre-existing preset changes which rows it selects.
+_PERIOD_STATS: tuple[tuple[str, str], ...] = (
+    ("period_avg", "Avg %"),
+    ("period_max", "Max %"),
+)
+
+
+def _period_stat_fields() -> list[dict]:
+    out: list[dict] = []
+    for stat, label in _PERIOD_STATS:
+        out.append({"name": f"{stat}_on", "label": label,
+                    "type": "checkbox", "default": False})
+        out.append({"name": f"{stat}_min", "label": ">=", "type": "float",
+                    "default": 0.0, "min": -9999.0, "max": 9999.0,
+                    "step": 1.0})
+    return out
+
+
+def _period_stat_scan_params(rows: dict) -> dict:
+    """Read the Period Avg / Max controls off all eight series rows.
+
+    Keyed off `_SERIES_ROW_KEYS` so a future series filter picks the controls
+    up by being added to that tuple, the same way Series / Backward Only
+    already work. `.value()` falls back to the field default when a row
+    predates a field, which keeps a partially-restored preset from raising.
+    """
+    out: dict = {}
+    for key in _SERIES_ROW_KEYS:
+        row = rows.get(key)
+        if row is None:
+            continue
+        for stat, _label in _PERIOD_STATS:
+            out[f"{key}_{stat}_enabled"] = bool(row.value(f"{stat}_on"))
+            out[f"{key}_{stat}_min"] = float(row.value(f"{stat}_min") or 0.0)
+    return out
+
+
 class IndicatorPanel(QScrollArea):
     """Scrollable panel with all indicator controls."""
 
@@ -738,9 +786,11 @@ class IndicatorPanel(QScrollArea):
                              ("most_recent", "Most Recent")]},
                 {"name": "backward_only", "label": "Backward Only",
                  "type": "checkbox", "default": True},
+                *_period_stat_fields(),
         ])
         self.rows["consec_eps_beats"].set_enabled(False)
         self._wire_backward_only_fields("consec_eps_beats")
+        self._wire_period_stat_fields("consec_eps_beats")
 
         self._add("consec_rev_beats", "Consecutive Rev Beats", [
             {"name": "min_count", "label": "Min", "type": "int", "default": 3, "min": 0, "max": 50},
@@ -752,9 +802,11 @@ class IndicatorPanel(QScrollArea):
                              ("most_recent", "Most Recent")]},
                 {"name": "backward_only", "label": "Backward Only",
                  "type": "checkbox", "default": True},
+                *_period_stat_fields(),
         ])
         self.rows["consec_rev_beats"].set_enabled(False)
         self._wire_backward_only_fields("consec_rev_beats")
+        self._wire_period_stat_fields("consec_rev_beats")
 
         # Wire grey-out behavior — beats checkbox disables the matching
         # individual filter rows, and emits beats_filter_toggled so the
@@ -790,9 +842,11 @@ class IndicatorPanel(QScrollArea):
                              ("most_recent", "Most Recent")]},
                 {"name": "backward_only", "label": "Backward Only",
                  "type": "checkbox", "default": False},
+                *_period_stat_fields(),
         ])
         self.rows["consec_eps_growth"].set_enabled(False)
         self._wire_backward_only_fields("consec_eps_growth")
+        self._wire_period_stat_fields("consec_eps_growth")
 
         self._add("consec_rev_growth", "Consecutive YoY Rev Growth", [
             {"name": "min_count", "label": "Min", "type": "int", "default": 3, "min": 0, "max": 50},
@@ -804,9 +858,11 @@ class IndicatorPanel(QScrollArea):
                              ("most_recent", "Most Recent")]},
                 {"name": "backward_only", "label": "Backward Only",
                  "type": "checkbox", "default": False},
+                *_period_stat_fields(),
         ])
         self.rows["consec_rev_growth"].set_enabled(False)
         self._wire_backward_only_fields("consec_rev_growth")
+        self._wire_period_stat_fields("consec_rev_growth")
 
         # --- Accelerating Quarters (spec Part 2) ---
         # Four discrete rows rather than one row with a metric selector,
@@ -841,9 +897,11 @@ class IndicatorPanel(QScrollArea):
                              ("most_recent", "Most Recent")]},
                 {"name": "backward_only", "label": "Backward Only",
                  "type": "checkbox", "default": False},
+                *_period_stat_fields(),
             ])
             self.rows[_key].set_enabled(False)
             self._wire_backward_only_fields(_key)
+            self._wire_period_stat_fields(_key)
 
         self.vbox.addStretch()
         self.setWidget(container)
@@ -986,6 +1044,54 @@ class IndicatorPanel(QScrollArea):
 
         combo.currentIndexChanged.connect(lambda _i: _apply())
         _apply()  # Apply once with the default mode
+
+    def _wire_period_stat_fields(self, key: str):
+        """Grey out each Period threshold spinbox while its checkbox is off.
+
+        Same visual treatment as the Backward-Only and surge-mode greyouts:
+        `setEnabled(False)` plus the explicit muted stylesheet, because Qt's
+        default `:disabled` rendering is nearly invisible against the dark
+        theme's `#3c3c3c` inputs.
+        """
+        row = self.rows[key]
+        for stat, _label in _PERIOD_STATS:
+            toggle = row.spinboxes.get(f"{stat}_on")
+            spin = row.spinboxes.get(f"{stat}_min")
+            if toggle is None or spin is None:
+                continue
+
+            def _apply(t=toggle, s=spin):
+                on = t.isChecked()
+                s.setEnabled(on)
+                s.setStyleSheet(
+                    "" if on else IndicatorRow._GREYED_INPUT_STYLE
+                )
+
+            toggle.toggled.connect(lambda _on, f=_apply: f())
+            _apply()  # Apply once with the default (unchecked)
+
+    def _sync_period_stat_fields(self):
+        """Re-apply every Period threshold greyout after a preset load.
+
+        `set_value` drives the checkbox through `setChecked`, which only
+        emits `toggled` on an actual state change — a preset that re-asserts
+        a value the row already holds would otherwise leave the spinbox in
+        the wrong enabled state. Mirrors `_sync_backward_only`.
+        """
+        for key in _SERIES_ROW_KEYS:
+            row = self.rows.get(key)
+            if row is None:
+                continue
+            for stat, _label in _PERIOD_STATS:
+                toggle = row.spinboxes.get(f"{stat}_on")
+                spin = row.spinboxes.get(f"{stat}_min")
+                if toggle is None or spin is None:
+                    continue
+                on = toggle.isChecked()
+                spin.setEnabled(on)
+                spin.setStyleSheet(
+                    "" if on else IndicatorRow._GREYED_INPUT_STYLE
+                )
 
     def _section(self, title: str):
         lbl = QLabel(f"  {title}")
@@ -1231,6 +1337,9 @@ class IndicatorPanel(QScrollArea):
 
             # --- Accelerating Quarters (spec Part 2) ---
             **_accel_scan_params(r),
+
+            # --- Period Avg / Max thresholds, all eight series rows ---
+            **_period_stat_scan_params(r),
         )
 
     def to_dict(self) -> dict:
@@ -1296,6 +1405,10 @@ class IndicatorPanel(QScrollArea):
         # row already holds emits no `toggled`, so the Series combo's
         # enabled state has to be re-derived explicitly.
         self._sync_backward_only()
+        # Same reason again for the Period Avg / Max threshold pairs: the
+        # spinbox greyout is driven by a checkbox that emits nothing when a
+        # preset re-asserts its current value.
+        self._sync_period_stat_fields()
         # Resync surge field-greyout after loading. Mirror
         # `_wire_surge_mode_dependent_fields` — apply the same explicit
         # muted style so a preset that lands on trend mode greys days
@@ -1338,6 +1451,33 @@ def _fmt_date(x) -> str:
             return ""
         return ts.strftime("%m/%d/%y")
     except Exception:
+        return str(x)
+
+
+def _fmt_period_pct(x) -> str:
+    """Format a Period Avg / Period Max cell — signed, two decimals, percent.
+
+    Signed like the other percentage columns so a contraction series reads
+    correctly: a Period Max of -2.10% is a very different statement from
+    +2.10%, and an unsigned render would hide it.
+
+    Named rather than a lambda so every Period column shares one object. The
+    populate loop keys some behaviour off formatter identity (`fmt is
+    _fmt_date`), and a shared name keeps that door open here too.
+
+    NaN never reaches this function from the results table — the populate
+    loop intercepts missing values and writes "N/A" itself — but the guard
+    stays because the export path formats through `_format_optional`, which
+    does call the formatter for some value shapes.
+    """
+    try:
+        if x is None or pd.isna(x):
+            return "N/A"
+    except (TypeError, ValueError):
+        pass
+    try:
+        return f"{float(x):+.2f}%"
+    except (TypeError, ValueError):
         return str(x)
 
 
@@ -1411,20 +1551,36 @@ RESULT_COLUMNS = [
     # the quarter count, the report-date span, and V(start) -> V(end).
     # Like every other column here they render only when populated, so
     # a scan with none of these filters on is unchanged.
+    # Period Avg / Period Max sit immediately right of the count they
+    # summarise. Both are the metric averaged (or maximised) over exactly the
+    # quarters that produced that count — see `earnings_series.window_values`.
+    # NaN means "no qualifying window", which the table renders as N/A.
     ("Consec YoY EPS Grw", "consec_eps_growth",  lambda x: str(int(x))),
+    ("Consec YoY EPS Grw Avg", "consec_eps_growth_period_avg", _fmt_period_pct),
+    ("Consec YoY EPS Grw Max", "consec_eps_growth_period_max", _fmt_period_pct),
     ("Consec YoY Rev Grw", "consec_rev_growth",  lambda x: str(int(x))),
+    ("Consec YoY Rev Grw Avg", "consec_rev_growth_period_avg", _fmt_period_pct),
+    ("Consec YoY Rev Grw Max", "consec_rev_growth_period_max", _fmt_period_pct),
     ("Accel EPS Surp Q",  "accel_eps_surp_len",  lambda x: str(int(x))),
     ("Accel EPS Surp Span", "accel_eps_surp_span", str),
     ("Accel EPS Surp V",  "accel_eps_surp_vals", str),
+    ("Accel EPS Surp Avg", "accel_eps_surp_period_avg", _fmt_period_pct),
+    ("Accel EPS Surp Max", "accel_eps_surp_period_max", _fmt_period_pct),
     ("Accel Rev Surp Q",  "accel_rev_surp_len",  lambda x: str(int(x))),
     ("Accel Rev Surp Span", "accel_rev_surp_span", str),
     ("Accel Rev Surp V",  "accel_rev_surp_vals", str),
+    ("Accel Rev Surp Avg", "accel_rev_surp_period_avg", _fmt_period_pct),
+    ("Accel Rev Surp Max", "accel_rev_surp_period_max", _fmt_period_pct),
     ("Accel YoY EPS Q",   "accel_eps_yoy_len",   lambda x: str(int(x))),
     ("Accel YoY EPS Span", "accel_eps_yoy_span", str),
     ("Accel YoY EPS V",   "accel_eps_yoy_vals",  str),
+    ("Accel YoY EPS Avg", "accel_eps_yoy_period_avg", _fmt_period_pct),
+    ("Accel YoY EPS Max", "accel_eps_yoy_period_max", _fmt_period_pct),
     ("Accel YoY Rev Q",   "accel_rev_yoy_len",   lambda x: str(int(x))),
     ("Accel YoY Rev Span", "accel_rev_yoy_span", str),
     ("Accel YoY Rev V",   "accel_rev_yoy_vals",  str),
+    ("Accel YoY Rev Avg", "accel_rev_yoy_period_avg", _fmt_period_pct),
+    ("Accel YoY Rev Max", "accel_rev_yoy_period_max", _fmt_period_pct),
 ]
 
 # The four accelerating filters' column prefixes, in RESULT_COLUMNS
@@ -1452,6 +1608,132 @@ DATE_COLUMN_KEYS = {
     "max_gap_date", "min_gap_date", "surge_start_date",
     "last_report_date",
 }
+
+
+# ── Earnings column TYPES (the "Hide Q Columns" dropdown) ───────────────
+#
+# A *type* collapses a dimension the user does not want to tick off one cell
+# at a time. Two dimensions exist:
+#
+#   * the quarter index — "Q-X Reported EPS" covers q1_reported_eps through
+#     q20_reported_eps, which is the whole point of the control;
+#   * the filter family — the eight series filters each emit the same handful
+#     of roles (a count, a span, a value pair, an average, a maximum), so the
+#     roles group across filters rather than listing 32 near-identical rows.
+#
+# To hide one individual column instead, the header right-click menu already
+# does that and is unaffected by any of this.
+#
+# Ordering here is the order the dropdown shows, chosen to read top-to-bottom
+# as EPS block, Rev block, then the series roles.
+_Q_TYPE_LABELS: tuple[tuple[str, str], ...] = (
+    ("q_report_date_eps",     "Q-X Date (EPS)"),
+    ("q_reported_eps",        "Q-X Reported EPS"),
+    ("q_surprise_eps_dollar", "Q-X Surp EPS $"),
+    ("q_surprise_eps_pct",    "Q-X Surp EPS %"),
+    ("q_yoy_eps_pct",         "Q-X YoY EPS %"),
+    ("q_report_date_rev",     "Q-X Date (Rev)"),
+    ("q_reported_rev",        "Q-X Reported Rev"),
+    ("q_surprise_rev_dollar", "Q-X Surp Rev $"),
+    ("q_surprise_rev_pct",    "Q-X Surp Rev %"),
+    ("q_yoy_rev_pct",         "Q-X YoY Rev %"),
+)
+
+# Exact keys per series role. Written out rather than derived from a suffix
+# so a future column whose name merely ends in "_span" cannot join a group by
+# accident, and so the count row can hold three differently-named keys
+# (`_beats`, `_growth`, `_len`) that mean the same thing.
+_SERIES_PREFIXES: tuple[str, ...] = (
+    "consec_eps_beats", "consec_rev_beats",
+    "consec_eps_growth", "consec_rev_growth",
+    "accel_eps_surp", "accel_rev_surp", "accel_eps_yoy", "accel_rev_yoy",
+)
+_ACCEL_PREFIXES: tuple[str, ...] = (
+    "accel_eps_surp", "accel_rev_surp", "accel_eps_yoy", "accel_rev_yoy",
+)
+
+# Grouped PER FILTER, not per role: a filter's whole output is one tick.
+# Typical use is a handful of series filters running together, so "stop
+# showing me this filter" is the operation worth one click; hiding the Span
+# of every accelerating filter at once is not. Individual columns remain
+# hideable through the header right-click menu.
+#
+# Each entry covers every column its filter emits — the count under whichever
+# of the three names that filter uses (`_beats`, `_growth`, `_len`), plus the
+# accel-only span / values pair, plus both Period columns.
+def _series_filter_keys(prefix: str) -> frozenset:
+    count_key = f"{prefix}_len" if prefix in _ACCEL_PREFIXES else prefix
+    keys = {count_key, f"{prefix}_period_avg", f"{prefix}_period_max"}
+    if prefix in _ACCEL_PREFIXES:
+        keys |= {f"{prefix}_span", f"{prefix}_vals"}
+    return frozenset(keys)
+
+
+_SERIES_TYPE_LABELS: tuple[tuple[str, str], ...] = (
+    ("series_consec_eps_beats",  "Consec EPS Beats (all cols)"),
+    ("series_consec_rev_beats",  "Consec Rev Beats (all cols)"),
+    ("series_consec_eps_growth", "Consec YoY EPS Growth (all cols)"),
+    ("series_consec_rev_growth", "Consec YoY Rev Growth (all cols)"),
+    ("series_accel_eps_surp",    "Accel EPS Surp (all cols)"),
+    ("series_accel_rev_surp",    "Accel Rev Surp (all cols)"),
+    ("series_accel_eps_yoy",     "Accel YoY EPS (all cols)"),
+    ("series_accel_rev_yoy",     "Accel YoY Rev (all cols)"),
+)
+
+_SERIES_TYPE_KEYS: dict[str, frozenset] = {
+    f"series_{prefix}": _series_filter_keys(prefix)
+    for prefix in _SERIES_PREFIXES
+}
+
+EARNINGS_COLUMN_TYPES: tuple[tuple[str, str], ...] = (
+    _Q_TYPE_LABELS + _SERIES_TYPE_LABELS
+)
+EARNINGS_COLUMN_TYPE_LABELS: dict[str, str] = dict(EARNINGS_COLUMN_TYPES)
+
+# Reverse index: exact key -> series type id. Built once at import.
+_SERIES_KEY_TO_TYPE: dict[str, str] = {
+    key: type_id
+    for type_id, keys in _SERIES_TYPE_KEYS.items()
+    for key in keys
+}
+
+
+def earnings_column_type_of(key: str):
+    """The hideable type a results column belongs to, or None.
+
+    None means "not an earnings column type" — every non-earnings column, and
+    any earnings column the taxonomy does not cover, is simply never hideable
+    through this control. Returning None rather than raising keeps an
+    unrecognised key visible, which is the safe direction to fail.
+    """
+    hit = _SERIES_KEY_TO_TYPE.get(key)
+    if hit is not None:
+        return hit
+    m = _Q_COL_RE.match(key)
+    if m is None:
+        return None
+    type_id = f"q_{m.group(2)}"
+    return type_id if type_id in EARNINGS_COLUMN_TYPE_LABELS else None
+
+
+def present_earnings_column_types(columns) -> list:
+    """`[(type_id, label, n_columns)]` for the types present in `columns`.
+
+    Drives the dropdown's contents so it only ever offers types this scan
+    actually produced. `columns` is an unfiltered (header, key, fmt) build —
+    pass the layout BEFORE hiding is applied, or a type disappears from the
+    menu the moment it is ticked and can never be un-ticked.
+    """
+    counts: dict[str, int] = {}
+    for _h, key, _f in columns:
+        type_id = earnings_column_type_of(key)
+        if type_id is not None:
+            counts[type_id] = counts.get(type_id, 0) + 1
+    return [
+        (tid, EARNINGS_COLUMN_TYPE_LABELS[tid], counts[tid])
+        for tid, _label in EARNINGS_COLUMN_TYPES
+        if tid in counts
+    ]
 
 
 def _format_optional(val, fmt) -> str:
@@ -1646,6 +1928,7 @@ def _anchor_date_value(key: str, row_data):
 
 def _build_dynamic_columns(
     df, *, interleave_quarters: bool = False,
+    hidden_types=frozenset(),
 ) -> tuple[list[tuple], int, int]:
     """Phase 8 §8.3 + 2026-05 update: build the table's column set
     from RESULT_COLUMNS, filtered to only the columns whose key is
@@ -1743,6 +2026,26 @@ def _build_dynamic_columns(
              lambda x: f"{x:+.2f}%"),
         ]
 
+    def _beats_cols_for(side: str) -> list[tuple]:
+        """The Consec Beats counter plus its Period Avg / Max, when present.
+
+        The beats counter is emitted here rather than from RESULT_COLUMNS, so
+        its two Period columns have to travel with it to stay adjacent. Each
+        is gated on the key actually being in the frame: a scan predating this
+        feature, or a row dict built by a test that only sets the counter,
+        renders the counter alone instead of two permanently-N/A columns.
+        """
+        label = "EPS" if side == "eps" else "Rev"
+        base = f"consec_{side}_beats"
+        out: list[tuple] = [
+            (f"Consec {label} Beats", base, lambda x: str(int(x))),
+        ]
+        for suffix, word in (("period_avg", "Avg"), ("period_max", "Max")):
+            key = f"{base}_{suffix}"
+            if key in df_columns:
+                out.append((f"Consec {label} Beats {word}", key, _fmt_period_pct))
+        return out
+
     # Interleave only kicks in when both sides have data. Single-side
     # case ignores the flag entirely → no behavior change for users
     # who only run EPS or only Rev beats.
@@ -1751,8 +2054,11 @@ def _build_dynamic_columns(
     if use_interleave:
         # Both Consec counter columns up front — cheaper to scan for
         # the user when reviewing per-ticker streak counts side by side.
-        cols.append(("Consec EPS Beats", "consec_eps_beats", lambda x: str(int(x))))
-        cols.append(("Consec Rev Beats", "consec_rev_beats", lambda x: str(int(x))))
+        # Each counter keeps its own Period Avg / Max alongside it, so the
+        # interleaved layout stays readable as "everything about EPS, then
+        # everything about Rev" rather than splitting a filter's own cells.
+        cols.extend(_beats_cols_for("eps"))
+        cols.extend(_beats_cols_for("rev"))
         # Walk by quarter index up to whichever side runs longer; emit
         # whatever blocks each side still has data for at index k.
         max_q = max(n_eps, n_rev)
@@ -1770,13 +2076,36 @@ def _build_dynamic_columns(
         # aligned-blue-highlight logic applies automatically when an
         # indicator-date for this row matches this report date.
         if n_eps > 0:
-            cols.append(("Consec EPS Beats", "consec_eps_beats", lambda x: str(int(x))))
+            cols.extend(_beats_cols_for("eps"))
             for k in range(1, n_eps + 1):
                 cols.extend(_eps_block_for_quarter(k))
         if n_rev > 0:
-            cols.append(("Consec Rev Beats", "consec_rev_beats", lambda x: str(int(x))))
+            cols.extend(_beats_cols_for("rev"))
             for k in range(1, n_rev + 1):
                 cols.extend(_rev_block_for_quarter(k))
+
+    # Type hiding happens HERE — last, on the finished layout — and never by
+    # dropping columns from `df`.
+    #
+    # That ordering is load-bearing. `n_eps` / `n_rev` above are derived from
+    # which `q*_reported_eps` / `q*_reported_rev` columns exist in the frame,
+    # and `use_interleave` is gated on both being > 0. Hiding the "Q-X
+    # Reported EPS" type by removing those columns from `df` would therefore
+    # collapse n_eps to 0 and take the ENTIRE EPS block with it — Date, both
+    # Surp columns, YoY, and the Consec EPS Beats counter — as well as
+    # silently switching the interleave layout off. One ticked box would wipe
+    # out four other types and a view mode.
+    #
+    # Filtering the emitted list instead means the quarter counts, the
+    # interleave decision, and the underlying frame are all computed from the
+    # full data, so hiding a type does exactly one thing. It also leaves every
+    # value intact for the export dialog to re-offer.
+    if hidden_types:
+        cols = [
+            (h, k, f) for h, k, f in cols
+            if k in _ALWAYS_VISIBLE_KEYS
+            or earnings_column_type_of(k) not in hidden_types
+        ]
 
     return cols, n_eps, n_rev
 
@@ -2452,6 +2781,10 @@ class ResultsTable(QTableView):
         # side has data — guarantees zero behavior change for users
         # who run EPS-only or Rev-only beats scans.
         self._interleave_quarters: bool = False
+        # Earnings column types omitted from the rendered layout. Empty by
+        # default so a table that is never told otherwise behaves exactly as
+        # it did before the Hide Q Columns control existed.
+        self._hidden_column_types: frozenset = frozenset()
 
         # Delete-rows wiring: enable the multi-select + custom context
         # menu so the user can right-click → "Delete selected row(s)".
@@ -2708,6 +3041,42 @@ class ResultsTable(QTableView):
     def interleave_quarters(self) -> bool:
         return self._interleave_quarters
 
+    def set_hidden_column_types(self, types) -> None:
+        """Set which earnings column TYPES the next populate should omit.
+
+        Same contract as `set_interleave_quarters`: flips state and
+        invalidates the width cache, but does not re-render — the caller
+        drives that through MainWindow's view-filter pipeline.
+
+        Stored as a frozenset so the layout decision cannot be mutated from
+        under a populate already in flight.
+        """
+        new = frozenset(types or ())
+        if self._hidden_column_types == new:
+            return
+        self._hidden_column_types = new
+        # The column SET changed, so cached per-column widths no longer
+        # describe this layout.
+        self._cached_column_widths = {}
+
+    @property
+    def hidden_column_types(self) -> frozenset:
+        return self._hidden_column_types
+
+    def unfiltered_columns_for(self, df) -> list:
+        """The layout this frame WOULD produce with nothing type-hidden.
+
+        The dropdown builds its menu from this rather than from
+        `active_columns`: a type that is currently hidden is absent from the
+        live layout, and a menu built off the live layout would drop the
+        entry the moment it was ticked, stranding the user with no way to
+        bring the columns back.
+        """
+        cols, _n_eps, _n_rev = _build_dynamic_columns(
+            df, interleave_quarters=self._interleave_quarters,
+        )
+        return cols
+
     def _apply_saved_order(self):
         """Walk `_saved_column_keys`; for each key that exists in the
         current `_active_columns`, move its section to the next
@@ -2833,6 +3202,7 @@ class ResultsTable(QTableView):
 
             cols, n_eps, n_rev = _build_dynamic_columns(
                 df, interleave_quarters=self._interleave_quarters,
+                hidden_types=self._hidden_column_types,
             )
             self._active_columns = cols
             self._active_n_eps_quarters = n_eps

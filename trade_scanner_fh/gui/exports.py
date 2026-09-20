@@ -296,9 +296,29 @@ class ExportsController:
         # dialog opens with everything checked and the user uses
         # Select-None / individual unchecks to refine.
         export_columns = win._ordered_active_columns_for_export()
+
+        # Type-hidden columns are absent from the table's active layout but
+        # their DATA is still in the frame (hiding filters the rendered
+        # column list, never the DataFrame). Append them here so the dialog
+        # defaults to exactly what is on screen while still letting the user
+        # tick a hidden type back into the output.
+        prechecked = {k for _h, k, _f in export_columns}
+        try:
+            hidden_types = set(win._hidden_earnings_col_types)
+        except AttributeError:
+            hidden_types = set()
+        if hidden_types:
+            from .widgets import earnings_column_type_of
+            for col in win._hide_types_source_columns():
+                key = col[1]
+                if (key not in prechecked
+                        and earnings_column_type_of(key) in hidden_types):
+                    export_columns.append(col)
+
         dlg = ExcelExportDialog(
             export_columns,
             periods=win._period_order, parent=win,
+            prechecked=prechecked if hidden_types else None,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return

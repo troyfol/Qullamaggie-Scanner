@@ -31,9 +31,9 @@ from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFrame, QGroupBox,
     QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
     QProgressBar, QPushButton, QSpinBox, QSplitter, QStatusBar,
-    QTextEdit, QToolBar, QVBoxLayout, QWidget,
+    QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .. import __version__, config, finnhub_client, scan_history
@@ -1246,6 +1246,53 @@ class MainWindow(QMainWindow):
         search_row.addStretch()
         results_vbox.addLayout(search_row)
 
+        # ── Second row: hide whole earnings column TYPES ──────────────
+        # Separate from the header right-click "Delete column" (which is
+        # per-column and resets every scan) and from the Columns ▾ popup.
+        # This one collapses the quarter dimension: one tick hides
+        # "Q-X Reported EPS" across every rendered quarter at once.
+        #
+        # Hiding is applied when the table's column list is BUILT, never by
+        # dropping data — see the comment at the foot of
+        # `_build_dynamic_columns`. The frame keeps every value, so the
+        # Excel dialog can still offer hidden columns for re-selection.
+        type_row = QHBoxLayout()
+        self.btn_hide_col_types = QToolButton()
+        self.btn_hide_col_types.setText("Hide Q Columns ▾")
+        self.btn_hide_col_types.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+        )
+        self.btn_hide_col_types.setToolTip(
+            "View-only: hide entire earnings column TYPES across every "
+            "quarter at once (e.g. all 'Q-X Surp EPS $' columns). Does not "
+            "affect scan results or the underlying data — hidden columns "
+            "can still be re-selected in the Excel export dialog. Saved "
+            "with the preset."
+        )
+        self._hide_types_menu = QMenu(self.btn_hide_col_types)
+        # Rebuild on every open: which types exist depends on the scan that
+        # just ran, and the menu must reflect the CURRENT layout rather than
+        # whatever was present when the window was constructed.
+        self._hide_types_menu.aboutToShow.connect(self._rebuild_hide_types_menu)
+        self.btn_hide_col_types.setMenu(self._hide_types_menu)
+        type_row.addWidget(self.btn_hide_col_types)
+
+        self.btn_show_all_col_types = QPushButton("Show All")
+        self.btn_show_all_col_types.setToolTip(
+            "Clear every hidden column type and re-render."
+        )
+        self.btn_show_all_col_types.clicked.connect(
+            self._on_show_all_column_types
+        )
+        type_row.addWidget(self.btn_show_all_col_types)
+
+        self.lbl_hidden_types = QLabel("")
+        self.lbl_hidden_types.setStyleSheet("color: #888;")
+        type_row.addWidget(self.lbl_hidden_types)
+
+        type_row.addStretch()
+        results_vbox.addLayout(type_row)
+
         self.results_table = ResultsTable()
         # Persist user-defined column order across timeframe switches
         # and propagate to Excel export. The table fires this signal
@@ -1275,6 +1322,13 @@ class MainWindow(QMainWindow):
         # so the underlying scan data is preserved. Reset on every
         # fresh scan (alongside the cut clipboard).
         self._deleted_column_keys: set[str] = set()
+        # Earnings column TYPES hidden via the Hide Q Columns dropdown.
+        # Deliberately NOT `_deleted_column_keys`: that set is per-column and
+        # is cleared on every fresh scan, whereas these selections are meant
+        # to survive a scan and round-trip through a preset. Types absent
+        # from the current scan stay in the set so a preset saved against a
+        # wider scan still means what it said when a narrower one is run.
+        self._hidden_earnings_col_types: set[str] = set()
         # F2 undo-delete: single-level snapshot of the most recent row
         # deletion — {"period": str, "rows": DataFrame, "positions":
         # list[int]} or None. Overwritten by each delete, consumed by
@@ -6895,6 +6949,99 @@ class MainWindow(QMainWindow):
     def _on_interleave_quarters_toggled(self, checked: bool):
         self._columns_mgr._on_interleave_quarters_toggled(checked)
 
+    # ── Hide-by-type dropdown ────────────────────────────────────────
+
+    def _hide_types_source_columns(self) -> list:
+        """The UNFILTERED layout the menu is built from.
+
+        Unfiltered matters: a hidden type is by definition absent from the
+        live layout, so a menu built off `active_columns` would lose the
+        entry as soon as it was ticked and leave no way to untick it.
+
+        Falls back to the active layout only when no frame is available (no
+        scan yet), where the menu is empty anyway.
+        """
+        try:
+            label = getattr(self, "_active_period", None)
+            df = self._period_results.get(label) if label else None
+            if df is None and getattr(self, "_period_order", None):
+                df = self._period_results.get(self._period_order[0])
+            if df is not None:
+                return self.results_table.unfiltered_columns_for(df)
+        except Exception as exc:
+            log.debug("hide-types source columns unavailable: %s", exc)
+        try:
+            return list(self.results_table.active_columns)
+        except (AttributeError, RuntimeError):
+            return []
+
+    def _rebuild_hide_types_menu(self):
+        """Repopulate the dropdown from the types this scan produced."""
+        from .widgets import present_earnings_column_types
+        menu = self._hide_types_menu
+        menu.clear()
+        present = present_earnings_column_types(self._hide_types_source_columns())
+        if not present:
+            act = menu.addAction("No earnings columns in this scan")
+            act.setEnabled(False)
+            return
+        for type_id, label, n_cols in present:
+            act = menu.addAction(f"{label}  ({n_cols})")
+            act.setCheckable(True)
+            act.setChecked(type_id in self._hidden_earnings_col_types)
+            # `triggered` carries the NEW checked state; bind type_id per
+            # iteration so every action does not close over the last one.
+            act.triggered.connect(
+                lambda checked, t=type_id: self._on_hide_type_toggled(t, checked)
+            )
+
+    def _on_hide_type_toggled(self, type_id: str, hidden: bool):
+        if hidden:
+            self._hidden_earnings_col_types.add(type_id)
+        else:
+            self._hidden_earnings_col_types.discard(type_id)
+        self._apply_hidden_column_types()
+
+    def _on_show_all_column_types(self):
+        if not self._hidden_earnings_col_types:
+            return
+        self._hidden_earnings_col_types.clear()
+        self._apply_hidden_column_types()
+
+    def _apply_hidden_column_types(self, *, rerender: bool = True):
+        """Push the hidden-type set into the table and re-render.
+
+        Also refreshes the button caption and the grey summary label so the
+        state is legible without opening the menu — the dropdown is the only
+        other place it shows.
+        """
+        hidden = set(self._hidden_earnings_col_types)
+        try:
+            self.results_table.set_hidden_column_types(hidden)
+        except (AttributeError, RuntimeError) as exc:
+            log.debug("could not push hidden column types: %s", exc)
+            return
+        try:
+            from .widgets import EARNINGS_COLUMN_TYPE_LABELS
+            n = len(hidden)
+            self.btn_hide_col_types.setText(
+                "Hide Q Columns ▾" if not n else f"Hide Q Columns ({n}) ▾"
+            )
+            # Name them while the list is short; past that the count carries
+            # the message and the full list lives in the menu.
+            if not n:
+                self.lbl_hidden_types.setText("")
+            elif n <= 3:
+                self.lbl_hidden_types.setText("hidden: " + ", ".join(
+                    sorted(EARNINGS_COLUMN_TYPE_LABELS.get(t, t) for t in hidden)
+                ))
+            else:
+                self.lbl_hidden_types.setText(f"{n} column types hidden")
+        except (AttributeError, RuntimeError) as exc:
+            log.debug("could not refresh hidden-type caption: %s", exc)
+        if rerender:
+            self._reapply_view_filters_for_active_period()
+
     # ── Columns dropdown wiring ──────────────────────────────────────
 
     def _current_columns_for_dialog(self) -> list[tuple]:
@@ -7672,6 +7819,14 @@ class MainWindow(QMainWindow):
             # for the current scan settings."
             "column_order": list(self._results_column_order),
             "column_hidden": sorted(self._deleted_column_keys),
+            # v6: earnings column TYPES hidden via Hide Q Columns. Kept
+            # apart from `column_hidden` — that is a per-column set the
+            # scan resets, this is a type-level view choice that persists.
+            # Saved even when a type is not in the current scan, so the
+            # preset still means what it said against a wider one.
+            "hidden_earnings_col_types": sorted(
+                self._hidden_earnings_col_types
+            ),
             # v6: session-bar omission toggles. Round-trip the user's
             # preferred posture per preset. Loading a preset with
             # `omit_previously_scanned=True` does NOT replay the
@@ -7858,6 +8013,19 @@ class MainWindow(QMainWindow):
                     "failed: %s", len(self._results_column_order), exc,
                 )
             self._sync_columns_dialog()
+
+        # v6: hidden earnings column types. Read OUTSIDE the column-layout
+        # block above so a preset can carry hidden types without also
+        # carrying an explicit column order. A missing key means a pre-v6
+        # preset, which must not silently clear a selection the user made
+        # in this session — hence `is not None` rather than `or []`.
+        hidden_types = data.get("hidden_earnings_col_types")
+        if hidden_types is not None:
+            self._hidden_earnings_col_types = set(hidden_types)
+            # No re-render: the branch above has already blanked the table,
+            # and a fresh scan re-renders anyway. Pushing the set into the
+            # table now means the next populate honours it.
+            self._apply_hidden_column_types(rerender=False)
 
         # v6: session-bar omission toggles. No signal connections live
         # on these checkboxes (they're polled in `_run_scan` /

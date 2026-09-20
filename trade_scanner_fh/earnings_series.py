@@ -260,6 +260,58 @@ def _is_hit(value: float, threshold: float, inclusive: bool) -> bool:
 
 
 # ----------------------------------------------------------------------
+# Resolved-window statistics (Period Avg / Period Max)
+# ----------------------------------------------------------------------
+
+def window_values(
+    points: Sequence[QuarterPoint], start_i: int, end_i: int,
+) -> tuple:
+    """The finite metric values of `points[start_i..end_i]`, oldest first.
+
+    Both series resolvers already know the inclusive index pair of the window
+    they picked, so the Period Avg / Period Max columns are computed from the
+    same indices that produced `length` rather than re-deriving the window
+    downstream - the two can never disagree about which quarters counted.
+
+    The finite filter is belt-and-braces. A run is contiguous in `points` and
+    `_is_hit` rejects NaN, so a threshold run cannot contain one even under
+    `keep_valueless=True`; the accelerating pool is built without
+    `keep_valueless` so it holds no NaN at all. Filtering anyway means a future
+    caller that widens either pool cannot silently poison an average.
+    """
+    return tuple(
+        p.value for p in points[start_i:end_i + 1]
+        if p.value is not None and np.isfinite(p.value)
+    )
+
+
+def series_avg(values: Sequence[float]) -> float:
+    """Mean of a resolved window, or NaN when the window is empty.
+
+    NaN rather than 0.0 for the empty case: a zero-length run means "no
+    qualifying quarters were measured", which the results table renders as
+    N/A, while 0.0 would read as a real average of zero percent - a
+    meaningful and quite different statement about a ticker.
+    """
+    if not values:
+        return float("nan")
+    return float(np.mean(values))
+
+
+def series_max(values: Sequence[float]) -> float:
+    """Highest value in a resolved window, or NaN when the window is empty.
+
+    NaN for the same reason as `series_avg`. Note this is the maximum of the
+    metric itself, not of its absolute value: for a contraction series every
+    member is negative and the maximum is the least-bad quarter, which is the
+    honest reading of "highest".
+    """
+    if not values:
+        return float("nan")
+    return float(np.max(values))
+
+
+# ----------------------------------------------------------------------
 # Part 1 - consecutive YoY growth
 # ----------------------------------------------------------------------
 
@@ -271,6 +323,14 @@ class RunSeries:
     report through one shape. `qualifies` is False when the best run fell
     short of the minimum count; the run is still returned so display-only mode
     can show how far the ticker actually got.
+
+    `values` carries the metric value of every quarter INSIDE the resolved
+    window, oldest first, so the Period Avg / Period Max columns can be
+    computed over exactly the quarters that produced `length` — no
+    re-derivation, and no risk of the two disagreeing. Bridged quarters are
+    absent from `points` entirely, so they cannot leak in. Defaulted to the
+    empty tuple: a few tests construct this dataclass directly, and an
+    unsupplied window simply reports N/A rather than raising.
     """
     length: int
     start_value: float
@@ -280,6 +340,7 @@ class RunSeries:
     start_report_date: Optional[pd.Timestamp]
     end_report_date: Optional[pd.Timestamp]
     qualifies: bool
+    values: tuple = ()
 
 
 def _runs(
@@ -400,6 +461,7 @@ def run_series(
         start_report_date=start_pt.report_date,
         end_report_date=end_pt.report_date,
         qualifies=qualifies,
+        values=window_values(points, start_i, end_i),
     )
 
 
@@ -441,6 +503,13 @@ class AcceleratingSeries:
     Series Count. The series is still reported in that case so the
     display-only column shows how far the ticker actually got instead of
     a bare blank.
+
+    `values` mirrors `RunSeries.values`: the metric value of every quarter
+    inside the resolved series, oldest first. Note this is the METRIC at each
+    quarter (the same number `start_value` / `end_value` report), not the
+    quarter-over-quarter step the acceleration threshold tests - so Period Avg
+    on an EPS-surprise series is the average surprise across it, consistent
+    with what the `_vals` column already shows.
     """
     length: int
     start_value: float
@@ -450,6 +519,7 @@ class AcceleratingSeries:
     start_report_date: Optional[pd.Timestamp]
     end_report_date: Optional[pd.Timestamp]
     qualifies: bool
+    values: tuple = ()
 
 
 def _link_ok(
@@ -573,4 +643,5 @@ def accelerating_series(
         start_report_date=start_pt.report_date,
         end_report_date=end_pt.report_date,
         qualifies=qualifies,
+        values=window_values(points, start_i, end_i),
     )

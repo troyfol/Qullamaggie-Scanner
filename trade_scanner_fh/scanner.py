@@ -560,6 +560,51 @@ class ScanParams:
     accel_rev_yoy_selection: str = "longest"
     accel_rev_yoy_backward_only: bool = False
 
+    # ── Period Avg / Period Max thresholds (all eight series filters) ──
+    # The metric averaged / maximised over exactly the quarters that produced
+    # the filter's count.
+    #
+    # `_enabled` is a real toggle rather than a sentinel value, so every
+    # threshold is expressible — including 0.0 ("the run averaged positive")
+    # and negatives ("the contraction never got worse than -5%"). Both
+    # default False, so a pre-existing preset and a default-constructed
+    # ScanParams select exactly as they did before these existed.
+    #
+    # The matching COLUMNS are populated regardless of any of this: the
+    # threshold gates rows, it does not gate the column.
+    consec_eps_beats_period_avg_enabled: bool = False
+    consec_eps_beats_period_avg_min: float = 0.0
+    consec_eps_beats_period_max_enabled: bool = False
+    consec_eps_beats_period_max_min: float = 0.0
+    consec_rev_beats_period_avg_enabled: bool = False
+    consec_rev_beats_period_avg_min: float = 0.0
+    consec_rev_beats_period_max_enabled: bool = False
+    consec_rev_beats_period_max_min: float = 0.0
+    consec_eps_growth_period_avg_enabled: bool = False
+    consec_eps_growth_period_avg_min: float = 0.0
+    consec_eps_growth_period_max_enabled: bool = False
+    consec_eps_growth_period_max_min: float = 0.0
+    consec_rev_growth_period_avg_enabled: bool = False
+    consec_rev_growth_period_avg_min: float = 0.0
+    consec_rev_growth_period_max_enabled: bool = False
+    consec_rev_growth_period_max_min: float = 0.0
+    accel_eps_surp_period_avg_enabled: bool = False
+    accel_eps_surp_period_avg_min: float = 0.0
+    accel_eps_surp_period_max_enabled: bool = False
+    accel_eps_surp_period_max_min: float = 0.0
+    accel_rev_surp_period_avg_enabled: bool = False
+    accel_rev_surp_period_avg_min: float = 0.0
+    accel_rev_surp_period_max_enabled: bool = False
+    accel_rev_surp_period_max_min: float = 0.0
+    accel_eps_yoy_period_avg_enabled: bool = False
+    accel_eps_yoy_period_avg_min: float = 0.0
+    accel_eps_yoy_period_max_enabled: bool = False
+    accel_eps_yoy_period_max_min: float = 0.0
+    accel_rev_yoy_period_avg_enabled: bool = False
+    accel_rev_yoy_period_avg_min: float = 0.0
+    accel_rev_yoy_period_max_enabled: bool = False
+    accel_rev_yoy_period_max_min: float = 0.0
+
     def max_trailing_bars(self) -> int:
         """How many bars BEFORE ``start_date`` any indicator can still read.
 
@@ -1100,9 +1145,13 @@ def _compute_ticker(
                 _eps_pool = past_pref if _eps_cap <= 0 else past_pref.head(_eps_cap)
                 _rev_pool = past_pref if _rev_cap <= 0 else past_pref.head(_rev_cap)
                 if params.consec_eps_beats_enabled or params.consec_eps_beats_display_only:
-                    row["consec_eps_beats"] = _beats_run(
+                    _eps_series = _beats_series(
                         _eps_pool, "surprise_eps_pct", params, "consec_eps_beats",
                     )
+                    row["consec_eps_beats"] = (
+                        0 if _eps_series is None else _eps_series.length
+                    )
+                    _write_period_stats(row, "consec_eps_beats", _eps_series)
                     for k, (_, q) in enumerate(
                         past_pref.head(_eps_n).iterrows(), 1
                     ):
@@ -1119,9 +1168,13 @@ def _compute_ticker(
                         row[f"q{k}_surprise_eps_pct"] = q.get("surprise_eps_pct")
                         row[f"q{k}_yoy_eps_pct"] = q.get("yoy_eps_pct")
                 if params.consec_rev_beats_enabled or params.consec_rev_beats_display_only:
-                    row["consec_rev_beats"] = _beats_run(
+                    _rev_series = _beats_series(
                         _rev_pool, "surprise_rev_pct", params, "consec_rev_beats",
                     )
+                    row["consec_rev_beats"] = (
+                        0 if _rev_series is None else _rev_series.length
+                    )
+                    _write_period_stats(row, "consec_rev_beats", _rev_series)
                     for k, (_, q) in enumerate(
                         past_pref.head(_rev_n).iterrows(), 1
                     ):
@@ -1189,6 +1242,45 @@ _ACCEL_FILTERS: tuple[tuple[str, str], ...] = (
 
 # The two Consecutive YoY Growth filters, as
 # (param prefix, history column).
+def _beats_series(pool, metric_col: str, params, prefix: str):
+    """The resolved beats run for one ticker, or None when the pool is empty.
+
+    Split out of `_beats_run` so the caller can read the Period Avg / Period
+    Max window off the same object that produced the length. `_beats_run`
+    remains the int-returning front door: a pile of tests compare it against a
+    bare number, and the streak column itself only ever wanted the count.
+    """
+    from . import earnings_series as es
+    points = es.build_quarter_points(pool, metric_col, keep_valueless=True)
+    return es.run_series(
+        points,
+        threshold=getattr(params, f"{prefix}_threshold_pct"),
+        min_count=getattr(params, f"{prefix}_min"),
+        inclusive=False,
+        max_bridged=config.SERIES_MAX_BRIDGED_BEATS,
+        selection=getattr(params, f"{prefix}_selection"),
+        backward_only=getattr(params, f"{prefix}_backward_only"),
+    )
+
+
+def _write_period_stats(row: dict, prefix: str, series) -> None:
+    """Write `{prefix}_period_avg` / `_period_max` for a resolved series.
+
+    Always writes both keys, even when the answer is NaN. The columns are
+    meant to be present whenever their parent filter ran - including in
+    display-only mode and including when the threshold spinboxes are left at
+    0 - so the results table must see a populated key to emit them at all
+    (`_build_dynamic_columns` filters on `k in df.columns`).
+
+    NaN is the N/A case: no pool for the metric (`series is None`) or a
+    zero-length run, which carries an empty `values` window.
+    """
+    from . import earnings_series as es
+    values = () if series is None else series.values
+    row[f"{prefix}_period_avg"] = es.series_avg(values)
+    row[f"{prefix}_period_max"] = es.series_max(values)
+
+
 def _beats_run(
     pool, metric_col: str, params, prefix: str,
 ) -> int:
@@ -1217,17 +1309,7 @@ def _beats_run(
     all of them 52/53-week filers whose period_ending drifts — the case
     `_period_steps` exists to handle correctly.
     """
-    from . import earnings_series as es
-    points = es.build_quarter_points(pool, metric_col, keep_valueless=True)
-    res = es.run_series(
-        points,
-        threshold=getattr(params, f"{prefix}_threshold_pct"),
-        min_count=getattr(params, f"{prefix}_min"),
-        inclusive=False,
-        max_bridged=config.SERIES_MAX_BRIDGED_BEATS,
-        selection=getattr(params, f"{prefix}_selection"),
-        backward_only=getattr(params, f"{prefix}_backward_only"),
-    )
+    res = _beats_series(pool, metric_col, params, prefix)
     return 0 if res is None else res.length
 
 
@@ -1314,12 +1396,22 @@ def _populate_quarter_series(row: dict, params: "ScanParams", past_pref) -> None
             past_pref, metric_col,
             quarter_cap=getattr(params, f"{prefix}_quarter_cap"),
         )
-        row[prefix] = es.consecutive_growth_run(
-            points, getattr(params, f"{prefix}_threshold_pct"),
+        # `run_series` directly rather than the `consecutive_growth_run`
+        # wrapper: identical arguments (the wrapper is a thin pass-through
+        # pinned to min_count=1), but it hands back the resolved object so the
+        # Period Avg / Max window comes off the same run that produced the
+        # length instead of being recomputed.
+        growth = es.run_series(
+            points,
+            threshold=getattr(params, f"{prefix}_threshold_pct"),
+            min_count=1,
+            inclusive=True,
             max_bridged=config.SERIES_MAX_BRIDGED_GROWTH,
             selection=getattr(params, f"{prefix}_selection"),
             backward_only=getattr(params, f"{prefix}_backward_only"),
         )
+        row[prefix] = 0 if growth is None else growth.length
+        _write_period_stats(row, prefix, growth)
 
     for prefix, metric_key in _ACCEL_FILTERS:
         if not (getattr(params, f"{prefix}_enabled")
@@ -1344,8 +1436,13 @@ def _populate_quarter_series(row: dict, params: "ScanParams", past_pref) -> None
             # length zero was measured", and the filter's `>= min_count`
             # test rejects NaN just as firmly.
             row[f"{prefix}_len"] = float("nan")
+            # Still write the stat keys so the columns render as N/A
+            # alongside the blank `_len` rather than vanishing for the
+            # whole scan when no ticker resolved a series.
+            _write_period_stats(row, prefix, None)
             continue
         row[f"{prefix}_len"] = result.length
+        _write_period_stats(row, prefix, result)
         row[f"{prefix}_span"] = _fmt_series_span(
             result.start_period, result.end_period,
         )
@@ -2093,6 +2190,44 @@ def _build_filter_stages(params: ScanParams) -> list[tuple[str, Callable]]:
                 f"{_label} >= {_count}q (start >={_start:g}%, "
                 f"step >={_step:g}pp, {_mode})",
                 _series_stage(f"{_prefix}_len", _count),
+            ))
+
+    # --- Period Avg / Period Max thresholds, all eight series filters ---
+    # Each is a SECOND gate on a filter that is already active: it narrows the
+    # rows a running filter returns and can never add one, so a filter left
+    # off is untouched no matter what its controls say.
+    #
+    # Gated on the explicit `_enabled` toggle, never on the threshold's value.
+    # A value-as-sentinel scheme would make `>= 0` unexpressible, and 0 is a
+    # perfectly reasonable bar — "the run averaged positive".
+    #
+    # Semantics worth stating: the run is chosen FIRST (by length, or recency
+    # under Most Recent), and only then is its average tested. A ticker whose
+    # longest run averages below the bar fails even if some shorter run in its
+    # history would have cleared it. Folding the average into run selection
+    # would mean optimising `run_series` on two axes at once, and that
+    # function backs all eight filters.
+    for _prefix, _label in (
+        ("consec_eps_beats", "Consec EPS Beats"),
+        ("consec_rev_beats", "Consec Rev Beats"),
+        ("consec_eps_growth", "Consec YoY EPS Growth"),
+        ("consec_rev_growth", "Consec YoY Rev Growth"),
+        ("accel_eps_surp", "Accel EPS Surp"),
+        ("accel_rev_surp", "Accel Rev Surp"),
+        ("accel_eps_yoy", "Accel YoY EPS"),
+        ("accel_rev_yoy", "Accel YoY Rev"),
+    ):
+        if not (getattr(params, f"{_prefix}_enabled")
+                and not getattr(params, f"{_prefix}_display_only")):
+            continue
+        for _stat, _word in (("period_avg", "Period Avg"),
+                             ("period_max", "Period Max")):
+            if not getattr(params, f"{_prefix}_{_stat}_enabled", False):
+                continue
+            _bar = getattr(params, f"{_prefix}_{_stat}_min", 0.0)
+            stages.append((
+                f"{_label} {_word} >= {_bar:g}%",
+                _series_stage(f"{_prefix}_{_stat}", _bar),
             ))
 
     return stages

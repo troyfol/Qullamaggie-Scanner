@@ -3309,6 +3309,45 @@ directories, and the previous `_internal/`.
 
 ## Changelog
 
+### v6.4.0 — Period Avg / Max on every series filter, and hide-by-column-type (2026-09-20)
+
+**Every multi-quarter earnings filter now reports the average and the maximum
+of its qualifying window.** All eight series filters (two beats, two YoY
+growth, four accelerating) resolve through one engine, and that engine already
+knew the exact `(start, end)` index pair of the run it picked — it just threw
+the members away. `RunSeries` and `AcceleratingSeries` now carry a `values`
+tuple, so `Period Avg` and `Period Max` are computed from the same quarters
+that produced the count and the two can never disagree. A zero-length run
+reports N/A rather than 0.00%, because "no qualifying quarters" and "averaged
+zero percent" are very different statements about a ticker.
+
+For the four accelerating filters the statistic is the METRIC at each quarter,
+not the quarter-over-quarter step the acceleration threshold tests — matching
+what the existing `_vals` column shows.
+
+**Both statistics are filterable, via a checkbox rather than a sentinel.**
+Each series row gained `Avg % >=` and `Max % >=` pairs, each a checkbox plus a
+spinbox that greys out while unticked. An earlier cut used `0.0` to mean
+"off", which quietly made `Avg >= 0` — "every quarter in the run averaged
+positive" — impossible to express. The threshold gates rows; it never gates
+the column, so the values are populated on every scan regardless.
+
+**Hide whole earnings column types.** A new row under the search bar carries a
+`Hide Q Columns` dropdown that collapses the quarter dimension: one tick hides
+`Q-X Reported EPS` across every rendered quarter. Series filters group per
+filter, so one tick hides everything a filter emits.
+
+Hiding is applied when the column list is BUILT, never by dropping columns
+from the frame. That ordering is load-bearing: `n_eps` / `n_rev` are derived
+from which `q*_reported_eps` columns exist, and `use_interleave` is gated on
+both being > 0, so hiding via the frame would have collapsed the entire EPS
+block and silently switched off the interleave layout. The data stays intact,
+which is also what lets the Excel dialog default to the on-screen columns
+while still offering the hidden ones as a separate unticked bundle.
+
+Selections persist into presets under `hidden_earnings_col_types`, kept apart
+from `column_hidden` (which is per-column and resets every scan).
+
 ### v6.3.3 — Zacks brought to parity with the other two sources (2026-09-19)
 
 **Gap Fill (Zacks) now means what the other two mean.** It was called
