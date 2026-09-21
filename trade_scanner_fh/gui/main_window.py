@@ -961,8 +961,8 @@ class MainWindow(QMainWindow):
 
         act_recheck_skips = QAction("Re-check Stale Skips...", self)
         act_recheck_skips.setToolTip(
-            "Re-enable entries on the finviz / finnhub / zacks skip lists so "
-            "the next Gap Fill tries them again — an entry auto-added because "
+            "Re-enable entries on the finviz / finnhub / zacks / finviz "
+            "attributes skip lists so the next Gap Fill tries them again — an entry auto-added because "
             "a source returned no data also describes an IPO that has since "
             "started reporting. Opens a dialog: choose the staleness window, "
             "the per-list cap, which sources, and which reason codes, with a "
@@ -986,9 +986,21 @@ class MainWindow(QMainWindow):
         act_fv_sweep.triggered.connect(self._refresh_finviz_attributes)
         data_menu.addAction(act_fv_sweep)
 
+        act_fv_gap = QAction("Gap Fill Finviz Attributes...", self)
+        act_fv_gap.setToolTip(
+            "Fetch attributes ONLY for universe tickers that have none at "
+            "all - new listings, tickers a stopped or aborted run never "
+            "reached, or ones Re-check Stale Skips re-enabled. Rows that are "
+            "merely old are left for the weekly refresh, and running this "
+            "does not reset that refresh's reminder."
+        )
+        act_fv_gap.triggered.connect(self._gap_fill_finviz_attributes)
+        data_menu.addAction(act_fv_gap)
+
         act_fv_stop = QAction("Stop Finviz Attribute Refresh", self)
         act_fv_stop.setToolTip(
-            "Cancel a running sweep. Everything already fetched is kept."
+            "Cancel a running refresh or gap fill. Everything already "
+            "fetched is kept."
         )
         act_fv_stop.triggered.connect(self._stop_finviz_attributes)
         data_menu.addAction(act_fv_stop)
@@ -1000,6 +1012,18 @@ class MainWindow(QMainWindow):
         )
         act_fv_status.triggered.connect(self._finviz_attribute_status)
         data_menu.addAction(act_fv_status)
+
+        act_fv_skip_list = QAction("Edit Finviz Attributes Skip List...", self)
+        act_fv_skip_list.setToolTip(
+            "View and edit the finviz ATTRIBUTES skip list - separate from "
+            "the finviz earnings one. Auto-populated only by a definitive "
+            "'ticker not found' from finviz, never by a block. Honored only "
+            "by the attribute refresh and gap fill."
+        )
+        act_fv_skip_list.triggered.connect(
+            self._show_finviz_snapshot_skip_list_editor
+        )
+        data_menu.addAction(act_fv_skip_list)
 
         act_prune_orphans = QAction("Prune Orphaned Data...", self)
         act_prune_orphans.setToolTip(
@@ -3594,7 +3618,7 @@ class MainWindow(QMainWindow):
     def _maybe_prompt_finviz_sweep(self) -> None:
         """Offer an overdue sweep at launch. Never starts one on its own.
 
-        Deliberately a PROMPT: the sweep is ~10.8 hours of requests, and
+        Deliberately a PROMPT: a full sweep is ~18 hours of requests, and
         beginning that unannounced while the user is trying to scan would be
         hostile. Also deliberately fired AFTER the OHLCV / Nasdaq / earnings
         chain is already under way, so the question can never delay them.
@@ -3645,19 +3669,53 @@ class MainWindow(QMainWindow):
             # A launch-time nicety must never be able to stop the app opening.
             log.warning("Finviz sweep due-check skipped: %s", exc)
 
-    def _start_finviz_sweep(self, symbols, skip) -> None:
-        """Launch the sweep worker. Shared by the menu action and the
-        overdue prompt so both stamp the run and wire the same signals."""
+    #: Log / status-bar prefix per run kind. The refresh wording is what
+    #: shipped in 7.0.x and is kept verbatim.
+    #: Which kind of run the live/last worker is. A CLASS default, not only
+    #: an instance one: on a bypass-init shell Qt raises RuntimeError (not
+    #: AttributeError) for a missing attribute, so getattr-with-default
+    #: would not save the log handlers there.
+    _fv_sweep_kind = "refresh"
+
+    _FV_SWEEP_LABELS = {
+        "refresh": ("Finviz attribute refresh", "Finviz attributes"),
+        "gap": ("Finviz attribute gap fill", "Finviz attribute gap fill"),
+    }
+
+    def _fv_sweep_label(self, which: int) -> str:
+        kind = self._fv_sweep_kind
+        return self._FV_SWEEP_LABELS.get(
+            kind, self._FV_SWEEP_LABELS["refresh"])[which]
+
+    def _start_finviz_sweep(self, symbols, skip, *, kind="refresh") -> None:
+        """Launch the sweep worker. Shared by the refresh menu action, the
+        overdue prompt and the gap fill so all three wire the same signals
+        and feed the same skip list.
+
+        Only a REFRESH stamps the weekly cadence clock. A gap fill that
+        fetches a handful of new listings must not push the full refresh's
+        reminder back a week.
+        """
         worker = FinvizSnapshotSweepWorker(symbols, skip=skip, parent=self)
         worker.progress.connect(self._on_fv_sweep_progress)
         worker.finished_sweep.connect(self._on_fv_sweep_done)
         worker.not_found.connect(self._on_fv_sweep_not_found)
         self._fv_sweep_worker = worker
-        self._stamp_finviz_sweep_now()
+        self._fv_sweep_kind = kind
+        if kind == "refresh":
+            self._stamp_finviz_sweep_now()
         worker.start()
-        self.status.showMessage(
-            "Finviz attribute refresh started: %s tickers."
-            % format(len(symbols), ","))
+        hours = (len(symbols) * config.FINVIZ_SNAPSHOT_MIN_INTERVAL_SEC) / 3600.0
+        msg = ("%s started: %s ticker(s) at %gs pacing "
+               "(~%.1f hours). Runs in the background; Data > Stop Finviz "
+               "Attribute Refresh to cancel."
+               % (self._fv_sweep_label(0), format(len(symbols), ","),
+                  config.FINVIZ_SNAPSHOT_MIN_INTERVAL_SEC, hours))
+        self.status.showMessage(msg)
+        try:
+            self.log_panel.write_line(msg)
+        except Exception as exc:
+            log.debug("could not write sweep start line: %s", exc)
 
 
     @staticmethod
@@ -3754,27 +3812,115 @@ class MainWindow(QMainWindow):
 
         self._start_finviz_sweep(stale, skip)
 
+    def _gap_fill_finviz_attributes(self):
+        """Menu: fetch attributes only for tickers that have none at all."""
+        from .. import finviz_snapshot as fvs
+
+        worker = getattr(self, "_fv_sweep_worker", None)
+        if worker is not None and worker.isRunning():
+            QMessageBox.information(
+                self, "Finviz Attributes",
+                "A refresh or gap fill is already running. Use Stop Finviz "
+                "Attribute Refresh to cancel it.")
+            return
+
+        universe = self._finviz_universe_symbols()
+        if not universe:
+            QMessageBox.warning(
+                self, "Finviz Attributes",
+                "No universe loaded - refresh the universe first.")
+            return
+
+        skip = self._combined_finviz_snapshot_skip_set()
+        missing = fvs.missing_symbols(universe, skip=skip)
+        if not missing:
+            QMessageBox.information(
+                self, "Gap Fill Finviz Attributes",
+                "No gaps - every universe ticker that is not skip-listed "
+                "already has attributes.<br><br>"
+                "Skip-listed: %s (finviz-not-found + OHLCV blacklist)"
+                % format(len(skip), ","))
+            return
+
+        pace = config.FINVIZ_SNAPSHOT_MIN_INTERVAL_SEC
+        hours = (len(missing) * pace) / 3600.0
+        preview = ", ".join(missing[:12]) + (" ..." if len(missing) > 12
+                                             else "")
+        msg = (
+            "Universe: %s tickers<br>"
+            "Skip-listed: %s (finviz-not-found + OHLCV blacklist)<br>"
+            "With no attributes at all: <b>%s</b><br>"
+            "<small>%s</small><br><br>"
+            "At %gs pacing this is roughly <b>%.1f hours</b> of requests. "
+            "Rows that are merely old are NOT refetched - that is the weekly "
+            "refresh's job, and its reminder is not reset by this.<br><br>"
+            "Start the gap fill?"
+            % (format(len(universe), ","), format(len(skip), ","),
+               format(len(missing), ","), preview, pace, hours)
+        )
+        if QMessageBox.question(
+            self, "Gap Fill Finviz Attributes", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        self._start_finviz_sweep(missing, skip, kind="gap")
+
     def _stop_finviz_attributes(self):
         worker = getattr(self, "_fv_sweep_worker", None)
         if worker is None or not worker.isRunning():
             QMessageBox.information(
-                self, "Finviz Attributes", "No refresh is running.")
+                self, "Finviz Attributes",
+                "No refresh or gap fill is running.")
             return
         worker.stop()
-        self.status.showMessage(
-            "Finviz attribute refresh: stop requested - finishing the "
-            "current ticker and saving.")
+        msg = ("%s: stop requested - finishing the current ticker and "
+               "saving." % self._fv_sweep_label(0))
+        self.status.showMessage(msg)
+        try:
+            self.log_panel.write_line(msg)
+        except Exception as exc:
+            log.debug("could not write sweep stop line: %s", exc)
+
+    # Log a progress line every N tickers. The worker signals every 25, which
+    # at 4s pacing is roughly every 100 seconds; echoing all of those into the
+    # log panel would be ~640 lines on a full-universe run and would bury
+    # everything else. 250 gives about 64 lines over a ~16,000-ticker,
+    # ~18-hour run, which is a readable trail you can scroll back through.
+    _FV_SWEEP_LOG_EVERY = 250
 
     @pyqtSlot(int, int, dict)
     def _on_fv_sweep_progress(self, done: int, total: int, summary: dict):
+        # Status bar: fine-grained, transient, overwritten freely.
+        pct = (done / total * 100.0) if total else 0.0
+        remaining = max(0, total - done)
+        eta_h = (remaining * config.FINVIZ_SNAPSHOT_MIN_INTERVAL_SEC) / 3600.0
+        label = self._fv_sweep_label(1)
         self.status.showMessage(
-            "Finviz attributes: %s/%s - %s fetched, %s not covered, "
-            "%s blocked" % (
-                format(done, ","), format(total, ","),
+            "%s: %s/%s (%.1f%%) - %s fetched, %s not covered, "
+            "%s blocked - ~%.1fh left" % (
+                label, format(done, ","), format(total, ","), pct,
                 format(summary.get("ok", 0), ","),
                 format(summary.get("not_found", 0), ","),
-                format(summary.get("blocked", 0), ","))
+                format(summary.get("blocked", 0), ","), eta_h)
         )
+        # Log panel: coarse, permanent. The status bar is shared with every
+        # other operation and leaves no scrollback, so a multi-hour job needs
+        # a durable trail of its own.
+        if done % self._FV_SWEEP_LOG_EVERY == 0 or done == total:
+            try:
+                self.log_panel.write_line(
+                    "%s: %s/%s (%.0f%%) - %s fetched, "
+                    "%s not covered, %s blocked, %s saved - ~%.1fh remaining"
+                    % (label, format(done, ","), format(total, ","), pct,
+                       format(summary.get("ok", 0), ","),
+                       format(summary.get("not_found", 0), ","),
+                       format(summary.get("blocked", 0), ","),
+                       format(summary.get("written", 0), ","), eta_h)
+                )
+            except Exception as exc:
+                log.debug("could not write sweep progress line: %s", exc)
 
     @pyqtSlot(str)
     def _on_fv_sweep_not_found(self, symbol: str):
@@ -3783,11 +3929,11 @@ class MainWindow(QMainWindow):
         if not sym or sym in self._finviz_snapshot_blacklist:
             return
         self._finviz_snapshot_blacklist.add(sym)
-        try:
-            self._pending_skip_reasons.setdefault(
-                "finviz_snapshot", {})[sym] = "not_found"
-        except AttributeError:
-            pass
+        # `_skip_reasons` is what `_save_skip_list_with_reasons` reads. This
+        # line used to write to a `_pending_skip_reasons` that never existed,
+        # inside an `except AttributeError: pass`, so every entry was saved
+        # as "unknown" (7.0.2 fix). No guard: a miss here should be loud.
+        self._skip_reasons.setdefault("finviz_snapshot", {})[sym] = "not_found"
 
     @pyqtSlot(dict)
     def _on_fv_sweep_done(self, summary: dict):
@@ -3798,19 +3944,40 @@ class MainWindow(QMainWindow):
                         exc)
         if summary.get("error"):
             self.status.showMessage(
-                "Finviz attribute refresh failed: %s" % summary["error"])
+                "%s failed: %s" % (self._fv_sweep_label(0), summary["error"]))
             return
         tail = ""
         if summary.get("aborted"):
-            tail = " (aborted - finviz throttling)"
+            tail = " (ABORTED - finviz throttling)"
         elif summary.get("stopped"):
-            tail = " (stopped)"
-        self.status.showMessage(
-            "Finviz attributes done%s: %s saved, %s not covered, %s blocked."
-            % (tail, format(summary.get("written", 0), ","),
-               format(summary.get("not_found", 0), ","),
-               format(summary.get("blocked", 0), ","))
-        )
+            tail = " (stopped by user)"
+        msg = ("%s done%s: %s saved, %s not covered, "
+               "%s blocked, %s network errors, %s empty pages."
+               % (self._fv_sweep_label(1), tail,
+                  format(summary.get("written", 0), ","),
+                  format(summary.get("not_found", 0), ","),
+                  format(summary.get("blocked", 0), ","),
+                  format(summary.get("network", 0), ","),
+                  format(summary.get("empty_grid", 0), ",")))
+        self.status.showMessage(msg)
+        try:
+            self.log_panel.write_line(msg)
+            if summary.get("not_found"):
+                self.log_panel.write_line(
+                    "  \u21b3 %s ticker(s) added to the finviz attribute skip "
+                    "list (definitive 'not found' only). Data > Re-check "
+                    "Stale Skips to revisit them later."
+                    % format(summary.get("not_found", 0), ","))
+            if summary.get("aborted"):
+                self.log_panel.write_line(
+                    "  \u21b3 Run aborted after repeated blocks. Progress is "
+                    "saved; the next run resumes from staleness."
+                    if self._fv_sweep_kind != "gap"
+                    else "  \u21b3 Run aborted after repeated blocks. "
+                    "Progress is saved; the next gap fill picks up only what "
+                    "is still missing.")
+        except Exception as exc:
+            log.debug("could not write sweep summary line: %s", exc)
 
     def _finviz_attribute_status(self):
         """Menu: coverage report. Fetches nothing."""
@@ -3822,8 +3989,17 @@ class MainWindow(QMainWindow):
         if not store.empty:
             covered = set(store[fvs.SYMBOL_COL].astype(str).str.upper())
         stale = fvs.stale_symbols(sorted(universe), skip=skip)
+        # Say whether a sweep is in flight. Without this the dialog reads like
+        # a static report and gives no way to check in on a running job.
+        worker = getattr(self, "_fv_sweep_worker", None)
+        running = ("<b>A %s is RUNNING right now.</b> Watch the log panel "
+                   "or the status bar for progress.<br><br>"
+                   % ("gap fill" if self._fv_sweep_kind
+                      == "gap" else "refresh")
+                   if worker is not None and worker.isRunning() else "")
         QMessageBox.information(
             self, "Finviz Attribute Coverage",
+            running +
             "<b>Last refresh:</b> %s<br><br>"
             "Universe: %s<br>"
             "With attributes: %s<br>"
@@ -3870,6 +4046,93 @@ class MainWindow(QMainWindow):
             self._finviz_blacklist.add(norm)
             self._skip_reasons.setdefault("finviz", {})[norm] = "empty"
             self._auto_added_finviz_skips += 1
+
+    def _show_finviz_snapshot_skip_list_editor(self):
+        """View/edit the finviz ATTRIBUTES skip list (line-per-ticker).
+
+        A deliberate copy of the finviz earnings editor below rather than a
+        shared helper: the three existing editors are untouched this way.
+        Differences: it edits `_finviz_snapshot_blacklist`, and tickers added
+        by hand are tagged ``manual`` - true here, and it keeps them out of
+        Re-check Stale Skips' default selection. Kept entries retain their
+        on-disk date and reason via `_save_skip_list_with_reasons`.
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Finviz Attributes Skip List")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(560)
+        dlg.setMinimumHeight(480)
+        layout = QVBoxLayout(dlg)
+
+        lbl = QLabel(
+            "Tickers in this list are <b>skipped only by the finviz "
+            "attribute refresh and gap fill</b>. Earnings fills (including "
+            "finviz earnings), OHLCV, sector fills and scans all still see "
+            "these tickers normally.\n\n"
+            "Auto-populated only by a definitive finviz <i>ticker not "
+            "found</i> page - never by a block or a throttle. Tickers on the "
+            "OHLCV blacklist are skipped as well, but are not stored here."
+            "\n\nOne ticker per line. Tickers you add are tagged "
+            "<code>manual</code>."
+        )
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+
+        current = set(getattr(self, "_finviz_snapshot_blacklist", set()) or ())
+        txt = QTextEdit()
+        txt.setFont(QFont("Consolas", 9))
+        txt.setPlaceholderText("e.g.\nABR-PD\nAAC-WT")
+        txt.setPlainText("\n".join(sorted(current)))
+        layout.addWidget(txt)
+
+        count_lbl = QLabel(
+            f"Currently on finviz attributes skip list: {len(current)}"
+        )
+        layout.addWidget(count_lbl)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_ok = QPushButton("OK")
+        btn_ok.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_ok)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._apply_finviz_snapshot_skip_edit(txt.toPlainText())
+
+    def _apply_finviz_snapshot_skip_edit(self, raw: str) -> bool:
+        """Persist an edited attributes skip list. Split out of the dialog so
+        it is testable without a modal. Returns True if anything changed."""
+        current = set(getattr(self, "_finviz_snapshot_blacklist", set()) or ())
+        new_set = {
+            self._normalize_ticker(t)
+            for line in raw.splitlines()
+            for t in line.split(",")
+            if t.strip()
+        }
+        new_set.discard("")
+        if new_set == current:
+            return False
+        reasons = self._skip_reasons.setdefault("finviz_snapshot", {})
+        for t in new_set - current:
+            reasons[t] = "manual"
+        self._finviz_snapshot_blacklist = new_set
+        try:
+            self._save_finviz_snapshot_blacklist()
+            self.log_panel.write_line(
+                f"Finviz attributes skip list updated: {len(new_set)} "
+                "tickers."
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Save Failed",
+                f"Could not save finviz attributes skip list: {exc}",
+            )
+        return True
 
     def _show_finviz_skip_list_editor(self):
         """View/edit the finviz-only skip list (line-per-ticker)."""

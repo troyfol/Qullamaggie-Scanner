@@ -3110,6 +3110,9 @@ client's rate limiter).
 | `test_config.py` | Holiday calendar, atomic writes |
 | `test_refetch_overlap.py` | Incremental refetch overlap — widened window, provisional-bar replacement, history preservation, conflicting-resend guard, re-anchor filter both directions, tz normalisation |
 | `test_acl_hardening.py` | DATA_DIR ACL hardening against the REAL `icacls` — pre-existing files stay readable, non-empty DACL, v1-sentinel rerun |
+| `test_period_stats_and_hidden_types.py` | **v6.4.0.** Period Avg / Max over the resolved window (engine + scanner + columns), the checkbox-gated thresholds, and hide-by-column-type. Contains the regression guard proving that hiding `Q-X Reported EPS` cannot collapse the EPS block or switch off Interleave |
+| `test_volatility_and_zscore.py` | **v7.0.0.** Price z-score (period selection, ddof=1, the 20-bar floor, truncation flagging) and the realized-volatility set, each checked against a hand-written computation rather than a frozen constant. Also pins that `max_trailing_bars()` only counts the long new lookbacks when the indicator will actually run |
+| `test_finviz_snapshot.py` | **v7.0.0 - 7.0.2.** Snapshot parsing (duplicate `EPS next Y`, the seven two-value cells, short ETF grids, the `Change %` label), the not-found gate that decides permanent skip-listing, the store's merge-never-replace rule, the sweep's block/abort behaviour, the launch cadence prompt, per-field spinbox ranges, sweep log visibility, the attributes skip list's reason codes end to end, its editor, and the gap fill's target selection and clock handling |
 
 ### Test invariants
 
@@ -3307,7 +3310,78 @@ directories, and the previous `_internal/`.
 
 ---
 
+## v7 module map
+
+Four modules were added in the v7 line. Everything else in `trade_scanner_fh/`
+predates it.
+
+| Module | Role |
+|---|---|
+| `finviz_snapshot.py` | Parses the quote-page snapshot grid (93 fields), owns the field taxonomy, per-field spinbox ranges and panel grouping, and the merge-never-replace store plus its write buffer |
+| `finviz_snapshot_fill.py` | The paced universe sweep. NOT chained into the market-open update — a full run is ~18 hours |
+| `indicators.price_zscore` / volatility set | `price_zscore`, `historical_volatility`, `yang_zhang_volatility`, `atr_pct`, `hv_rank`, `hv_percentile`, `beta_vs_benchmark` |
+| `earnings_series.window_values` / `series_avg` / `series_max` | Period Avg / Max over the window a series filter resolved to |
+
+The free attribute scavenge is not a module: it lives inside
+`finviz_client.fetch_earnings` (which stashes the parsed grid) and
+`finviz_fill._fetch_one_ticker` (which queues it). Every earnings request
+therefore refreshes that ticker's attributes at no extra cost, independently
+of whether the sweep ever runs.
+
 ## Changelog
+
+### v7.0.2 - attributes skip list editor, gap fill, reason fix, and sweep visibility (2026-09-21)
+
+**The attributes skip list had no editor.** Finviz, Zacks and Finnhub each had
+an Edit ... Skip List item; the finviz attributes list
+(`scanner_data/finviz_snapshot_blacklist.txt`) was only reachable through
+Re-check Stale Skips or the file itself. New: **Data > Edit Finviz Attributes
+Skip List...**, next to the other attribute items. Kept entries retain their
+date and reason; tickers you add by hand are tagged `manual`, which Re-check
+Stale Skips leaves alone by default. It is a separate copy of the existing
+editor rather than a shared rewrite, so the other three are untouched.
+
+**Every attributes skip entry was saved with reason `unknown`.** The
+not-found handler wrote the reason to `self._pending_skip_reasons`, which
+never existed, inside an `except AttributeError: pass`. The saver reads
+`self._skip_reasons`, found nothing, and fell back to `unknown`. The entries
+themselves were correct (the definitive-404 handler is the only thing that
+writes to this list), only the label was wrong. Fixed, with the guard removed
+so a miss is loud, and pinned by a test that runs a not-found through to the
+saved file. The 3,126 entries from the first full sweep (2026-09-21) were
+relabelled `not_found` in place in the user's data store.
+
+**Gap Fill Finviz Attributes.** Data > Gap Fill Finviz Attributes... fetches
+only universe tickers that have **no** attribute row at all, minus the
+combined skip set: new listings after a universe refresh, tickers a stopped or
+aborted run never reached, or ones Re-check Stale Skips re-enabled. A row
+that is merely old is never refetched here; that stays the weekly refresh's
+job. The selector is a new `finviz_snapshot.missing_symbols()`, kept separate
+from `stale_symbols()` so the refresh path is unchanged. It shares the refresh
+worker, pacing, not-found handling and Stop item, refuses to start while a
+run is live, and **does not reset the weekly refresh reminder** (only a
+refresh stamps it). Its log and status lines are labelled "gap fill".
+
+**You could not check in on a running attribute sweep.** A full sweep is ~18
+hours, and its only output was the status bar, which is shared with every
+other operation and leaves no scrollback. Every other long job in the app
+writes to the log panel; this one had zero `log_panel.write_line` calls
+against the app's 160.
+
+Now: a start line naming the ticker count, the pacing and the estimate; a
+progress line every 250 tickers (about 65 over a full run, rather than the
+~640 that echoing every 25-ticker signal would have dumped on the panel); and
+a completion line carrying the full breakdown including network errors and
+empty pages, which were previously counted and then discarded. An aborted run
+says so and notes that progress is saved and the next run resumes from
+staleness; a stopped one says "stopped by user".
+
+The status bar additionally carries percent complete and a live ETA, and the
+Coverage dialog leads with a notice when a sweep is actually in flight instead
+of reading like a static report.
+
+Every log write is individually guarded, so a broken log panel cannot take
+down an 18-hour job. There is a test for that.
 
 ### v7.0.1 - filter ranges scaled to what they measure, and a universe-lookup fix (2026-09-20)
 

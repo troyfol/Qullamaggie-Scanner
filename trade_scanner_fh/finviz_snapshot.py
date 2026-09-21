@@ -450,6 +450,32 @@ def stale_symbols(
     return never + [s for _t, s in aged]
 
 
+def missing_symbols(
+    universe: "list[str]", *, skip: "set[str] | None" = None,
+) -> list:
+    """Universe members with NO snapshot row at all - the gap-fill target.
+
+    Kept separate from `stale_symbols` rather than bolted on as a flag: that
+    function drives the weekly refresh, and a gap fill must never widen into
+    re-fetching rows that merely aged. Any existing row counts as covered,
+    however old. Universe order is kept and duplicates are dropped.
+    """
+    skip = {s.upper() for s in (skip or set())}
+    df = load_store()
+    have = (set(df[SYMBOL_COL].astype(str).str.upper())
+            if not df.empty and SYMBOL_COL in df.columns else set())
+    out, seen = [], set()
+    for s in universe:
+        if not s or not str(s).strip():
+            continue
+        s = str(s).upper().strip()
+        if s in skip or s in have or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
 # ----------------------------------------------------------------------
 # Panel grouping
 # ----------------------------------------------------------------------

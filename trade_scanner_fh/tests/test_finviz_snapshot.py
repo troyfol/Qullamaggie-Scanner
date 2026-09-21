@@ -744,3 +744,297 @@ def test_large_bounds_render_readably_in_the_funnel():
         "market_cap": {"enabled": True, "min": 2e9, "max": 5e11}})
     labels = [n for n, _f in sc._build_filter_stages(p)]
     assert "Market Cap >= 2B and <= 500B" in labels
+
+
+# ----------------------------------------------------------------------
+# Sweep visibility (v7.0.2)
+# ----------------------------------------------------------------------
+#
+# A ~18 hour background job needs a durable trail. The status bar is shared
+# with every other operation and leaves no scrollback, so it cannot be the
+# only signal.
+
+@pytest.fixture
+def logwin(qapp, store):
+    from trade_scanner_fh.gui.main_window import MainWindow
+    w = MainWindow.__new__(MainWindow)
+    w._log = []
+    w._bar = []
+    w.log_panel = type("L", (), {
+        "write_line": lambda _s, m, _o=w: _o._log.append(m)})()
+    w.status = type("S", (), {
+        "showMessage": lambda _s, m, _o=w: _o._bar.append(m)})()
+    w._fv_sweep_worker = None
+    w._finviz_snapshot_blacklist = set()
+    w._save_finviz_snapshot_blacklist = lambda: None
+    return w
+
+
+def _summary(**kw):
+    base = {"ok": 0, "not_found": 0, "blocked": 0, "written": 0,
+            "network": 0, "empty_grid": 0, "stopped": False,
+            "aborted": False}
+    base.update(kw)
+    return base
+
+
+def test_progress_writes_to_the_status_bar_every_tick(logwin):
+    logwin._on_fv_sweep_progress(25, 1000, _summary(ok=25))
+    assert len(logwin._bar) == 1
+    assert "25/1,000" in logwin._bar[0]
+
+
+def test_progress_logs_only_periodically(logwin):
+    """Echoing every tick would be ~640 lines on a full run and would bury
+    everything else in the panel."""
+    for done in range(25, 1001, 25):
+        logwin._on_fv_sweep_progress(done, 1000, _summary(ok=done))
+    assert len(logwin._bar) == 40           # every tick
+    assert len(logwin._log) == 4            # every 250
+    assert all("Finviz attributes:" in m for m in logwin._log)
+
+
+def test_progress_reports_percent_and_eta(logwin):
+    logwin._on_fv_sweep_progress(250, 1000, _summary(ok=250))
+    line = logwin._log[0]
+    assert "25%" in line
+    assert "remaining" in line
+    assert "250/1,000" in line
+
+
+def test_final_tick_always_logs_even_off_the_interval(logwin):
+    logwin._on_fv_sweep_progress(1001, 1001, _summary(ok=1001))
+    assert len(logwin._log) == 1
+
+
+def test_completion_logs_a_full_breakdown(logwin):
+    logwin._on_fv_sweep_done(_summary(
+        written=15132, not_found=804, blocked=161, network=3, empty_grid=1))
+    joined = " ".join(logwin._log)
+    for token in ("15,132 saved", "804 not covered", "161 blocked",
+                  "3 network errors", "1 empty pages"):
+        assert token in joined, token
+
+
+def test_completion_explains_skip_list_additions(logwin):
+    logwin._on_fv_sweep_done(_summary(written=10, not_found=7))
+    joined = " ".join(logwin._log)
+    assert "skip list" in joined
+    assert "Re-check Stale Skips" in joined
+
+
+def test_abort_is_called_out_in_the_log(logwin):
+    logwin._on_fv_sweep_done(_summary(written=5, blocked=40, aborted=True))
+    joined = " ".join(logwin._log)
+    assert "ABORTED" in joined
+    assert "resumes from staleness" in joined
+
+
+def test_stopped_run_says_so(logwin):
+    logwin._on_fv_sweep_done(_summary(written=5, stopped=True))
+    assert "stopped by user" in logwin._log[0]
+
+
+def test_a_log_panel_failure_never_breaks_the_sweep(logwin):
+    """The panel is a nicety; a broken one must not take the run down."""
+    def boom(_m):
+        raise RuntimeError("panel gone")
+    logwin.log_panel = type("L", (), {"write_line": lambda _s, m: boom(m)})()
+    logwin._on_fv_sweep_progress(250, 1000, _summary(ok=250))
+    logwin._on_fv_sweep_done(_summary(written=1))
+    assert logwin._bar, "status bar should still have been updated"
+
+
+# ----------------------------------------------------------------------
+# v7.0.2: attributes skip-list reasons, its editor, and the gap fill.
+# ----------------------------------------------------------------------
+
+def _rows(*syms, age_days=0):
+    ts = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=age_days)
+    return [{fs.SYMBOL_COL: s, fs.FETCHED_COL: ts, "pe": 1.0} for s in syms]
+
+
+def test_missing_symbols_on_an_empty_store_is_the_whole_universe(store):
+    assert fs.missing_symbols(["AAA", "BBB"]) == ["AAA", "BBB"]
+
+
+def test_missing_symbols_counts_any_row_as_covered_however_old(store):
+    """A gap fill must never widen into re-fetching rows that merely aged -
+    that is the weekly refresh's job."""
+    fs.merge_rows(_rows("OLD", age_days=400) + _rows("NEW"))
+    assert fs.missing_symbols(["OLD", "NEW", "GAP"]) == ["GAP"]
+    # ...while the refresh selector does still want the aged one.
+    assert "OLD" in fs.stale_symbols(["OLD", "NEW", "GAP"])
+
+
+def test_missing_symbols_honours_skip_order_case_and_duplicates(store):
+    fs.merge_rows(_rows("HAVE"))
+    got = fs.missing_symbols(["zzz", "HAVE", "aaa", "SKIP", "ZZZ", " ", ""],
+                             skip={"skip"})
+    assert got == ["ZZZ", "AAA"]
+
+
+def _reason_win(qapp, tmp_path):
+    from trade_scanner_fh.gui.main_window import MainWindow
+    w = MainWindow.__new__(MainWindow)
+    w._skip_reasons = {}
+    w._finviz_snapshot_blacklist = set()
+    w._FINVIZ_SNAPSHOT_BLACKLIST_FILE = tmp_path / "fvs_skip.txt"
+    w._log = []
+    w.log_panel = type("L", (), {
+        "write_line": lambda _s, m, _o=w: _o._log.append(m)})()
+    return w
+
+
+def _saved_reasons(path):
+    from trade_scanner_fh.gui.blacklists import BlacklistManager
+    return {t: r for t, (_d, r) in
+            BlacklistManager(path, label="t").load_entries().items()}
+
+
+def test_not_found_is_saved_as_not_found_not_unknown(qapp, tmp_path):
+    """7.0.2 regression: the handler wrote to a `_pending_skip_reasons` that
+    never existed, an `except AttributeError` swallowed it, and every entry
+    reached disk as "unknown". Pinned end-to-end through the real saver."""
+    w = _reason_win(qapp, tmp_path)
+    w._on_fv_sweep_not_found("abr-pd")
+    w._on_fv_sweep_not_found("ABR-PD")          # duplicate is a no-op
+    assert w._finviz_snapshot_blacklist == {"ABR-PD"}
+    w._save_finviz_snapshot_blacklist()
+    assert _saved_reasons(w._FINVIZ_SNAPSHOT_BLACKLIST_FILE) == {
+        "ABR-PD": "not_found"}
+
+
+def test_not_found_handler_has_no_swallowing_guard():
+    import inspect
+    from trade_scanner_fh.gui.main_window import MainWindow
+    src = inspect.getsource(MainWindow._on_fv_sweep_not_found)
+    code = "\n".join(l.split("#", 1)[0] for l in src.splitlines())
+    assert "_pending_skip_reasons" not in code
+    assert "except AttributeError" not in code
+    assert '_skip_reasons.setdefault("finviz_snapshot"' in code
+
+
+def test_editor_keeps_existing_reasons_and_tags_additions_manual(
+        qapp, tmp_path):
+    w = _reason_win(qapp, tmp_path)
+    w._on_fv_sweep_not_found("AAUAF")
+    w._on_fv_sweep_not_found("DROPME")
+    w._save_finviz_snapshot_blacklist()
+    changed = w._apply_finviz_snapshot_skip_edit("AAUAF\nmine1, MINE2\n\n")
+    assert changed is True
+    assert w._finviz_snapshot_blacklist == {"AAUAF", "MINE1", "MINE2"}
+    assert _saved_reasons(w._FINVIZ_SNAPSHOT_BLACKLIST_FILE) == {
+        "AAUAF": "not_found", "MINE1": "manual", "MINE2": "manual"}
+    assert any("skip list updated: 3" in m for m in w._log)
+
+
+def test_editor_with_no_change_writes_nothing(qapp, tmp_path):
+    w = _reason_win(qapp, tmp_path)
+    w._finviz_snapshot_blacklist = {"AAA"}
+    assert w._apply_finviz_snapshot_skip_edit("aaa\n") is False
+    assert not w._FINVIZ_SNAPSHOT_BLACKLIST_FILE.exists()
+
+
+def test_menu_offers_the_attributes_editor_and_gap_fill():
+    import inspect
+    from trade_scanner_fh.gui.main_window import MainWindow
+    src = inspect.getsource(MainWindow)
+    assert '"Edit Finviz Attributes Skip List..."' in src
+    assert "self._show_finviz_snapshot_skip_list_editor" in src
+    assert '"Gap Fill Finviz Attributes..."' in src
+    assert "self._gap_fill_finviz_attributes" in src
+
+
+class _FakeSignal:
+    def connect(self, _fn):
+        pass
+
+
+class _FakeWorker:
+    started = []
+
+    def __init__(self, symbols, skip=None, parent=None):
+        self.symbols, self.skip = list(symbols), skip
+        self.progress = self.finished_sweep = self.not_found = _FakeSignal()
+
+    def start(self):
+        _FakeWorker.started.append(self.symbols)
+
+    def isRunning(self):
+        return False
+
+
+@pytest.fixture
+def gapwin(win, monkeypatch):
+    from trade_scanner_fh.gui import main_window as mw_mod
+    _FakeWorker.started = []
+    monkeypatch.setattr(mw_mod, "FinvizSnapshotSweepWorker", _FakeWorker)
+    win._log = []
+    win.log_panel = type("L", (), {
+        "write_line": lambda _s, m, _o=win: _o._log.append(m)})()
+    win._boxes = []
+
+    def box(kind, answer=None):
+        def f(*a, **k):
+            win._boxes.append((kind, a[1] if len(a) > 1 else "", a[2]
+                               if len(a) > 2 else ""))
+            return answer
+        return f
+    Yes = mw_mod.QMessageBox.StandardButton.Yes
+    monkeypatch.setattr(mw_mod.QMessageBox, "question",
+                        staticmethod(box("question", Yes)))
+    monkeypatch.setattr(mw_mod.QMessageBox, "information",
+                        staticmethod(box("information")))
+    monkeypatch.setattr(mw_mod.QMessageBox, "warning",
+                        staticmethod(box("warning")))
+    return win
+
+
+def test_gap_fill_does_not_reset_the_weekly_clock(gapwin):
+    gapwin._start_finviz_sweep(["AAA"], set(), kind="gap")
+    assert _FakeWorker.started == [["AAA"]]
+    assert gapwin._is_finviz_sweep_due() is True       # never stamped
+    assert "gap fill started" in gapwin._log[0]
+
+
+def test_refresh_still_resets_the_weekly_clock(gapwin):
+    gapwin._start_finviz_sweep(["AAA"], set())
+    assert gapwin._is_finviz_sweep_due() is False
+    assert gapwin._log[0].startswith("Finviz attribute refresh started")
+
+
+def test_gap_fill_targets_only_rows_that_do_not_exist(gapwin, store):
+    """AAA is ancient but present, BBB is skip-listed, CCC has nothing."""
+    fs.merge_rows(_rows("AAA", age_days=400))
+    gapwin._finviz_snapshot_blacklist = {"BBB"}
+    gapwin._gap_fill_finviz_attributes()
+    assert _FakeWorker.started == [["CCC"]]
+    assert gapwin._fv_sweep_kind == "gap"
+    assert gapwin._boxes[0][0] == "question"
+
+
+def test_gap_fill_with_no_gaps_starts_nothing(gapwin, store):
+    fs.merge_rows(_rows("AAA", "BBB", "CCC"))
+    gapwin._gap_fill_finviz_attributes()
+    assert _FakeWorker.started == []
+    assert gapwin._boxes and gapwin._boxes[0][0] == "information"
+    assert "No gaps" in gapwin._boxes[0][2]
+
+
+def test_gap_fill_refuses_while_a_run_is_live(gapwin):
+    gapwin._fv_sweep_worker = type("R", (), {"isRunning": lambda s: True})()
+    gapwin._gap_fill_finviz_attributes()
+    assert _FakeWorker.started == []
+    assert "already running" in gapwin._boxes[0][2]
+
+
+def test_gap_fill_log_lines_are_labelled_as_gap_fill(logwin):
+    logwin._fv_sweep_kind = "gap"
+    logwin._on_fv_sweep_progress(250, 250, _summary(ok=250))
+    logwin._on_fv_sweep_done(_summary(written=5, aborted=True))
+    joined = " ".join(logwin._log)
+    assert "Finviz attribute gap fill: 250/250" in joined
+    assert "Finviz attribute gap fill done" in joined
+    assert "next gap fill" in joined
+    assert all("Finviz attribute gap fill" in m for m in logwin._bar)

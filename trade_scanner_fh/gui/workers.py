@@ -1736,7 +1736,7 @@ class FinvizSnapshotSweepWorker(QThread):
     """Background paced sweep of the finviz attribute grid (v7.0.0).
 
     Deliberately NOT chained into the market-open auto-update: at 4.0s pacing
-    a ~9,750-ticker universe is ~10.8 hours, and blocking the Nasdaq calendar
+    the ~16,000-ticker universe (ETFs included) is ~18 hours, and blocking the Nasdaq calendar
     step behind that would stall the morning chain every day. This runs on its
     own staleness cadence or on demand.
     """
