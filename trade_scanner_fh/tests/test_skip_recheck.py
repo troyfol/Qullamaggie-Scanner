@@ -36,6 +36,13 @@ def mw(_qapp, tmp_path, monkeypatch):
     w._finnhub_blacklist = set()
     w._finviz_blacklist = set()
     w._zacks_blacklist = set()
+    # v7.0.0: the finviz ATTRIBUTE skip list is a fourth recheckable source.
+    # The shell has to declare it or `_stale_skip_candidates` raises when it
+    # walks `_RECHECKABLE_SKIP_LISTS` — on a bypass-init MainWindow, Qt turns
+    # a missing attribute into RuntimeError rather than AttributeError.
+    w._FINVIZ_SNAPSHOT_BLACKLIST_FILE = (
+        tmp_path / "finviz_snapshot_blacklist.txt")
+    w._finviz_snapshot_blacklist = set()
     return w
 
 

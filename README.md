@@ -3309,6 +3309,81 @@ directories, and the previous `_internal/`.
 
 ## Changelog
 
+### v7.0.0 - Price z-score, realized volatility, and the finviz attribute layer (2026-09-20)
+
+**Price standard deviations from the mean.** How many sample standard
+deviations the scan-end close sits from the mean close of a 5Y / 1Y / 6M
+window, or of the scan period itself. The three calendar windows measure
+backward from the scan END date, not from today, so a backdated scan sees only
+what its own end date could have seen. Sample stdev (ddof=1) and a 20-bar
+floor - below that the statistic is noise dressed up as a number, and it
+reports N/A instead.
+
+The store holds `OHLCV_HISTORY_YEARS` (5) of bars, so a 5Y comparison is at
+the boundary even for a scan ending today and a backdated one has
+proportionally less room. When the cache cannot reach back far enough the mean
+is computed over the history that exists and the period reports a NOTE saying
+how many tickers were affected - a new `ScanResult.notes` channel, rendered
+per period.
+
+**Realized volatility.** Historical (close-to-close) Volatility, Yang-Zhang,
+ATR%, HV Rank and HV Percentile, all annualized at 252 days and in percent so
+they read directly against an implied-vol quote. Yang-Zhang was chosen over
+Parkinson and Garman-Klass because it is the only common estimator that
+handles OVERNIGHT GAPS, and gappy momentum names are what this scanner exists
+to surface. HV Rank and HV Percentile are the computable analogues of IV Rank
+and IV Percentile; they disagree exactly when one spike dominates the range,
+which is worth seeing.
+
+`max_trailing_bars()` now accounts for these, but only when the indicator will
+actually run. The classic lookbacks top out near 200 bars and are counted
+unconditionally; HV Rank reaches 272 and a 5Y z-score reaches 1,260, and
+applying those to every scan would have quarantined five years of split seams
+for users who never enabled a volatility filter.
+
+**Finviz attribute layer.** All 93 fields of the quote page's snapshot grid -
+valuation, ownership, margins, performance, technicals - parsed, stored and
+filterable. Beta, weekly and monthly Volatility, Optionable and Shortable sit
+under a new **Options** header alongside a per-period **Beta (calc)** computed
+against SPY; the rest live under **Finviz Additional** in eight collapsible
+sub-sections, all closed by default.
+
+Two producers feed one store. The first is FREE: the `&ty=ea` page the
+earnings fill already downloads embeds the same grid, so every earnings
+request now yields a full attribute set at zero extra cost. The second is a
+paced universe sweep against the plain quote page, which at ~271 KB is 8.3x
+lighter than the 2.25 MB earnings page. The sweep is deliberately NOT chained
+into the market-open auto-update: at 4.0s pacing a ~9,750-ticker universe is
+~10.8 hours, and blocking the Nasdaq calendar step behind that would stall the
+morning chain every day. It runs weekly-by-staleness or on demand.
+
+The cadence is a PROMPT, never an automatic start. `_startup` schedules a
+deferred due-check that fires ten seconds after launch - after the OHLCV /
+Nasdaq / earnings chain is already under way, so it can never delay them. If
+the last run is `FINVIZ_SNAPSHOT_STALE_DAYS` (7) or more ago AND tickers are
+actually stale, it offers the sweep with the stale count and the estimated
+hours; declining leaves the offer for next launch. Due by the clock with
+nothing stale just re-stamps, because the free earnings scavenge kept up.
+The stamp is written when a sweep STARTS, not when it finishes: a run the
+user stops still spent its requests.
+
+Three properties of the live page drove the parser, each verified against real
+responses rather than assumed: `EPS next Y` appears TWICE with different
+meanings, so parsing is positional; seven cells pack two values; and an ETF
+returns a shorter grid (SPY 144 cells vs AAPL 168). The label is literally
+`Change %`, not `Change`.
+
+A ticker is auto-skip-listed ONLY on finviz's definitive 404 plus
+`Ticker "X" not found`, or when the OHLCV blacklist already excludes it. A
+429, a 403 or a challenge page means we were BLOCKED, which says nothing about
+coverage. The finviz page wraps the symbol in markup, so the check strips tags
+first - matching raw HTML found nothing and would have retried every uncovered
+ticker forever. The list is separate from the finviz EARNINGS skip list (an
+ETF has no earnings tab but does have Beta) and appears as its own source in
+Re-check Stale Skips.
+
+2,059 tests pass.
+
 ### v6.4.0 — Period Avg / Max on every series filter, and hide-by-column-type (2026-09-20)
 
 **Every multi-quarter earnings filter now reports the average and the maximum

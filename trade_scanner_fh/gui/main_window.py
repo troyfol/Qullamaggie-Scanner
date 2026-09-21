@@ -61,9 +61,9 @@ from .widgets import (
     ResultsTable, restore_rows_at_positions,
 )
 from .workers import (
-    BridgeWorker, EarningsFillWorker, PrefetchWorker, ScanWorker,
-    SectorFillWorker, UniverseRefreshWorker, UniverseWorker, UpdateWorker,
-    ZacksFillWorker,
+    BridgeWorker, EarningsFillWorker, FinvizSnapshotSweepWorker,
+    PrefetchWorker, ScanWorker, SectorFillWorker, UniverseRefreshWorker,
+    UniverseWorker, UpdateWorker, ZacksFillWorker,
 )
 
 log = logging.getLogger("scanner.gui")
@@ -530,6 +530,9 @@ class MainWindow(QMainWindow):
         self._zacks_blacklist: set[str] = set()
         self._finnhub_blacklist: set[str] = set()
         self._finviz_blacklist: set[str] = set()
+        self._finviz_snapshot_blacklist: set[str] = set()
+        # Handle for the paced finviz attribute sweep (v7.0.0).
+        self._fv_sweep_worker = None
         # Counter populated by `_on_zacks_failures` so `_on_zacks_done`
         # can report "added X new to skip list" cleanly. Reset every run.
         self._auto_added_zacks_skips: int = 0
@@ -547,6 +550,7 @@ class MainWindow(QMainWindow):
         self._load_zacks_blacklist()
         self._load_finnhub_blacklist()
         self._load_finviz_blacklist()
+        self._load_finviz_snapshot_blacklist()
 
         # Ticker greylist — scan-only filter that does NOT exclude tickers
         # from OHLCV / sector / earnings updates.
@@ -967,6 +971,35 @@ class MainWindow(QMainWindow):
         )
         act_recheck_skips.triggered.connect(self._recheck_stale_skips)
         data_menu.addAction(act_recheck_skips)
+
+        # -- Finviz Attributes (v7.0.0) --------------------------------
+        data_menu.addSeparator()
+
+        act_fv_sweep = QAction("Refresh Finviz Attributes...", self)
+        act_fv_sweep.setToolTip(
+            "Sweep the universe for finviz snapshot attributes (Beta, "
+            "Volatility, valuation, ownership, margins, performance). Paced "
+            "slowly and NOT part of the market-open auto-update - a full "
+            "universe run takes hours. Shows how long it has been since the "
+            "last refresh before starting."
+        )
+        act_fv_sweep.triggered.connect(self._refresh_finviz_attributes)
+        data_menu.addAction(act_fv_sweep)
+
+        act_fv_stop = QAction("Stop Finviz Attribute Refresh", self)
+        act_fv_stop.setToolTip(
+            "Cancel a running sweep. Everything already fetched is kept."
+        )
+        act_fv_stop.triggered.connect(self._stop_finviz_attributes)
+        data_menu.addAction(act_fv_stop)
+
+        act_fv_status = QAction("Finviz Attribute Coverage...", self)
+        act_fv_status.setToolTip(
+            "How many universe tickers carry attributes, how fresh they are, "
+            "and how many are skip-listed. Fetches nothing."
+        )
+        act_fv_status.triggered.connect(self._finviz_attribute_status)
+        data_menu.addAction(act_fv_status)
 
         act_prune_orphans = QAction("Prune Orphaned Data...", self)
         act_prune_orphans.setToolTip(
@@ -1722,6 +1755,21 @@ class MainWindow(QMainWindow):
 
     def _startup(self):
         """Load universe and kick off OHLCV update. Handles first-run."""
+        # Offer an overdue finviz attribute sweep, deferred so it lands AFTER
+        # this method has started the OHLCV / Nasdaq / earnings chain and the
+        # event loop is running. Scheduled here — before the first-run and
+        # cache-current branches below — so both launch paths get exactly one
+        # offer. 10s of slack keeps the question off the screen while the
+        # window is still painting.
+        #
+        # This is the only automatic trigger the sweep has. It never starts a
+        # run by itself: ~10.8 hours of requests beginning unannounced would
+        # be hostile, so the user answers a dialog.
+        try:
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(10_000, self._maybe_prompt_finviz_sweep)
+        except Exception as exc:
+            log.debug("Could not schedule the finviz sweep due-check: %s", exc)
         # Audit 2026-08-12 (SEC-2): main() logs the rejected data-dir override
         # before any handler exists, so repeat it in the panel — a user who set
         # the variable deliberately must see that it did not take effect, not
@@ -3466,6 +3514,325 @@ class MainWindow(QMainWindow):
             self._finviz_blacklist, "finviz",
         )
 
+    # ── Finviz SNAPSHOT skip list (v7.0.0) ──────────────────────────────
+    # Separate file from the earnings skip list above. That one records
+    # "finviz has no earningsData for this ticker", which is true of every
+    # ETF and says nothing about the snapshot grid — an ETF has no earnings
+    # tab but does carry Beta, Volatility and performance figures.
+
+    _FINVIZ_SNAPSHOT_BLACKLIST_FILE = config.FINVIZ_SNAPSHOT_BLACKLIST_FILE
+
+    def _load_finviz_snapshot_blacklist(self):
+        self._finviz_snapshot_blacklist = BlacklistManager(
+            self._FINVIZ_SNAPSHOT_BLACKLIST_FILE,
+            label="finviz snapshot skip list",
+        ).load()
+
+    def _save_finviz_snapshot_blacklist(self):
+        self._save_skip_list_with_reasons(
+            self._FINVIZ_SNAPSHOT_BLACKLIST_FILE, "finviz snapshot skip list",
+            self._finviz_snapshot_blacklist, "finviz_snapshot",
+        )
+
+    def _combined_finviz_snapshot_skip_set(self) -> set:
+        """Snapshot skip list UNION the universe OHLCV blacklist.
+
+        The union is the user's explicit rule: anything OHLCV has given up on
+        is not worth spending a finviz request on either. Everything else is
+        fair game, including ETFs.
+        """
+        out = set(getattr(self, "_finviz_snapshot_blacklist", set()) or set())
+        out |= set(getattr(self, "_blacklist", set()) or set())
+        return {t.upper() for t in out if t}
+
+    # -- Finviz attribute sweep handlers (v7.0.0) ------------------------
+
+    _FINVIZ_SWEEP_LAST_RUN_KEY = "last_finviz_sweep_iso"
+
+    def _is_finviz_sweep_due(self) -> bool:
+        """True iff the last sweep is older than FINVIZ_SNAPSHOT_STALE_DAYS.
+
+        Mirrors `_is_nasdaq_refresh_due`, including the calendar-day rather
+        than rolling-24h comparison: stamping on COMPLETION and then testing a
+        rolling gap would skip a same-time-next-week launch at 6d 23h 58m.
+
+        Note this is the *cadence* question ("should we offer a sweep?"),
+        which is separate from `finviz_snapshot.stale_symbols` ("which tickers
+        are out of date?"). Both read the same constant, but a sweep can be
+        due with nothing stale, and tickers can be stale between sweeps
+        because the free earnings scavenge refreshes only what it touches.
+        """
+        try:
+            last_iso = self._qsettings().value(self._FINVIZ_SWEEP_LAST_RUN_KEY)
+        except Exception as exc:
+            log.debug("Could not read %s: %s",
+                      self._FINVIZ_SWEEP_LAST_RUN_KEY, exc)
+            return False   # never nag on an unreadable setting
+        if not last_iso:
+            return True
+        try:
+            last = datetime.fromisoformat(str(last_iso))
+        except ValueError:
+            log.debug("Bad %s value: %r", self._FINVIZ_SWEEP_LAST_RUN_KEY,
+                      last_iso)
+            return True
+        days = (datetime.now().date() - last.date()).days
+        return days >= config.FINVIZ_SNAPSHOT_STALE_DAYS
+
+    def _stamp_finviz_sweep_now(self) -> None:
+        """Record a sweep run. Stamped when a sweep is STARTED, not when it
+        finishes: a run that is stopped or aborted still spent hours of
+        requests, and re-offering it at the next launch would be nagging.
+        """
+        try:
+            self._qsettings().setValue(
+                self._FINVIZ_SWEEP_LAST_RUN_KEY,
+                datetime.now().isoformat(timespec="seconds"))
+        except Exception as exc:
+            log.debug("Could not stamp the finviz sweep run: %s", exc)
+
+    def _maybe_prompt_finviz_sweep(self) -> None:
+        """Offer an overdue sweep at launch. Never starts one on its own.
+
+        Deliberately a PROMPT: the sweep is ~10.8 hours of requests, and
+        beginning that unannounced while the user is trying to scan would be
+        hostile. Also deliberately fired AFTER the OHLCV / Nasdaq / earnings
+        chain is already under way, so the question can never delay them.
+
+        Declining just leaves the stamp alone; the offer returns next launch.
+        """
+        try:
+            if not self._is_finviz_sweep_due():
+                return
+            worker = getattr(self, "_fv_sweep_worker", None)
+            if worker is not None and worker.isRunning():
+                return
+            from .. import finviz_snapshot as fvs
+            last = fvs.last_updated()
+            universe = self._finviz_universe_symbols()
+            if not universe:
+                return
+            skip = self._combined_finviz_snapshot_skip_set()
+            stale = fvs.stale_symbols(universe, skip=skip)
+            if not stale:
+                # Due by the clock but nothing actually needs fetching - the
+                # earnings scavenge kept up. Stamp it so we stop asking.
+                self._stamp_finviz_sweep_now()
+                return
+            hours = (len(stale) * config.FINVIZ_SNAPSHOT_MIN_INTERVAL_SEC) / 3600.0
+            answer = QMessageBox.question(
+                self, "Finviz Attributes Are Overdue",
+                "<b>Last attribute refresh:</b> %s<br><br>"
+                "%s tickers are stale or have never been fetched - roughly "
+                "<b>%.1f hours</b> of requests at %gs pacing.<br><br>"
+                "This runs in the background, does not block scanning, and "
+                "can be stopped at any time; everything already fetched is "
+                "kept.<br><br>"
+                "Run it now?"
+                % (self._describe_age(last), format(len(stale), ","), hours,
+                   config.FINVIZ_SNAPSHOT_MIN_INTERVAL_SEC),
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._start_finviz_sweep(stale, skip)
+            else:
+                self.status.showMessage(
+                    "Finviz attributes are overdue - run "
+                    "Data > Refresh Finviz Attributes when convenient.")
+        except Exception as exc:
+            # A launch-time nicety must never be able to stop the app opening.
+            log.warning("Finviz sweep due-check skipped: %s", exc)
+
+    def _start_finviz_sweep(self, symbols, skip) -> None:
+        """Launch the sweep worker. Shared by the menu action and the
+        overdue prompt so both stamp the run and wire the same signals."""
+        worker = FinvizSnapshotSweepWorker(symbols, skip=skip, parent=self)
+        worker.progress.connect(self._on_fv_sweep_progress)
+        worker.finished_sweep.connect(self._on_fv_sweep_done)
+        worker.not_found.connect(self._on_fv_sweep_not_found)
+        self._fv_sweep_worker = worker
+        self._stamp_finviz_sweep_now()
+        worker.start()
+        self.status.showMessage(
+            "Finviz attribute refresh started: %s tickers."
+            % format(len(symbols), ","))
+
+
+    @staticmethod
+    def _describe_age(ts) -> str:
+        """Human phrasing for how long ago `ts` was, or 'never'."""
+        if ts is None:
+            return "never"
+        try:
+            delta = pd.Timestamp.now(tz="UTC") - pd.Timestamp(ts)
+        except Exception:
+            return "unknown"
+        days = delta.days
+        if days >= 2:
+            return "%d days ago" % days
+        hours = int(delta.total_seconds() // 3600)
+        if hours >= 2:
+            return "%d hours ago" % hours
+        return "less than an hour ago"
+
+    def _finviz_universe_symbols(self) -> list:
+        """Universe symbols for the sweep, ETFs INCLUDED.
+
+        Unlike the earnings fill, ETFs are not pre-skipped: they have no
+        earnings tab but they do carry Beta, Volatility and performance,
+        which are exactly the fields the Options header screens on.
+        """
+        try:
+            df = data_engine.load_universe()
+            if df is None or df.empty or "symbol" not in df.columns:
+                return []
+            return [str(x).upper().strip() for x in df["symbol"]
+                    if str(x).strip()]
+        except Exception as exc:
+            log.warning("Could not load the universe for the finviz "
+                        "sweep: %s", exc)
+            return []
+
+    def _refresh_finviz_attributes(self):
+        """Menu: start the paced attribute sweep, after confirming."""
+        from .. import finviz_snapshot as fvs
+
+        worker = getattr(self, "_fv_sweep_worker", None)
+        if worker is not None and worker.isRunning():
+            QMessageBox.information(
+                self, "Finviz Attributes",
+                "A refresh is already running. Use Stop Finviz Attribute "
+                "Refresh to cancel it.")
+            return
+
+        universe = self._finviz_universe_symbols()
+        if not universe:
+            QMessageBox.warning(
+                self, "Finviz Attributes",
+                "No universe loaded - refresh the universe first.")
+            return
+
+        skip = self._combined_finviz_snapshot_skip_set()
+        stale = fvs.stale_symbols(universe, skip=skip)
+        last = fvs.last_updated()
+        pace = config.FINVIZ_SNAPSHOT_MIN_INTERVAL_SEC
+        hours = (len(stale) * pace) / 3600.0
+
+        if not stale:
+            QMessageBox.information(
+                self, "Finviz Attributes",
+                "Everything is current - last refresh %s."
+                % self._describe_age(last))
+            return
+
+        msg = (
+            "<b>Last attribute refresh:</b> %s<br><br>"
+            "Universe: %s tickers<br>"
+            "Skip-listed: %s (finviz-not-found + OHLCV blacklist)<br>"
+            "Stale or never fetched: <b>%s</b><br><br>"
+            "At %gs pacing this is roughly <b>%.1f hours</b> of requests."
+            "<br><br>"
+            "This does not block scanning and can be stopped at any time; "
+            "everything already fetched is kept.<br><br>"
+            "Start the refresh?"
+            % (self._describe_age(last), format(len(universe), ","),
+               format(len(skip), ","), format(len(stale), ","), pace, hours)
+        )
+        if QMessageBox.question(
+            self, "Refresh Finviz Attributes", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        self._start_finviz_sweep(stale, skip)
+
+    def _stop_finviz_attributes(self):
+        worker = getattr(self, "_fv_sweep_worker", None)
+        if worker is None or not worker.isRunning():
+            QMessageBox.information(
+                self, "Finviz Attributes", "No refresh is running.")
+            return
+        worker.stop()
+        self.status.showMessage(
+            "Finviz attribute refresh: stop requested - finishing the "
+            "current ticker and saving.")
+
+    @pyqtSlot(int, int, dict)
+    def _on_fv_sweep_progress(self, done: int, total: int, summary: dict):
+        self.status.showMessage(
+            "Finviz attributes: %s/%s - %s fetched, %s not covered, "
+            "%s blocked" % (
+                format(done, ","), format(total, ","),
+                format(summary.get("ok", 0), ","),
+                format(summary.get("not_found", 0), ","),
+                format(summary.get("blocked", 0), ","))
+        )
+
+    @pyqtSlot(str)
+    def _on_fv_sweep_not_found(self, symbol: str):
+        """Definitive 404 only - never a block. See finviz_snapshot_fill."""
+        sym = (symbol or "").upper().strip()
+        if not sym or sym in self._finviz_snapshot_blacklist:
+            return
+        self._finviz_snapshot_blacklist.add(sym)
+        try:
+            self._pending_skip_reasons.setdefault(
+                "finviz_snapshot", {})[sym] = "not_found"
+        except AttributeError:
+            pass
+
+    @pyqtSlot(dict)
+    def _on_fv_sweep_done(self, summary: dict):
+        try:
+            self._save_finviz_snapshot_blacklist()
+        except Exception as exc:
+            log.warning("Could not save the finviz snapshot skip list: %s",
+                        exc)
+        if summary.get("error"):
+            self.status.showMessage(
+                "Finviz attribute refresh failed: %s" % summary["error"])
+            return
+        tail = ""
+        if summary.get("aborted"):
+            tail = " (aborted - finviz throttling)"
+        elif summary.get("stopped"):
+            tail = " (stopped)"
+        self.status.showMessage(
+            "Finviz attributes done%s: %s saved, %s not covered, %s blocked."
+            % (tail, format(summary.get("written", 0), ","),
+               format(summary.get("not_found", 0), ","),
+               format(summary.get("blocked", 0), ","))
+        )
+
+    def _finviz_attribute_status(self):
+        """Menu: coverage report. Fetches nothing."""
+        from .. import finviz_snapshot as fvs
+        universe = set(self._finviz_universe_symbols())
+        store = fvs.load_store()
+        skip = self._combined_finviz_snapshot_skip_set()
+        covered = set()
+        if not store.empty:
+            covered = set(store[fvs.SYMBOL_COL].astype(str).str.upper())
+        stale = fvs.stale_symbols(sorted(universe), skip=skip)
+        QMessageBox.information(
+            self, "Finviz Attribute Coverage",
+            "<b>Last refresh:</b> %s<br><br>"
+            "Universe: %s<br>"
+            "With attributes: %s<br>"
+            "Stale or missing: %s<br>"
+            "Skip-listed: %s<br>"
+            "Rows in store: %s<br>"
+            "Buffered, not yet written: %s"
+            % (self._describe_age(fvs.last_updated()),
+               format(len(universe), ","),
+               format(len(covered & universe), ","),
+               format(len(stale), ","), format(len(skip), ","),
+               format(len(store), ","), format(fvs.pending_count(), ","))
+        )
+
     def _combined_finviz_skip_set(self) -> set[str]:
         """Combined skip set for finviz bulk / gap fills:
 
@@ -3574,6 +3941,12 @@ class MainWindow(QMainWindow):
          "_finnhub_blacklist", "_save_finnhub_blacklist"),
         ("zacks", "Zacks", "_ZACKS_BLACKLIST_FILE",
          "_zacks_blacklist", "_save_zacks_blacklist"),
+        # v7.0.0. Listed here so Re-check Stale Skips offers it as its own
+        # source rather than lumping it in with finviz earnings — the two
+        # lists mean different things and are re-checked at different costs.
+        ("finviz_snapshot", "Finviz Attributes",
+         "_FINVIZ_SNAPSHOT_BLACKLIST_FILE",
+         "_finviz_snapshot_blacklist", "_save_finviz_snapshot_blacklist"),
     )
 
     def _skip_entries_by_source(self) -> tuple[dict, dict]:

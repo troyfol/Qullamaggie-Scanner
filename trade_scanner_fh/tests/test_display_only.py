@@ -226,10 +226,33 @@ def test_display_only_checkbox_added_to_filter_rows(panel):
         "consec_eps_growth", "consec_rev_growth",
         "accel_eps_surp", "accel_rev_surp",
         "accel_eps_yoy", "accel_rev_yoy",
+        # Realized volatility + price dispersion (v7.0.0).
+        "hv", "yz", "atr_pct", "hv_rank", "hv_pct", "price_zscore",
+        # Options header (v7.0.0). The scraped finviz characteristics are
+        # `fv_*` rows and are checked separately below, because they are
+        # GENERATED from finviz_snapshot's field list rather than written out
+        # here - a hand-kept inventory of 82 generated rows would rot.
+        "beta_calc",
     }
     actual_supported = {
         k for k, row in panel.rows.items() if row.display_only is not None
     }
+    # Generated finviz rows: assert they match their generator EXACTLY, which
+    # is a stronger guard than a hand list - it catches a field added to
+    # finviz_snapshot that never reached the panel, and vice versa.
+    from trade_scanner_fh import finviz_snapshot as _fvs
+    expected_fv = {
+        f"fv_{k}" for k in
+        [n for n, _l in _fvs.OPTIONS_FIELDS]
+        + [n for _g, items in _fvs.FINVIZ_GROUPS for n, _l in items]
+    }
+    actual_fv = {k for k in actual_supported if k.startswith("fv_")}
+    assert actual_fv == expected_fv, (
+        f"finviz panel rows drifted from finviz_snapshot's field list - "
+        f"missing: {sorted(expected_fv - actual_fv)}; "
+        f"unexpected: {sorted(actual_fv - expected_fv)}"
+    )
+    actual_supported = actual_supported - actual_fv
     missing_checkbox = expected_supported - actual_supported
     unlisted_rows = actual_supported - expected_supported
     assert actual_supported == expected_supported, (

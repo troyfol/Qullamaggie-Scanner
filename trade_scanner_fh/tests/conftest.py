@@ -63,6 +63,14 @@ def _redirect_data_dir_derived_paths(config, tmp_path, monkeypatch) -> None:
                         tmp_path / "finviz_blacklist.txt")
     monkeypatch.setattr(config, "FINNHUB_BLACKLIST_FILE",
                         tmp_path / "finnhub_blacklist.txt")
+    # v7.0.0 finviz snapshot store. Separate from the earnings-side finviz
+    # paths above: different page, different store, different skip list.
+    monkeypatch.setattr(config, "FINVIZ_SNAPSHOT_PARQUET",
+                        tmp_path / "finviz_snapshot.parquet")
+    monkeypatch.setattr(config, "FINVIZ_SNAPSHOT_BLACKLIST_FILE",
+                        tmp_path / "finviz_snapshot_blacklist.txt")
+    monkeypatch.setattr(config, "FINVIZ_SNAPSHOT_BULK_CHECKPOINT",
+                        tmp_path / ".finviz_snapshot_checkpoint.json")
     monkeypatch.setattr(config, "TICKER_CSV", tmp_path / "universe.csv")
     monkeypatch.setattr(config, "FAILED_TICKERS_LOG",
                         tmp_path / "failed_tickers.log")

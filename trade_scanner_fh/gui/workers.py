@@ -1730,3 +1730,45 @@ class FirefoxCookieWaitWorker(QThread):
             f"{when}."
         )
         self.finished.emit(True, n, is_new, self._pre_sig)
+
+
+class FinvizSnapshotSweepWorker(QThread):
+    """Background paced sweep of the finviz attribute grid (v7.0.0).
+
+    Deliberately NOT chained into the market-open auto-update: at 4.0s pacing
+    a ~9,750-ticker universe is ~10.8 hours, and blocking the Nasdaq calendar
+    step behind that would stall the morning chain every day. This runs on its
+    own staleness cadence or on demand.
+    """
+
+    progress = pyqtSignal(int, int, dict)     # done, total, running summary
+    finished_sweep = pyqtSignal(dict)         # final summary
+    not_found = pyqtSignal(str)               # ticker finviz definitively lacks
+
+    def __init__(self, symbols, skip=None, parent=None):
+        super().__init__(parent)
+        self._symbols = list(symbols or [])
+        self._skip = set(skip or set())
+        self._stop = False
+
+    def stop(self):
+        """Cooperative cancel. The sweep flushes what it already fetched."""
+        self._stop = True
+
+    def run(self):
+        summary = {}
+        try:
+            from .. import finviz_snapshot_fill as ff
+            summary = ff.run_sweep(
+                self._symbols,
+                skip=self._skip,
+                on_not_found=self.not_found.emit,
+                progress=lambda d, t, s: self.progress.emit(d, t, s),
+                should_stop=lambda: self._stop,
+            )
+        except Exception as exc:
+            # An uncaught exception in QThread.run() can abort the process
+            # under PyInstaller windowed mode, so it is reported as a result.
+            log.exception("finviz snapshot sweep failed")
+            summary = {"error": str(exc)}
+        self.finished_sweep.emit(summary)

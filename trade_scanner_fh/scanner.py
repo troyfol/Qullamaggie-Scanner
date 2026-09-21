@@ -269,6 +269,107 @@ class ScanParams:
     atr_long: int = 50
     atr_max_ratio: float = 0.75
 
+    # --- Realized volatility (v7.0.0) -----------------------------------
+    # Annualized and in percent, so they read directly against an options
+    # implied-vol quote. Every min/max default is deliberately wide enough to
+    # be inert: enabling a row without touching its bounds must not silently
+    # drop anything.
+
+    # Historical (close-to-close) Volatility
+    hv_enabled: bool = False
+    hv_display_only: bool = False
+    hv_lookback: int = 20
+    hv_min: float = 0.0
+    hv_max: float = 999.0
+
+    # Yang-Zhang Volatility — the gap-aware estimator
+    yz_enabled: bool = False
+    yz_display_only: bool = False
+    yz_lookback: int = 20
+    yz_min: float = 0.0
+    yz_max: float = 999.0
+
+    # ATR as a percentage of price
+    atr_pct_enabled: bool = False
+    atr_pct_display_only: bool = False
+    atr_pct_period: int = 14
+    atr_pct_min: float = 0.0
+    atr_pct_max: float = 999.0
+
+    # HV Rank — current HV min-max scaled against its own trailing window
+    hv_rank_enabled: bool = False
+    hv_rank_display_only: bool = False
+    hv_rank_lookback: int = 20
+    hv_rank_window: int = 252
+    hv_rank_min: float = 0.0
+    hv_rank_max: float = 100.0
+
+    # HV Percentile — share of the trailing window spent below current HV
+    hv_pct_enabled: bool = False
+    hv_pct_display_only: bool = False
+    hv_pct_lookback: int = 20
+    hv_pct_window: int = 252
+    hv_pct_min: float = 0.0
+    hv_pct_max: float = 100.0
+
+    # --- Price z-score (v7.0.0) -----------------------------------------
+    # Standard deviations of the scan-end close from the mean close of the
+    # comparison period. `price_zscore_period` is one of
+    # `indicators.PRICE_ZSCORE_PERIOD_KEYS`; 5y/1y/6m look backward from the
+    # scan END date, "p" uses the scan period itself.
+    price_zscore_enabled: bool = False
+    price_zscore_display_only: bool = False
+    price_zscore_period: str = "1y"
+    price_zscore_min: float = -99.0
+    price_zscore_max: float = 99.0
+
+    # --- Beta vs benchmark, computed per period (v7.0.0) ----------------
+    # Sits beside the scraped `finviz_beta` under the Options header. Finviz
+    # publishes one static number with no period attached; this one moves with
+    # the scan window like every other filter here. Both are shown, labelled.
+    beta_calc_enabled: bool = False
+    beta_calc_display_only: bool = False
+    beta_calc_lookback: int = 252
+    beta_calc_min: float = -99.0
+    beta_calc_max: float = 99.0
+
+    # --- Finviz snapshot attributes (v7.0.0) ----------------------------
+    # 80 range filters held in ONE dict rather than 320 flat dataclass
+    # fields. The flat convention the rest of this class follows does not
+    # scale here: it would add ~700 lines of boilerplate, make every
+    # ScanParams repr unreadable during debugging, and force a dataclass edit
+    # every time finviz adds a row. The dict serialises straight into a preset
+    # and `finviz_filter()` below gives callers the same shape the flat
+    # `getattr(params, f"{prefix}_min")` pattern reads like.
+    #
+    # Shape: {field_name: {"enabled": bool, "display_only": bool,
+    #                      "min": float, "max": float}}
+    # An absent key means the filter was never touched, which is inert.
+    finviz_filters: dict = field(default_factory=dict)
+
+    def finviz_filter(self, field_name: str) -> dict:
+        """One finviz filter's settings, with inert defaults when unset."""
+        spec = (self.finviz_filters or {}).get(field_name) or {}
+        return {
+            "enabled": bool(spec.get("enabled", False)),
+            "display_only": bool(spec.get("display_only", False)),
+            "min": spec.get("min"),
+            "max": spec.get("max"),
+        }
+
+    def active_finviz_filters(self) -> list:
+        """`[(field_name, settings)]` for filters that should gate rows.
+
+        Display-only is excluded here by design — like every other filter in
+        this class, display-only computes and colours but never removes a row.
+        """
+        out = []
+        for name in (self.finviz_filters or {}):
+            spec = self.finviz_filter(name)
+            if spec["enabled"] and not spec["display_only"]:
+                out.append((name, spec))
+        return out
+
     # --- Volume / Liquidity ---
     # #11  Volume dry-up ratio
     vol_dryup_enabled: bool = False
@@ -620,6 +721,40 @@ class ScanParams:
         indicators, and a filter toggled on between the artifact rebuild and
         the scan must not be able to widen the reach behind the check's back.
         """
+        # The price z-score reaches MUCH further back than any classic
+        # indicator lookback — up to five years — and HV Rank / Percentile
+        # need their rolling window plus the HV lookback on top. Both are
+        # listed here for the reason the docstring gives: a split seam four
+        # years before the scan start would silently poison a 5Y mean, and
+        # the quarantine is what catches that.
+        #
+        # Calendar periods are converted at 252 trading days per year, which
+        # slightly OVER-states the bar count. Over-stating is the safe
+        # direction: it widens the quarantine's reach rather than narrowing it.
+        #
+        # ASYMMETRY, deliberate: the classic lookbacks above are counted
+        # unconditionally, but these v7.0.0 ones are counted only when the
+        # indicator will actually run. The unconditional rule is affordable
+        # for lookbacks that top out around 200 bars; it is not affordable
+        # here. HV Rank alone reaches window + lookback (272 by default) and a
+        # 5Y z-score reaches 1,260 — applying those to EVERY scan would
+        # quarantine five years of split seams for users who never enabled a
+        # volatility filter, silently shrinking their result sets.
+        #
+        # Gating on `enabled or display_only` is not a hole: that is the exact
+        # condition `_compute_ticker` uses to decide whether to read the data,
+        # and `seam_relevance_cutoff` evaluates this against the same params
+        # object the scan runs with, so there is no window in which a toggle
+        # can widen the reach behind the check's back.
+        def _if_live(prefix: str, bars: int) -> int:
+            live = (getattr(self, f"{prefix}_enabled", False)
+                    or getattr(self, f"{prefix}_display_only", False))
+            return bars if live else 0
+
+        zscore_bars = _if_live("price_zscore", {
+            "5y": 5 * 252, "1y": 252, "6m": 126,
+        }.get(self.price_zscore_period, 0))
+
         return max(
             self.sma1_period, self.sma2_period,
             self.sti_short_lb, self.sti_long_lb,
@@ -630,6 +765,12 @@ class ScanParams:
             self.rvol_lookback + 1,
             self.rs_market_lookback, self.rs_nasdaq_lookback,
             self.rs_sector_lookback,
+            _if_live("hv", self.hv_lookback + 1),
+            _if_live("yz", self.yz_lookback + 1),
+            _if_live("atr_pct", self.atr_pct_period),
+            _if_live("hv_rank", self.hv_rank_window + self.hv_rank_lookback),
+            _if_live("hv_pct", self.hv_pct_window + self.hv_pct_lookback),
+            zscore_bars,
             1,
         )
 
@@ -652,6 +793,13 @@ class ScanResult:
     funnel: list[FunnelStage] = field(default_factory=list)
     errors: list[dict] = field(default_factory=list)
     elapsed_sec: float = 0.0
+    # Period-level advisories: things the user should know about HOW this
+    # period was computed, as opposed to an error (which belongs in `errors`)
+    # or a row count (which belongs in the funnel). The first of these is the
+    # price z-score reporting that the cache could not reach as far back as
+    # the chosen comparison period. Rendered under the funnel in the log
+    # panel, once per period.
+    notes: list[str] = field(default_factory=list)
 
     def funnel_summary(self) -> str:
         parts = []
@@ -872,6 +1020,47 @@ def _compute_ticker(
         row["bbw"] = indicators.bollinger_band_width(
             full_to_end, period=params.bbw_period, num_std=params.bbw_num_std
         )
+
+    # --- Realized volatility (v7.0.0) ---
+    if params.hv_enabled or params.hv_display_only:
+        row["hv"] = indicators.historical_volatility(
+            full_to_end, lookback=params.hv_lookback)
+
+    if params.yz_enabled or params.yz_display_only:
+        row["yz_vol"] = indicators.yang_zhang_volatility(
+            full_to_end, lookback=params.yz_lookback)
+
+    if params.atr_pct_enabled or params.atr_pct_display_only:
+        row["atr_pct"] = indicators.atr_pct(
+            full_to_end, period=params.atr_pct_period)
+
+    if params.hv_rank_enabled or params.hv_rank_display_only:
+        row["hv_rank"] = indicators.hv_rank(
+            full_to_end, lookback=params.hv_rank_lookback,
+            window=params.hv_rank_window)
+
+    if params.hv_pct_enabled or params.hv_pct_display_only:
+        row["hv_pct"] = indicators.hv_percentile(
+            full_to_end, lookback=params.hv_pct_lookback,
+            window=params.hv_pct_window)
+
+    if (params.beta_calc_enabled or params.beta_calc_display_only) \
+            and benchmark_data and "SPY" in benchmark_data:
+        row["beta_calc"] = indicators.beta_vs_benchmark(
+            full_to_end, benchmark_data["SPY"],
+            lookback=params.beta_calc_lookback)
+
+    # --- Price z-score (v7.0.0) ---
+    # The truncation flag rides on the row under an underscore key so the
+    # scan can aggregate it into ONE period note rather than logging per
+    # ticker. `_compute_ticker` has no access to the ScanResult, and a
+    # per-ticker warning across thousands of names would be unreadable.
+    if params.price_zscore_enabled or params.price_zscore_display_only:
+        zres = indicators.price_zscore(
+            full_to_end, window, period_key=params.price_zscore_period)
+        row["price_zscore"] = zres.z
+        row["_price_zscore_truncated"] = bool(zres.truncated)
+        row["_price_zscore_bars"] = int(zres.bars_used)
 
     if params.atr_ratio_enabled or params.atr_ratio_display_only:
         row["atr_ratio"] = indicators.atr_ratio(
@@ -1570,6 +1759,17 @@ def _compute_display_only_fails(
         except (TypeError, ValueError):
             pass
 
+    # Range filters (v7.0.0): red on EITHER side of the band, so a
+    # display-only volatility row marks the names its bounds would have cut
+    # regardless of which end they fell off.
+    for _pfx, _col in (
+        ("hv", "hv"), ("yz", "yz_vol"), ("atr_pct", "atr_pct"),
+        ("hv_rank", "hv_rank"), ("hv_pct", "hv_pct"),
+        ("price_zscore", "price_zscore"),
+    ):
+        _flag_min(_pfx, _col, f"{_pfx}_min")
+        _flag_max(_pfx, _col, f"{_pfx}_max")
+
     # Min-threshold filters (col >= threshold).
     _flag_min("avg_vol", "avg_vol", "avg_vol_min")
     _flag_min("dollar_vol", "dollar_vol", "dollar_vol_min")
@@ -1882,6 +2082,90 @@ def _build_filter_stages(params: ScanParams) -> list[tuple[str, Callable]]:
         stages.append((
             f"ATR Ratio <= {params.atr_max_ratio}",
             lambda df, p=params: df["atr_ratio"] <= p.atr_max_ratio,
+        ))
+
+    # --- Realized volatility + price z-score (v7.0.0) ---
+    # All range filters of the same shape, so one loop rather than six
+    # near-identical blocks. NaN fails every comparison in pandas, which is
+    # the right default here: "this name's volatility is unmeasurable" is not
+    # a pass for a volatility filter. A missing column (the indicator did not
+    # run) fails the same way rather than raising.
+    def _finviz_stage(col: str, lo, hi):
+        """One finviz attribute band. Either bound may be None (open side).
+
+        NaN fails, as everywhere else: a ticker with no snapshot row has no
+        Short Float, and "unknown" is not a pass for a filter the user
+        explicitly switched on. A missing COLUMN fails the same way rather
+        than raising — that happens when the snapshot store is empty, and
+        failing closed is what stops an empty store silently behaving like
+        "no filter".
+        """
+        def mask(df, c=col, a=lo, b=hi):
+            if c not in df.columns:
+                return pd.Series([False] * len(df), index=df.index)
+            vals = pd.to_numeric(df[c], errors="coerce")
+            out = vals.notna()
+            if a is not None:
+                out &= vals >= a
+            if b is not None:
+                out &= vals <= b
+            return out
+        return mask
+
+    def _range_stage(col: str, lo: float, hi: float):
+        def mask(df, c=col, a=lo, b=hi):
+            if c not in df.columns:
+                return pd.Series([False] * len(df), index=df.index)
+            vals = pd.to_numeric(df[c], errors="coerce")
+            return (vals >= a) & (vals <= b)
+        return mask
+
+    # --- Finviz snapshot attribute filters (v7.0.0) ---
+    # Ordered by field name so the funnel log is stable run to run; the dict
+    # these come from has no meaningful order of its own.
+    #
+    # A bound left as None means "open on that side", so a user can ask for
+    # "Short Float >= 20%" without also having to invent an upper bound.
+    try:
+        from . import finviz_snapshot as _fvs_labels
+        _fv_labels = _fvs_labels.FIELD_LABELS
+    except Exception:
+        _fv_labels = {}
+    for _name, _spec in sorted(params.active_finviz_filters()):
+        _lo, _hi = _spec["min"], _spec["max"]
+        if _lo is None and _hi is None:
+            continue
+        _pretty = _fv_labels.get(_name, _name)
+        _bits = []
+        if _lo is not None:
+            _bits.append(f">= {_lo:g}")
+        if _hi is not None:
+            _bits.append(f"<= {_hi:g}")
+        stages.append((
+            f"{_pretty} {' and '.join(_bits)}",
+            _finviz_stage(_name, _lo, _hi),
+        ))
+
+    for _pfx, _col, _label, _unit in (
+        ("hv", "hv", "HV", "%"),
+        ("yz", "yz_vol", "Yang-Zhang", "%"),
+        ("atr_pct", "atr_pct", "ATR%", "%"),
+        ("hv_rank", "hv_rank", "HV Rank", ""),
+        ("hv_pct", "hv_pct", "HV Pctile", ""),
+        ("price_zscore", "price_zscore", "Price Z", "sd"),
+        ("beta_calc", "beta_calc", "Beta (calc)", ""),
+    ):
+        if not (getattr(params, f"{_pfx}_enabled")
+                and not getattr(params, f"{_pfx}_display_only")):
+            continue
+        _lo = getattr(params, f"{_pfx}_min")
+        _hi = getattr(params, f"{_pfx}_max")
+        _extra = ""
+        if _pfx == "price_zscore":
+            _extra = f" [{params.price_zscore_period.upper()}]"
+        stages.append((
+            f"{_label}{_extra} {_lo:g}{_unit} to {_hi:g}{_unit}",
+            _range_stage(_col, _lo, _hi),
         ))
 
     # #11 Volume dry-up
@@ -2598,6 +2882,46 @@ def run_scan(
 
     result.funnel.append(FunnelStage("Universe (computed)", total_computed, len(symbols)))
 
+    # ── Finviz snapshot join ──
+    # Left-joined onto the computed frame, not fetched per ticker: the store
+    # is written by two background producers (the free scavenge off the
+    # earnings fill and the paced sweep) and a scan only READS it. A ticker
+    # with no snapshot row gets NaN across every finviz column, which fails
+    # any finviz filter and renders blank — the same contract every other
+    # data-backed filter here has.
+    #
+    # These values are point-in-time and identical across every period of a
+    # multi-timeframe run. That is the user's explicit decision: no history is
+    # kept for them, so filtering on them means filtering on the most recent
+    # values. It is why they are joined here rather than computed per period.
+    if not computed.empty:
+        try:
+            from . import finviz_snapshot as _fvs
+            snap = _fvs.load_store()
+            if not snap.empty:
+                wanted = [c for c in snap.columns
+                          if c not in (_fvs.SYMBOL_COL,)]
+                # Never let the join clobber a column the scan computed
+                # itself — `sales`, `income` and the perf names could collide
+                # with future scanner columns, and the computed value wins.
+                wanted = [c for c in wanted if c not in computed.columns]
+                if wanted:
+                    snap = snap[[_fvs.SYMBOL_COL] + wanted].copy()
+                    snap[_fvs.SYMBOL_COL] = (
+                        snap[_fvs.SYMBOL_COL].astype(str).str.upper())
+                    computed = computed.merge(
+                        snap, how="left",
+                        left_on="symbol", right_on=_fvs.SYMBOL_COL)
+                    if _fvs.SYMBOL_COL != "symbol":
+                        computed = computed.drop(columns=[_fvs.SYMBOL_COL])
+                    matched = int(computed[wanted[0]].notna().sum()) \
+                        if wanted else 0
+                    log.info("Finviz snapshot joined: %d of %d tickers "
+                             "carry attributes", matched, len(computed))
+        except Exception as exc:
+            # A missing or unreadable snapshot store must never stop a scan.
+            log.warning("Finviz snapshot join skipped: %s", exc)
+
     # ── Phase B: Funnel filter stages ──
     stages = _build_filter_stages(params)
 
@@ -2637,10 +2961,35 @@ def run_scan(
             log.info("  Top %.0f%% Gain (cutoff=%.1f%%): %d -> %d",
                      params.top_pct_cutoff, cutoff_value, before, len(current))
 
+    # ── Period notes ──
+    # Counted over `computed` (every ticker the scan evaluated) rather than
+    # `current` (those that survived): the advisory is about how much history
+    # this PERIOD had to work with, which is a property of the data behind the
+    # scan, not of whichever rows happened to pass the other filters.
+    if (params.price_zscore_enabled or params.price_zscore_display_only) \
+            and "_price_zscore_truncated" in computed.columns:
+        trunc = computed["_price_zscore_truncated"].fillna(False).astype(bool)
+        n_trunc = int(trunc.sum())
+        if n_trunc:
+            bars = pd.to_numeric(
+                computed.loc[trunc, "_price_zscore_bars"], errors="coerce")
+            median_bars = int(bars.median()) if bars.notna().any() else 0
+            label = params.price_zscore_period.upper()
+            result.notes.append(
+                f"Price Z-Score [{label}]: {n_trunc} of {len(computed)} "
+                f"tickers had less history than the comparison period "
+                f"requires — mean computed over the history that exists "
+                f"(median {median_bars} sessions). Cached depth is "
+                f"OHLCV_HISTORY_YEARS={config.OHLCV_HISTORY_YEARS}y, so a "
+                f"backdated end date leaves proportionally less room."
+            )
+
     # ── Final ──
     result.funnel.append(FunnelStage("Final", len(current), len(current)))
     result.results_df = current.reset_index(drop=True)
     result.elapsed_sec = time.time() - t0
+    for _note in result.notes:
+        log.info("NOTE: %s", _note)
 
     log.info("=" * 60)
     log.info("Scan complete: %d results in %.1fs", len(current), result.elapsed_sec)

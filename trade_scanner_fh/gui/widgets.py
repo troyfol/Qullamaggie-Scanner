@@ -404,6 +404,74 @@ _PERIOD_STATS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _finviz_range_fields() -> list[dict]:
+    """Min / Max spec shared by every finviz attribute row.
+
+    A wide default band (+/- 1e12) rather than 0 means these are inert when a
+    row is enabled but untouched, and the range spans market caps in dollars
+    as comfortably as it spans a PEG of 0.42. `build_scan_params` converts a
+    bound still sitting at the sentinel into None so the filter treats that
+    side as open rather than clamping at the sentinel.
+    """
+    return [
+        {"name": "fv_min", "label": "Min", "type": "float",
+         "default": -1e12, "min": -1e12, "max": 1e12, "step": 1.0},
+        {"name": "fv_max", "label": "Max", "type": "float",
+         "default": 1e12, "min": -1e12, "max": 1e12, "step": 1.0},
+    ]
+
+
+def _finviz_scan_params(rows: dict) -> dict:
+    """Read every `fv_*` row into the single `finviz_filters` dict.
+
+    Only rows the user actually switched on are emitted. An untouched row
+    contributes NO key at all, which keeps a preset small and makes
+    `active_finviz_filters()` cheap regardless of how many fields exist.
+
+    The +/-1e12 sentinels become None so the filter treats that side as OPEN.
+    Without this, asking for "Short Float >= 20" would also silently assert
+    "<= 1e12", which is harmless for a percentage and wrong for a market cap
+    the day finviz lists something larger.
+    """
+    from .. import finviz_snapshot as _fvs
+    out: dict = {}
+    for name in _fvs.FILTERABLE_FIELDS:
+        row = rows.get(f"fv_{name}")
+        if row is None:
+            continue
+        enabled = row.is_enabled()
+        display_only = row.is_display_only()
+        if not (enabled or display_only):
+            continue
+        lo = row.value("fv_min")
+        hi = row.value("fv_max")
+        out[name] = {
+            "enabled": bool(enabled),
+            "display_only": bool(display_only),
+            "min": None if lo is None or lo <= -1e12 else float(lo),
+            "max": None if hi is None or hi >= 1e12 else float(hi),
+        }
+    # The two yes/no rows ride in the same dict using min==max==1.0 / 0.0, so
+    # the scanner needs no separate boolean code path: the stored values are
+    # real 1/0 floats in the parquet.
+    for name in _fvs.BOOL_FIELDS:
+        row = rows.get(f"fv_{name}")
+        if row is None:
+            continue
+        if not (row.is_enabled() or row.is_display_only()):
+            continue
+        want = row.value("want")
+        if want not in ("yes", "no"):
+            continue
+        target = 1.0 if want == "yes" else 0.0
+        out[name] = {
+            "enabled": bool(row.is_enabled()),
+            "display_only": bool(row.is_display_only()),
+            "min": target, "max": target,
+        }
+    return out
+
+
 def _period_stat_fields() -> list[dict]:
     out: list[dict] = []
     for stat, label in _PERIOD_STATS:
@@ -488,6 +556,10 @@ class IndicatorPanel(QScrollArea):
         self.vbox.addWidget(col_header)
 
         self.rows: dict[str, IndicatorRow] = {}
+        # title -> (header button, body widget) for the collapsible
+        # Finviz Additional sub-sections. Tests and preset load use it
+        # to assert / restore open-closed state.
+        self._collapsible_sections: dict = {}
 
         # --- Trend Filters ---
         self._section("Trend Filters")
@@ -687,6 +759,64 @@ class IndicatorPanel(QScrollArea):
         self.rows["rvol"].set_enabled(False)
 
         # --- Earnings Filters ---
+        # --- Realized volatility + price dispersion (v7.0.0) ---
+        # Every figure here is annualized and in percent so it can be read
+        # straight against an options implied-vol quote; HV Rank / Percentile
+        # are 0-100. Defaults on every band are wide enough to be inert, so
+        # ticking a row on without touching its bounds filters nothing.
+        self._section("Volatility")
+
+        self._add("hv", "Historical Volatility (ann.)", [
+            {"name": "lookback", "label": "Lookback", "type": "int", "default": 20, "min": 2, "max": 504},
+            {"name": "min_hv", "label": "Min %", "type": "float", "default": 0.0, "min": 0.0, "max": 999.0, "step": 5.0},
+            {"name": "max_hv", "label": "Max %", "type": "float", "default": 999.0, "min": 0.0, "max": 999.0, "step": 5.0},
+        ])
+        self.rows["hv"].set_enabled(False)
+
+        self._add("yz", "Yang-Zhang Volatility (ann.)", [
+            {"name": "lookback", "label": "Lookback", "type": "int", "default": 20, "min": 2, "max": 504},
+            {"name": "min_yz", "label": "Min %", "type": "float", "default": 0.0, "min": 0.0, "max": 999.0, "step": 5.0},
+            {"name": "max_yz", "label": "Max %", "type": "float", "default": 999.0, "min": 0.0, "max": 999.0, "step": 5.0},
+        ])
+        self.rows["yz"].set_enabled(False)
+
+        self._add("atr_pct", "ATR % of Price", [
+            {"name": "period", "label": "Period", "type": "int", "default": 14, "min": 2, "max": 200},
+            {"name": "min_atr_pct", "label": "Min %", "type": "float", "default": 0.0, "min": 0.0, "max": 999.0, "step": 0.5},
+            {"name": "max_atr_pct", "label": "Max %", "type": "float", "default": 999.0, "min": 0.0, "max": 999.0, "step": 0.5},
+        ])
+        self.rows["atr_pct"].set_enabled(False)
+
+        self._add("hv_rank", "HV Rank (0-100)", [
+            {"name": "lookback", "label": "HV LB", "type": "int", "default": 20, "min": 2, "max": 504},
+            {"name": "window", "label": "Window", "type": "int", "default": 252, "min": 20, "max": 1260},
+            {"name": "min_rank", "label": "Min", "type": "float", "default": 0.0, "min": 0.0, "max": 100.0, "step": 5.0},
+            {"name": "max_rank", "label": "Max", "type": "float", "default": 100.0, "min": 0.0, "max": 100.0, "step": 5.0},
+        ])
+        self.rows["hv_rank"].set_enabled(False)
+
+        self._add("hv_pct", "HV Percentile (0-100)", [
+            {"name": "lookback", "label": "HV LB", "type": "int", "default": 20, "min": 2, "max": 504},
+            {"name": "window", "label": "Window", "type": "int", "default": 252, "min": 20, "max": 1260},
+            {"name": "min_pct", "label": "Min", "type": "float", "default": 0.0, "min": 0.0, "max": 100.0, "step": 5.0},
+            {"name": "max_pct", "label": "Max", "type": "float", "default": 100.0, "min": 0.0, "max": 100.0, "step": 5.0},
+        ])
+        self.rows["hv_pct"].set_enabled(False)
+
+        # Standard deviations of the scan-end close from the comparison
+        # period's mean close. 5Y / 1Y / 6M measure backward from the scan END
+        # date, not from today, so a backdated scan sees only what its own end
+        # date could have seen. "P" uses the scan period itself.
+        self._add("price_zscore", "Price Std Devs from Mean", [
+            {"name": "period", "label": "Period", "type": "combo",
+             "default": "1y", "width": 140,
+             "choices": [("5y", "5Y"), ("1y", "1Y"), ("6m", "6M"),
+                         ("p", "P (scan period)")]},
+            {"name": "min_z", "label": "Min SD", "type": "float", "default": -99.0, "min": -99.0, "max": 99.0, "step": 0.25},
+            {"name": "max_z", "label": "Max SD", "type": "float", "default": 99.0, "min": -99.0, "max": 99.0, "step": 0.25},
+        ])
+        self.rows["price_zscore"].set_enabled(False)
+
         self._section("Earnings Filters")
 
         # NOTE: per-row "Include No Data" checkboxes were removed —
@@ -903,6 +1033,50 @@ class IndicatorPanel(QScrollArea):
             self._wire_backward_only_fields(_key)
             self._wire_period_stat_fields(_key)
 
+        # --- Options (v7.0.0, goal 3) ---
+        # Scraped finviz characteristics plus the per-period computed Beta.
+        # These do NOT vary by scan period: no history is kept for them, so
+        # filtering on them filters every period of a multi-timeframe run
+        # against the same most-recent values. That is deliberate.
+        self._section("Options")
+
+        from .. import finviz_snapshot as _fvs
+
+        self._add("beta_calc", "Beta (calc, vs SPY)", [
+            {"name": "lookback", "label": "Lookback", "type": "int",
+             "default": 252, "min": 20, "max": 1260},
+            {"name": "min_beta", "label": "Min", "type": "float",
+             "default": -99.0, "min": -99.0, "max": 99.0, "step": 0.1},
+            {"name": "max_beta", "label": "Max", "type": "float",
+             "default": 99.0, "min": -99.0, "max": 99.0, "step": 0.1},
+        ])
+        self.rows["beta_calc"].set_enabled(False)
+
+        for _key, _label in _fvs.OPTIONS_FIELDS:
+            if _key in _fvs.BOOL_FIELDS:
+                # Optionable / Shortable are yes-no, so a min/max band would
+                # be nonsense. A tri-state combo keeps "don't care" available
+                # as the default without needing a second checkbox.
+                self._add(f"fv_{_key}", _label, [
+                    {"name": "want", "label": "Require", "type": "combo",
+                     "default": "any", "width": 110,
+                     "choices": [("any", "Any"), ("yes", "Yes"), ("no", "No")]},
+                ])
+            else:
+                self._add(f"fv_{_key}", _label, _finviz_range_fields())
+            self.rows[f"fv_{_key}"].set_enabled(False)
+
+        # --- Finviz Additional (v7.0.0, goal 4) ---
+        # 80 range filters. Every sub-section starts COLLAPSED so a user who
+        # never touches these sees eight header lines rather than eighty rows.
+        self._section("Finviz Additional")
+        for _title, _items in _fvs.FINVIZ_GROUPS:
+            _body = self._collapsible(_title)
+            for _key, _label in _items:
+                self._add(f"fv_{_key}", _label, _finviz_range_fields(),
+                          target=_body)
+                self.rows[f"fv_{_key}"].set_enabled(False)
+
         self.vbox.addStretch()
         self.setWidget(container)
 
@@ -1100,11 +1274,48 @@ class IndicatorPanel(QScrollArea):
         self.vbox.addWidget(lbl)
 
     def _add(self, key: str, label: str, params: list[dict],
-             *, display_only_supported: bool = True):
+             *, display_only_supported: bool = True, target=None):
         row = IndicatorRow(label, params,
                            display_only_supported=display_only_supported)
         self.rows[key] = row
-        self.vbox.addWidget(row)
+        (target if target is not None else self.vbox).addWidget(row)
+
+    def _collapsible(self, title: str, *, expanded: bool = False):
+        """A collapsing sub-section; returns the layout to add rows into.
+
+        The Finviz Additional block carries 80 filter rows. Laid out flat that
+        is an unusable wall of spinboxes, so each sub-section collapses and
+        all of them start CLOSED — a user who never touches finviz filters
+        should see eight header lines, not eighty rows.
+
+        The header is a checkable QPushButton rather than a QToolButton with
+        an arrow: this panel already styles QPushButton headers elsewhere, and
+        a checkable button gives the open/closed state for free.
+        """
+        btn = QPushButton(f"  ▸  {title}")
+        btn.setCheckable(True)
+        btn.setChecked(bool(expanded))
+        btn.setStyleSheet(
+            "QPushButton { text-align: left; border: none; padding: 3px; "
+            "color: #4a90d9; font-weight: bold; } "
+            "QPushButton:hover { color: #6aa9e9; }"
+        )
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(10, 0, 0, 0)
+        body_layout.setSpacing(2)
+        body.setVisible(bool(expanded))
+
+        def _toggle(on: bool, _b=btn, _w=body, _t=title):
+            _w.setVisible(on)
+            _b.setText(f"  {'▾' if on else '▸'}  {_t}")
+
+        btn.toggled.connect(_toggle)
+        _toggle(bool(expanded))
+        self.vbox.addWidget(btn)
+        self.vbox.addWidget(body)
+        self._collapsible_sections[title] = (btn, body)
+        return body_layout
 
     def build_scan_params(self, start: date, end: date,
                           earnings_dates_only: bool = False,
@@ -1212,6 +1423,45 @@ class IndicatorPanel(QScrollArea):
             atr_max=r["atr"].value("max_val"),
             atr_stop_multiplier=float(r["atr"].value("stop_mult")),
             # BBW
+            # --- Realized volatility + price z-score (v7.0.0) ---
+            hv_enabled=r["hv"].is_enabled(),
+            hv_display_only=r["hv"].is_display_only(),
+            hv_lookback=int(r["hv"].value("lookback")),
+            hv_min=r["hv"].value("min_hv"),
+            hv_max=r["hv"].value("max_hv"),
+
+            yz_enabled=r["yz"].is_enabled(),
+            yz_display_only=r["yz"].is_display_only(),
+            yz_lookback=int(r["yz"].value("lookback")),
+            yz_min=r["yz"].value("min_yz"),
+            yz_max=r["yz"].value("max_yz"),
+
+            atr_pct_enabled=r["atr_pct"].is_enabled(),
+            atr_pct_display_only=r["atr_pct"].is_display_only(),
+            atr_pct_period=int(r["atr_pct"].value("period")),
+            atr_pct_min=r["atr_pct"].value("min_atr_pct"),
+            atr_pct_max=r["atr_pct"].value("max_atr_pct"),
+
+            hv_rank_enabled=r["hv_rank"].is_enabled(),
+            hv_rank_display_only=r["hv_rank"].is_display_only(),
+            hv_rank_lookback=int(r["hv_rank"].value("lookback")),
+            hv_rank_window=int(r["hv_rank"].value("window")),
+            hv_rank_min=r["hv_rank"].value("min_rank"),
+            hv_rank_max=r["hv_rank"].value("max_rank"),
+
+            hv_pct_enabled=r["hv_pct"].is_enabled(),
+            hv_pct_display_only=r["hv_pct"].is_display_only(),
+            hv_pct_lookback=int(r["hv_pct"].value("lookback")),
+            hv_pct_window=int(r["hv_pct"].value("window")),
+            hv_pct_min=r["hv_pct"].value("min_pct"),
+            hv_pct_max=r["hv_pct"].value("max_pct"),
+
+            price_zscore_enabled=r["price_zscore"].is_enabled(),
+            price_zscore_display_only=r["price_zscore"].is_display_only(),
+            price_zscore_period=r["price_zscore"].value("period"),
+            price_zscore_min=r["price_zscore"].value("min_z"),
+            price_zscore_max=r["price_zscore"].value("max_z"),
+
             bbw_enabled=r["bbw"].is_enabled(),
             bbw_display_only=r["bbw"].is_display_only(),
             bbw_period=r["bbw"].value("period"),
@@ -1340,6 +1590,16 @@ class IndicatorPanel(QScrollArea):
 
             # --- Period Avg / Max thresholds, all eight series rows ---
             **_period_stat_scan_params(r),
+
+            # --- Options: per-period computed beta (v7.0.0) ---
+            beta_calc_enabled=r["beta_calc"].is_enabled(),
+            beta_calc_display_only=r["beta_calc"].is_display_only(),
+            beta_calc_lookback=int(r["beta_calc"].value("lookback")),
+            beta_calc_min=r["beta_calc"].value("min_beta"),
+            beta_calc_max=r["beta_calc"].value("max_beta"),
+
+            # --- Finviz snapshot attribute filters (v7.0.0) ---
+            finviz_filters=_finviz_scan_params(r),
         )
 
     def to_dict(self) -> dict:
@@ -1512,6 +1772,16 @@ RESULT_COLUMNS = [
     ("ATR Stop",          "atr_stop",            lambda x: f"${x:.2f}"),
     ("BBW",               "bbw",                 lambda x: f"{x:.4f}"),
     ("ATR Ratio",         "atr_ratio",           lambda x: f"{x:.3f}"),
+    # Realized volatility (v7.0.0) — annualized percentages, so they read
+    # directly against an implied-vol quote. Rank / Percentile are 0-100.
+    ("HV",                "hv",                  lambda x: f"{x:.1f}%"),
+    ("Yang-Zhang",        "yz_vol",              lambda x: f"{x:.1f}%"),
+    ("ATR%",              "atr_pct",             lambda x: f"{x:.2f}%"),
+    ("HV Rank",           "hv_rank",             lambda x: f"{x:.0f}"),
+    ("HV Pctile",         "hv_pct",              lambda x: f"{x:.0f}"),
+    # Signed: the sign is the entire point of a z-score.
+    ("Price Z",           "price_zscore",        lambda x: f"{x:+.2f}"),
+    ("Beta (calc)",       "beta_calc",           lambda x: f"{x:.2f}"),
     ("ConsecGaps",        "consec_gaps",         lambda x: str(int(x))),
     ("Up Gap Start",      "up_gap_start_date",   _fmt_date),
     ("ConsecGapDn",       "consec_gaps_down",    lambda x: str(int(x))),
@@ -1582,6 +1852,69 @@ RESULT_COLUMNS = [
     ("Accel YoY Rev Avg", "accel_rev_yoy_period_avg", _fmt_period_pct),
     ("Accel YoY Rev Max", "accel_rev_yoy_period_max", _fmt_period_pct),
 ]
+
+
+def _fmt_fv_num(x) -> str:
+    """Render a finviz numeric. Large magnitudes get a K/M/B/T suffix.
+
+    Market Cap and Short Interest arrive as raw dollars / shares, so an
+    unformatted cell reads `4905540000000.0` and is unusable at a glance;
+    ratios and percentages need their decimals kept.
+    """
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    a = abs(v)
+    for cut, suf in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+        if a >= cut:
+            return f"{v / cut:,.2f}{suf}"
+    if a >= 10000:
+        return f"{v:,.0f}"
+    return f"{v:,.2f}"
+
+
+def _fmt_fv_bool(x) -> str:
+    if x is None:
+        return "N/A"
+    try:
+        if pd.isna(x):
+            return "N/A"
+    except (TypeError, ValueError):
+        pass
+    return "Yes" if bool(x) else "No"
+
+
+# Finviz snapshot columns (v7.0.0). Generated from the SAME group structure
+# the indicator panel builds its rows from, so a field can never appear as a
+# filter without a column or vice versa. Prefixed "FV " in the header so a
+# scraped static value is never mistaken for a per-period computed one.
+def _finviz_result_columns() -> list:
+    from .. import finviz_snapshot as _fvs
+    cols: list = []
+    seen: set = set()
+    for key, label in list(_fvs.OPTIONS_FIELDS) + [
+        (k, l) for _g, items in _fvs.FINVIZ_GROUPS for k, l in items
+    ]:
+        if key in seen:
+            continue
+        seen.add(key)
+        fmt = _fmt_fv_bool if key in _fvs.BOOL_FIELDS else _fmt_fv_num
+        cols.append((f"FV {label}", key, fmt))
+    # Parsed but deliberately not filterable: the stale latest-day values, the
+    # per-period duplicates, and the four free-text fields. Still worth
+    # rendering and exporting.
+    for key in _fvs.COLUMN_ONLY_FIELDS:
+        if key in seen:
+            continue
+        seen.add(key)
+        fmt = str if key in _fvs.TEXT_FIELDS else _fmt_fv_num
+        label = key.replace("finviz_", "").replace("_", " ").title()
+        cols.append((f"FV {label}", key, fmt))
+    return cols
+
+
+RESULT_COLUMNS.extend(_finviz_result_columns())
 
 # The four accelerating filters' column prefixes, in RESULT_COLUMNS
 # order. Used by the match-colour anchoring below.

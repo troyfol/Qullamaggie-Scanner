@@ -1136,6 +1136,36 @@ FINVIZ_BLACKLIST_FILE = DATA_DIR / "finviz_blacklist.txt"
 # Hard cap on the scraped page size to defend against a runaway response.
 FINVIZ_MAX_RESPONSE_BYTES = 20 * 1024 * 1024
 
+# -- Finviz snapshot attributes (v7.0.0) ----------------------------------
+# The ~93 valuation / ownership / margin / performance fields from the quote
+# page's snapshot grid. Two independent sources feed one store:
+#
+#   1. A FREE SCAVENGE off the earnings fill. The `&ty=ea` page the earnings
+#      scrape already downloads embeds the SAME grid, so every earnings
+#      request yields a snapshot at zero extra cost.
+#   2. A PACED UNIVERSE SWEEP against the plain quote page, which at ~271 KB
+#      is 8.3x lighter than the 2.25 MB earnings page.
+#
+# The sweep is deliberately NOT chained into the market-open auto-update. At
+# 4.0s pacing a ~9,750-ticker in-scope universe is ~10.8 hours; blocking the
+# Nasdaq calendar step behind that would stall the morning chain every day.
+FINVIZ_SNAPSHOT_PARQUET = DATA_DIR / "finviz_snapshot.parquet"
+FINVIZ_SNAPSHOT_URL = "https://finviz.com/quote.ashx?t={sym}"
+# Own pacing knob rather than reusing FINVIZ_MIN_INTERVAL_SEC: the two jobs
+# hit different pages with very different weights, and the user must be able
+# to slow the sweep without also slowing the earnings fill.
+FINVIZ_SNAPSHOT_MIN_INTERVAL_SEC = 4.0
+FINVIZ_SNAPSHOT_JITTER_SEC = 1.0
+# Staleness window for the sweep. These are slow-moving fundamentals and the
+# free scavenge keeps actively-reporting names fresher than this on its own.
+FINVIZ_SNAPSHOT_STALE_DAYS = 7
+FINVIZ_SNAPSHOT_BULK_CHECKPOINT = DATA_DIR / ".finviz_snapshot_checkpoint.json"
+# Skip list SEPARATE from FINVIZ_BLACKLIST_FILE. That one records "finviz has
+# no earningsData for this ticker", which is true of every ETF and says
+# nothing about whether the snapshot grid exists -- an ETF has no earnings tab
+# but does have Beta, Volatility and performance figures worth pulling.
+FINVIZ_SNAPSHOT_BLACKLIST_FILE = DATA_DIR / "finviz_snapshot_blacklist.txt"
+
 # -- Hotkey target-window guard (audit 2026-08-12, SEC-10) ----------------
 # `pyautogui` types BLIND: whatever holds focus at t+delay_ms receives the
 # ticker and the confirm key. The existing mitigations are strong (no global

@@ -231,6 +231,11 @@ class _FetchResult:
     # Nearest future earningsDate (finviz's next scheduled report), routed
     # to earnings_dates as finviz's next_earnings. None when none upcoming.
     next_date: Optional[pd.Timestamp] = None
+    # v7.0.0: attribute grid scavenged from the same page, already stamped
+    # with symbol + fetched_at. None when the page carried no grid (a block
+    # page or a 404). Independent of `rows` — an ETF yields a snapshot and no
+    # earnings.
+    snapshot: Optional[dict] = None
 
 
 def _fetch_one_ticker(
@@ -247,6 +252,31 @@ def _fetch_one_ticker(
         return out
 
     data = finviz_client.fetch_earnings(sym)
+
+    # Free snapshot scavenge (v7.0.0). The `ty=ea` page carries the full
+    # attribute grid, so every earnings request yields one at no extra cost.
+    #
+    # Harvested BEFORE the earnings result is inspected and stored even when
+    # the earnings side came back empty: an ETF has no earningsData at all but
+    # does have Beta, Volatility and performance figures worth keeping. Tying
+    # the snapshot to earnings success would throw those away.
+    #
+    # Fully isolated — a snapshot failure must never change what the earnings
+    # fill reports, which is the job this function exists to do.
+    try:
+        _snap = finviz_client.last_snapshot()
+        if _snap:
+            from . import finviz_snapshot as _fvs
+            _snap = dict(_snap)
+            _snap[_fvs.SYMBOL_COL] = sym
+            _snap[_fvs.FETCHED_COL] = pd.Timestamp.now(tz="UTC")
+            out.snapshot = _snap
+            # Buffered, not written: merge_rows rewrites the whole parquet,
+            # and this runs once per ticker across a ~10k universe.
+            _fvs.queue_row(_snap)
+    except Exception as exc:
+        log.debug("finviz snapshot harvest failed for %s: %s", sym, exc)
+
     if data is None:
         kind = finviz_client.last_failure_kind()
         if kind == finviz_client.FAIL_EMPTY:

@@ -844,3 +844,377 @@ def relative_volume(df: pd.DataFrame, *, lookback: int = 20) -> float:
     if last_vol is None or not np.isfinite(last_vol):
         return np.nan
     return float(last_vol) / float(base)
+
+
+# ============================================================================
+# Price dispersion — standard deviations from the mean
+# ============================================================================
+
+# Selectable comparison periods for `price_zscore`. The first three look
+# BACKWARD FROM THE SCAN END DATE (not from today), so a backdated scan
+# measures the mean its own end date could actually have seen. "p" means the
+# scan period itself.
+PRICE_ZSCORE_PERIODS: tuple[tuple[str, str], ...] = (
+    ("5y", "5Y"),
+    ("1y", "1Y"),
+    ("6m", "6M"),
+    ("p", "P (scan period)"),
+)
+PRICE_ZSCORE_PERIOD_KEYS: tuple[str, ...] = tuple(
+    k for k, _label in PRICE_ZSCORE_PERIODS
+)
+
+# A z-score over a handful of bars is noise dressed as a statistic. Below this
+# many closes the function reports NaN rather than a number the user might act
+# on — most visible on a very short scan window under period "p".
+PRICE_ZSCORE_MIN_BARS = 20
+
+
+class ZScoreResult:
+    """Outcome of one `price_zscore` call.
+
+    `truncated` is the flag the scan surfaces as a period note: the cache did
+    not reach as far back as the chosen period, so the mean was computed over
+    whatever history existed. `first_available` / `requested_start` carry the
+    two dates the note quotes.
+    """
+    __slots__ = ("z", "bars_used", "truncated", "requested_start",
+                 "first_available")
+
+    def __init__(self, z, bars_used, truncated,
+                 requested_start=None, first_available=None):
+        self.z = z
+        self.bars_used = bars_used
+        self.truncated = truncated
+        self.requested_start = requested_start
+        self.first_available = first_available
+
+    def __repr__(self):  # pragma: no cover - debugging aid
+        return (f"ZScoreResult(z={self.z!r}, bars_used={self.bars_used}, "
+                f"truncated={self.truncated})")
+
+
+def _zscore_window_start(end_ts, period_key: str):
+    """The requested first date for a backward-looking comparison period, or
+    None for "p" (whose start is the scan window's own first bar)."""
+    if period_key == "5y":
+        return end_ts - pd.DateOffset(years=5)
+    if period_key == "1y":
+        return end_ts - pd.DateOffset(years=1)
+    if period_key == "6m":
+        return end_ts - pd.DateOffset(months=6)
+    return None
+
+
+def price_zscore(
+    full_to_end: pd.DataFrame,
+    window: pd.DataFrame,
+    *,
+    period_key: str = "1y",
+    min_bars: int = PRICE_ZSCORE_MIN_BARS,
+) -> ZScoreResult:
+    """How many standard deviations the scan-end close sits from the mean
+    close of the comparison period.
+
+    ``z = (close_at_scan_end - mean(close)) / stdev(close)``
+
+    This standardises the PRICE LEVEL, not returns: it answers "this name is
+    2.1 sigma above its 1Y average price", which is a positioning question.
+    The return-distribution version ("today was a 3-sigma day") is a different
+    statistic and deliberately not what this computes.
+
+    `full_to_end` is every cached bar up to the scan end date and `window` is
+    the scan period itself; the caller already holds both. The comparison
+    slice is taken from `full_to_end` for 5Y / 1Y / 6M and is `window` for
+    "p".
+
+    Sample standard deviation (ddof=1, pandas' default) — the comparison
+    period is a sample of the price process, not the entire population of it.
+
+    When the cache does not reach back far enough the mean is computed over
+    whatever history exists and `truncated` is set, which is what the scan
+    turns into a period note. That case is routine rather than exceptional:
+    the store holds `OHLCV_HISTORY_YEARS` (5) of bars, so a 5Y comparison is
+    at the boundary even for a scan ending today, and a backdated scan has
+    proportionally less room behind its end date.
+    """
+    if window is None or window.empty:
+        return ZScoreResult(np.nan, 0, False)
+
+    end_ts = window.index[-1]
+    current = window["Close"].iloc[-1]
+
+    if period_key == "p":
+        comparison = window
+        requested_start = window.index[0]
+        truncated = False
+        first_available = window.index[0]
+    else:
+        if full_to_end is None or full_to_end.empty:
+            return ZScoreResult(np.nan, 0, False)
+        requested_start = _zscore_window_start(end_ts, period_key)
+        if requested_start is None:
+            return ZScoreResult(np.nan, 0, False)
+        comparison = full_to_end.loc[requested_start:end_ts]
+        first_available = full_to_end.index[0]
+        # Truncated when the cache itself starts after the requested date.
+        # Comparing against the STORE's first bar rather than the slice's
+        # avoids calling a ticker truncated merely because it listed late
+        # relative to the requested window but the store holds all of it —
+        # that is still all the history there is.
+        truncated = bool(first_available > requested_start)
+
+    bars = len(comparison)
+    if bars < max(2, int(min_bars)):
+        return ZScoreResult(np.nan, bars, truncated,
+                            requested_start, first_available)
+
+    closes = comparison["Close"]
+    mean = closes.mean()
+    std = closes.std()  # ddof=1
+    if not np.isfinite(std) or std == 0 or not np.isfinite(mean):
+        return ZScoreResult(np.nan, bars, truncated,
+                            requested_start, first_available)
+    if current is None or not np.isfinite(current):
+        return ZScoreResult(np.nan, bars, truncated,
+                            requested_start, first_available)
+
+    return ZScoreResult(float((current - mean) / std), bars, truncated,
+                        requested_start, first_available)
+
+
+# ============================================================================
+# Volatility — realized / historical estimators
+# ============================================================================
+
+# Trading days per year. Every estimator below reports an ANNUALIZED figure so
+# the numbers are directly comparable to an options implied vol quote, which
+# is the whole reason for having them.
+TRADING_DAYS_PER_YEAR = 252
+
+
+def _log_returns(close: pd.Series) -> np.ndarray:
+    """Close-to-close log returns as a finite float array (may be empty)."""
+    vals = pd.to_numeric(close, errors="coerce").to_numpy(dtype=float)
+    vals = vals[np.isfinite(vals) & (vals > 0)]
+    if vals.size < 2:
+        return np.empty(0, dtype=float)
+    return np.diff(np.log(vals))
+
+
+def historical_volatility(
+    df: pd.DataFrame, *, lookback: int = 20,
+    annualize: bool = True,
+) -> float:
+    """Close-to-close realized volatility over the last `lookback` bars.
+
+    The textbook estimator and the standard comparator for an implied vol
+    quote: sample stdev (ddof=1) of daily log returns, scaled by sqrt(252) and
+    reported in PERCENT.
+
+    Uses `lookback` returns, which needs `lookback + 1` closes — an n-bar
+    window yields n-1 returns, and quietly reporting a 19-return figure as a
+    20-day vol would understate the sample every time.
+    """
+    if df is None or len(df) < lookback + 1:
+        return np.nan
+    rets = _log_returns(df["Close"].iloc[-(lookback + 1):])
+    if rets.size < 2:
+        return np.nan
+    sd = float(np.std(rets, ddof=1))
+    if not np.isfinite(sd):
+        return np.nan
+    if annualize:
+        sd *= np.sqrt(TRADING_DAYS_PER_YEAR)
+    return sd * 100.0
+
+
+def yang_zhang_volatility(
+    df: pd.DataFrame, *, lookback: int = 20, annualize: bool = True,
+) -> float:
+    """Yang-Zhang realized volatility over the last `lookback` bars, in percent.
+
+    Chosen over the other range estimators because it is the only common one
+    that handles OVERNIGHT GAPS, and this scanner's whole purpose is surfacing
+    gappy momentum names — a close-to-close figure attributes the entire gap
+    to the session, while Parkinson and Garman-Klass ignore it outright.
+
+    sigma^2 = sigma_open^2 + k * sigma_close^2 + (1 - k) * sigma_rs^2
+
+    where sigma_open is the overnight (prev close -> open) variance,
+    sigma_close the open -> close variance, sigma_rs the Rogers-Satchell
+    intraday variance, and k the standard 0.34 / (1.34 + (n+1)/(n-1)) weight
+    that minimises estimator variance.
+    """
+    if df is None or len(df) < lookback + 1:
+        return np.nan
+    tail = df.iloc[-(lookback + 1):]
+    o = pd.to_numeric(tail["Open"], errors="coerce").to_numpy(dtype=float)
+    h = pd.to_numeric(tail["High"], errors="coerce").to_numpy(dtype=float)
+    l = pd.to_numeric(tail["Low"], errors="coerce").to_numpy(dtype=float)
+    c = pd.to_numeric(tail["Close"], errors="coerce").to_numpy(dtype=float)
+
+    # Drop the first bar: every term needs the PREVIOUS close.
+    prev_c = c[:-1]
+    o, h, l, c = o[1:], h[1:], l[1:], c[1:]
+    ok = (np.isfinite(o) & np.isfinite(h) & np.isfinite(l) & np.isfinite(c)
+          & np.isfinite(prev_c) & (o > 0) & (h > 0) & (l > 0) & (c > 0)
+          & (prev_c > 0))
+    o, h, l, c, prev_c = o[ok], h[ok], l[ok], c[ok], prev_c[ok]
+    n = o.size
+    if n < 2:
+        return np.nan
+
+    log_ho = np.log(h / o)
+    log_lo = np.log(l / o)
+    log_co = np.log(c / o)
+    log_oc = np.log(o / prev_c)          # overnight jump
+
+    var_open = np.sum((log_oc - log_oc.mean()) ** 2) / (n - 1)
+    var_close = np.sum((log_co - log_co.mean()) ** 2) / (n - 1)
+    var_rs = np.sum(log_ho * (log_ho - log_co)
+                    + log_lo * (log_lo - log_co)) / n
+
+    k = 0.34 / (1.34 + (n + 1) / (n - 1))
+    var = var_open + k * var_close + (1.0 - k) * var_rs
+    if not np.isfinite(var) or var < 0:
+        return np.nan
+    sd = float(np.sqrt(var))
+    if annualize:
+        sd *= np.sqrt(TRADING_DAYS_PER_YEAR)
+    return sd * 100.0
+
+
+def atr_pct(df: pd.DataFrame, *, period: int = 14) -> float:
+    """ATR as a percentage of the latest close.
+
+    `atr_value` is in dollars and `atr_ratio` compares two ATRs to each other;
+    neither lets a $8 name be compared to a $400 one. This does.
+    """
+    atr = atr_value(df, period=period)
+    if not np.isfinite(atr):
+        return np.nan
+    close = pd.to_numeric(df["Close"], errors="coerce").iloc[-1]
+    if not np.isfinite(close) or close <= 0:
+        return np.nan
+    return float(atr / close * 100.0)
+
+
+def _rolling_hv_series(
+    close: pd.Series, lookback: int,
+) -> "pd.Series | None":
+    """Annualized close-to-close HV at every bar, as a percent Series.
+
+    Vectorised rather than a python loop over windows: the rank/percentile
+    callers ask for a year of history, so the naive version recomputes a
+    20-bar stdev ~252 times per ticker across a ~10k universe.
+    """
+    vals = pd.to_numeric(close, errors="coerce")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        logret = np.log(vals / vals.shift(1))
+    logret = logret.replace([np.inf, -np.inf], np.nan)
+    hv = logret.rolling(lookback).std(ddof=1)
+    return hv * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0
+
+
+def hv_rank(
+    df: pd.DataFrame, *, lookback: int = 20, window: int = TRADING_DAYS_PER_YEAR,
+) -> float:
+    """Where current HV sits between its own MIN and MAX over `window` bars,
+    as 0-100.
+
+    The computable analogue of IV Rank. 0 means current HV is the lowest it
+    has been in the window, 100 the highest. Reads as "how stretched is this
+    name's volatility RELATIVE TO ITSELF", which a raw HV cannot answer —
+    30% HV is calm for a biotech and extreme for a utility.
+    """
+    if df is None or len(df) < lookback + 2:
+        return np.nan
+    hv = _rolling_hv_series(df["Close"], lookback)
+    tail = hv.iloc[-window:].dropna()
+    if tail.size < 2:
+        return np.nan
+    current = tail.iloc[-1]
+    lo, hi = float(tail.min()), float(tail.max())
+    if not np.isfinite(current) or not np.isfinite(lo) or not np.isfinite(hi):
+        return np.nan
+    if hi == lo:
+        # Perfectly flat HV history — no rank is meaningful, and returning 0
+        # or 100 would be an arbitrary pick between two opposite readings.
+        return np.nan
+    return float((current - lo) / (hi - lo) * 100.0)
+
+
+def hv_percentile(
+    df: pd.DataFrame, *, lookback: int = 20, window: int = TRADING_DAYS_PER_YEAR,
+) -> float:
+    """Share of the last `window` bars whose HV was BELOW the current one,
+    as 0-100.
+
+    Differs from `hv_rank` in the way IV Percentile differs from IV Rank:
+    rank is min-max scaled and so is dominated by one spike, percentile counts
+    observations and is not. Worth having both — they disagree exactly when a
+    single outlier is driving the range, which is useful to see.
+    """
+    if df is None or len(df) < lookback + 2:
+        return np.nan
+    hv = _rolling_hv_series(df["Close"], lookback)
+    tail = hv.iloc[-window:].dropna()
+    if tail.size < 2:
+        return np.nan
+    current = tail.iloc[-1]
+    if not np.isfinite(current):
+        return np.nan
+    prior = tail.iloc[:-1]
+    if prior.size == 0:
+        return np.nan
+    return float((prior < current).sum() / prior.size * 100.0)
+
+
+def beta_vs_benchmark(
+    df: pd.DataFrame, benchmark: pd.DataFrame, *, lookback: int = 252,
+) -> float:
+    """Ordinary-least-squares beta of daily returns against a benchmark.
+
+    ``beta = cov(stock, bench) / var(bench)`` over the last `lookback`
+    overlapping sessions.
+
+    Complements the static Beta scraped from finviz rather than replacing it.
+    Finviz publishes ONE number per ticker with no period attached; this one
+    is computed over the scan's own window, so it moves with the scan the way
+    every other filter in the app does. Both are surfaced, clearly labelled,
+    because they answer different questions and will legitimately disagree.
+
+    The two return series are INNER-JOINED on date before any maths. A stock
+    that was halted, listed late, or carries a different session calendar to
+    the benchmark would otherwise pair mismatched days and produce a beta that
+    is pure artefact.
+    """
+    if df is None or benchmark is None or df.empty or benchmark.empty:
+        return np.nan
+    try:
+        s = pd.to_numeric(df["Close"], errors="coerce")
+        b = pd.to_numeric(benchmark["Close"], errors="coerce")
+    except (KeyError, TypeError):
+        return np.nan
+
+    joined = pd.concat([s.rename("s"), b.rename("b")], axis=1, join="inner")
+    joined = joined[(joined["s"] > 0) & (joined["b"] > 0)].dropna()
+    if len(joined) < 3:
+        return np.nan
+
+    # lookback RETURNS needs lookback + 1 closes, same contract as the HV
+    # estimators.
+    tail = joined.iloc[-(int(lookback) + 1):]
+    rs = np.diff(np.log(tail["s"].to_numpy(dtype=float)))
+    rb = np.diff(np.log(tail["b"].to_numpy(dtype=float)))
+    if rs.size < 2 or rb.size < 2:
+        return np.nan
+
+    var_b = float(np.var(rb, ddof=1))
+    if not np.isfinite(var_b) or var_b == 0:
+        return np.nan
+    cov = float(np.cov(rs, rb, ddof=1)[0, 1])
+    if not np.isfinite(cov):
+        return np.nan
+    return cov / var_b

@@ -73,6 +73,31 @@ def _set_failure(kind: Optional[str]) -> None:
     _LAST_FAILURE_KIND = kind
 
 
+# Snapshot scavenged from the most recent successful fetch. Same
+# module-state idiom as `last_failure_kind()` above, chosen so
+# `fetch_earnings` keeps its exact signature and return type — a pile of tests
+# and both fill paths depend on it returning just the earnings list.
+#
+# The point: the `&ty=ea` page ALREADY contains the full snapshot grid, so
+# every earnings request can yield a complete set of finviz attributes for
+# free. Not reading it would mean paying for the same bytes twice.
+_last_snapshot: "dict | None" = None
+
+
+def last_snapshot() -> "dict | None":
+    """Snapshot parsed from the last fetch, or None if that page had none.
+
+    Valid only until the next `fetch_earnings` call, exactly like
+    `last_failure_kind()`. Callers read it immediately or not at all.
+    """
+    return _last_snapshot
+
+
+def _set_snapshot(value) -> None:
+    global _last_snapshot
+    _last_snapshot = value
+
+
 def is_configured() -> bool:
     """True — finviz needs no API key (HTTP scrape). Present for parity
     with finnhub_client.is_configured so callers can gate uniformly."""
@@ -174,6 +199,7 @@ def fetch_earnings(symbol: str, *, timeout: float = 25.0) -> Optional[list[dict]
     # fill takes a hand-typed symbol that never passed through the universe
     # filter at all. quote() then encodes whatever the allowlist permits
     # (`$` and `^` are legal in a query value but must not be raw).
+    _set_snapshot(None)
     sym = config.url_safe_ticker(symbol)
     if not sym:
         log.warning("finviz: refusing implausible symbol %r", symbol)
@@ -220,6 +246,18 @@ def fetch_earnings(symbol: str, *, timeout: float = 25.0) -> Optional[list[dict]
     if len(body.encode("utf-8", "ignore")) > config.FINVIZ_MAX_RESPONSE_BYTES:
         _set_failure(FAIL_TOO_LARGE)
         return None
+
+    # Free scavenge. Deliberately BEFORE the earnings parse and wrapped so a
+    # snapshot problem can never affect the earnings result: earnings is the
+    # job this function exists to do, and the attributes are a bonus riding
+    # along on bytes already paid for.
+    try:
+        from . import finviz_snapshot as _fvs
+        snap = _fvs.parse_snapshot(body)
+        _set_snapshot(snap or None)
+    except Exception as exc:
+        log.debug("finviz snapshot scavenge failed for %s: %s", sym, exc)
+        _set_snapshot(None)
 
     try:
         data = _extract_earnings_data(body)
