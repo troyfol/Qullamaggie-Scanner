@@ -3685,7 +3685,12 @@ class MainWindow(QMainWindow):
         which are exactly the fields the Options header screens on.
         """
         try:
-            df = data_engine.load_universe()
+            # Prefer the frame the launch path already loaded: re-reading a
+            # 16k-row CSV to answer "is a sweep due" would be wasteful, and
+            # this runs on every startup.
+            df = self._universe_df
+            if df is None or getattr(df, "empty", True):
+                df = load_universe()
             if df is None or df.empty or "symbol" not in df.columns:
                 return []
             return [str(x).upper().strip() for x in df["symbol"]

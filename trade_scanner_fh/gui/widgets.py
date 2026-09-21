@@ -404,20 +404,26 @@ _PERIOD_STATS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _finviz_range_fields() -> list[dict]:
-    """Min / Max spec shared by every finviz attribute row.
+def _finviz_range_fields(name: str) -> list[dict]:
+    """Min / Max spec for one finviz attribute row, scaled to the field.
 
-    A wide default band (+/- 1e12) rather than 0 means these are inert when a
-    row is enabled but untouched, and the range spans market caps in dollars
-    as comfortably as it spans a PEG of 0.42. `build_scan_params` converts a
-    bound still sitting at the sentinel into None so the filter treats that
-    side as open rather than clamping at the sentinel.
+    Bounds, defaults, step and decimals all come from
+    `finviz_snapshot.field_range`, so a Market Cap row steps in hundreds of
+    millions while a PEG row steps in halves. The previous shared +/-1e12
+    sentinel made the panel unreadable and gave no clue what scale a field is
+    measured on.
+
+    A bound left AT its limit is read as "no limit on this side" by
+    `_finviz_scan_params`, so the defaults stay inert: enabling a row without
+    touching it filters nothing, exactly as before.
     """
+    from .. import finviz_snapshot as _fvs
+    lo, hi, dlo, dhi, step, dp = _fvs.field_range(name)
     return [
         {"name": "fv_min", "label": "Min", "type": "float",
-         "default": -1e12, "min": -1e12, "max": 1e12, "step": 1.0},
+         "default": dlo, "min": lo, "max": hi, "step": step, "decimals": dp},
         {"name": "fv_max", "label": "Max", "type": "float",
-         "default": 1e12, "min": -1e12, "max": 1e12, "step": 1.0},
+         "default": dhi, "min": lo, "max": hi, "step": step, "decimals": dp},
     ]
 
 
@@ -448,8 +454,8 @@ def _finviz_scan_params(rows: dict) -> dict:
         out[name] = {
             "enabled": bool(enabled),
             "display_only": bool(display_only),
-            "min": None if lo is None or lo <= -1e12 else float(lo),
-            "max": None if hi is None or hi >= 1e12 else float(hi),
+            "min": None if _fvs.is_open_bound(name, lo, upper=False) else float(lo),
+            "max": None if _fvs.is_open_bound(name, hi, upper=True) else float(hi),
         }
     # The two yes/no rows ride in the same dict using min==max==1.0 / 0.0, so
     # the scanner needs no separate boolean code path: the stored values are
@@ -768,22 +774,22 @@ class IndicatorPanel(QScrollArea):
 
         self._add("hv", "Historical Volatility (ann.)", [
             {"name": "lookback", "label": "Lookback", "type": "int", "default": 20, "min": 2, "max": 504},
-            {"name": "min_hv", "label": "Min %", "type": "float", "default": 0.0, "min": 0.0, "max": 999.0, "step": 5.0},
-            {"name": "max_hv", "label": "Max %", "type": "float", "default": 999.0, "min": 0.0, "max": 999.0, "step": 5.0},
+            {"name": "min_hv", "label": "Min %", "type": "float", "default": 0.0, "min": 0.0, "max": 300.0, "step": 5.0},
+            {"name": "max_hv", "label": "Max %", "type": "float", "default": 300.0, "min": 0.0, "max": 300.0, "step": 5.0},
         ])
         self.rows["hv"].set_enabled(False)
 
         self._add("yz", "Yang-Zhang Volatility (ann.)", [
             {"name": "lookback", "label": "Lookback", "type": "int", "default": 20, "min": 2, "max": 504},
-            {"name": "min_yz", "label": "Min %", "type": "float", "default": 0.0, "min": 0.0, "max": 999.0, "step": 5.0},
-            {"name": "max_yz", "label": "Max %", "type": "float", "default": 999.0, "min": 0.0, "max": 999.0, "step": 5.0},
+            {"name": "min_yz", "label": "Min %", "type": "float", "default": 0.0, "min": 0.0, "max": 300.0, "step": 5.0},
+            {"name": "max_yz", "label": "Max %", "type": "float", "default": 300.0, "min": 0.0, "max": 300.0, "step": 5.0},
         ])
         self.rows["yz"].set_enabled(False)
 
         self._add("atr_pct", "ATR % of Price", [
             {"name": "period", "label": "Period", "type": "int", "default": 14, "min": 2, "max": 200},
-            {"name": "min_atr_pct", "label": "Min %", "type": "float", "default": 0.0, "min": 0.0, "max": 999.0, "step": 0.5},
-            {"name": "max_atr_pct", "label": "Max %", "type": "float", "default": 999.0, "min": 0.0, "max": 999.0, "step": 0.5},
+            {"name": "min_atr_pct", "label": "Min %", "type": "float", "default": 0.0, "min": 0.0, "max": 50.0, "step": 0.5},
+            {"name": "max_atr_pct", "label": "Max %", "type": "float", "default": 50.0, "min": 0.0, "max": 50.0, "step": 0.5},
         ])
         self.rows["atr_pct"].set_enabled(False)
 
@@ -812,8 +818,8 @@ class IndicatorPanel(QScrollArea):
              "default": "1y", "width": 140,
              "choices": [("5y", "5Y"), ("1y", "1Y"), ("6m", "6M"),
                          ("p", "P (scan period)")]},
-            {"name": "min_z", "label": "Min SD", "type": "float", "default": -99.0, "min": -99.0, "max": 99.0, "step": 0.25},
-            {"name": "max_z", "label": "Max SD", "type": "float", "default": 99.0, "min": -99.0, "max": 99.0, "step": 0.25},
+            {"name": "min_z", "label": "Min SD", "type": "float", "default": -5.0, "min": -5.0, "max": 5.0, "step": 0.25},
+            {"name": "max_z", "label": "Max SD", "type": "float", "default": 5.0, "min": -5.0, "max": 5.0, "step": 0.25},
         ])
         self.rows["price_zscore"].set_enabled(False)
 
@@ -1046,9 +1052,9 @@ class IndicatorPanel(QScrollArea):
             {"name": "lookback", "label": "Lookback", "type": "int",
              "default": 252, "min": 20, "max": 1260},
             {"name": "min_beta", "label": "Min", "type": "float",
-             "default": -99.0, "min": -99.0, "max": 99.0, "step": 0.1},
+             "default": -5.0, "min": -5.0, "max": 10.0, "step": 0.1},
             {"name": "max_beta", "label": "Max", "type": "float",
-             "default": 99.0, "min": -99.0, "max": 99.0, "step": 0.1},
+             "default": 10.0, "min": -5.0, "max": 10.0, "step": 0.1},
         ])
         self.rows["beta_calc"].set_enabled(False)
 
@@ -1063,7 +1069,7 @@ class IndicatorPanel(QScrollArea):
                      "choices": [("any", "Any"), ("yes", "Yes"), ("no", "No")]},
                 ])
             else:
-                self._add(f"fv_{_key}", _label, _finviz_range_fields())
+                self._add(f"fv_{_key}", _label, _finviz_range_fields(_key))
             self.rows[f"fv_{_key}"].set_enabled(False)
 
         # --- Finviz Additional (v7.0.0, goal 4) ---
@@ -1073,7 +1079,7 @@ class IndicatorPanel(QScrollArea):
         for _title, _items in _fvs.FINVIZ_GROUPS:
             _body = self._collapsible(_title)
             for _key, _label in _items:
-                self._add(f"fv_{_key}", _label, _finviz_range_fields(),
+                self._add(f"fv_{_key}", _label, _finviz_range_fields(_key),
                           target=_body)
                 self.rows[f"fv_{_key}"].set_enabled(False)
 

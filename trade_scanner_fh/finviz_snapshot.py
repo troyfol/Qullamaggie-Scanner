@@ -626,3 +626,107 @@ def flush_queue() -> int:
 def pending_count() -> int:
     """Rows buffered but not yet on disk — for tests and status lines."""
     return len(_pending)
+
+
+# ----------------------------------------------------------------------
+# Per-field spinbox ranges
+# ----------------------------------------------------------------------
+#
+# Every filter row needs bounds, defaults, a step and a decimal count that
+# match what the field actually measures. A shared +/-1e12 sentinel made the
+# panel unreadable: "Market Cap min -1000000000000" tells you nothing about
+# the scale you are screening on, and a 0.01 step on a figure in the billions
+# is unusable.
+#
+# `RANGE_KINDS` maps a kind to (spin_min, spin_max, default_min, default_max,
+# step, decimals). A bound left sitting AT its spinbox limit is treated as
+# OPEN by `_finviz_scan_params`, so "Short Float >= 20" with the maximum at
+# 100 does not silently also assert "<= 100" - dragging a bound to the end of
+# its range is the natural way to say "no limit on this side".
+RANGE_KINDS: dict = {
+    #                  spin_lo   spin_hi   def_lo   def_hi   step  dp
+    "pct_0_100":     (      0.0,    100.0,     0.0,   100.0,   1.0, 2),
+    "pct_signed":    (   -100.0,   1000.0,  -100.0,  1000.0,   5.0, 2),
+    "pct_growth":    (   -100.0,  10000.0,  -100.0, 10000.0,  10.0, 2),
+    "pct_margin":    (   -500.0,    500.0,  -500.0,   500.0,   5.0, 2),
+    "ratio":         (      0.0,   1000.0,     0.0,  1000.0,   0.5, 2),
+    "ratio_signed":  (   -100.0,    100.0,  -100.0,   100.0,   0.1, 2),
+    "money_large":   (      0.0,   5.0e12,     0.0,  5.0e12, 1.0e8, 0),
+    "shares":        (      0.0,   5.0e11,     0.0,  5.0e11, 1.0e6, 0),
+    "price":         (      0.0,  100000.0,    0.0, 100000.0,  1.0, 2),
+    "eps":           (  -1000.0,   1000.0, -1000.0,  1000.0,   0.1, 2),
+    "count":         (      0.0,  5.0e6,       0.0,   5.0e6, 1000.0, 0),
+    "recom":         (      1.0,      5.0,     1.0,     5.0,   0.1, 2),
+    "rsi":           (      0.0,    100.0,     0.0,   100.0,   1.0, 2),
+    "beta":          (     -5.0,     10.0,    -5.0,    10.0,   0.1, 2),
+    "volatility":    (      0.0,    100.0,     0.0,   100.0,   0.5, 2),
+}
+
+# field -> kind. Anything unlisted falls back to "ratio", which is the least
+# surprising general-purpose numeric shape.
+FIELD_KINDS: dict = {
+    # Valuation
+    "market_cap": "money_large", "enterprise_value": "money_large",
+    "pe": "ratio", "forward_pe": "ratio", "peg": "ratio", "ps": "ratio",
+    "pb": "ratio", "pc": "ratio", "pfcf": "ratio",
+    "ev_ebitda": "ratio", "ev_sales": "ratio",
+    "target_price": "price", "recom": "recom",
+    # Financials
+    "income": "money_large", "sales": "money_large",
+    "book_per_sh": "eps", "cash_per_sh": "eps",
+    "quick_ratio": "ratio", "current_ratio": "ratio",
+    "debt_eq": "ratio", "lt_debt_eq": "ratio",
+    "employees": "count",
+    # Dividends
+    "dividend_est": "eps", "dividend_est_pct": "pct_0_100",
+    "dividend_ttm": "eps", "dividend_ttm_pct": "pct_0_100",
+    "dividend_gr_3y": "pct_signed", "dividend_gr_5y": "pct_signed",
+    "payout_pct": "pct_0_100",
+    # Growth & estimates
+    "eps_ttm": "eps", "eps_next_y": "eps", "eps_next_q": "eps",
+    "eps_this_y_pct": "pct_growth", "eps_next_y_pct": "pct_growth",
+    "eps_next_5y_pct": "pct_growth",
+    "eps_past_3y_pct": "pct_growth", "eps_past_5y_pct": "pct_growth",
+    "sales_past_3y_pct": "pct_growth", "sales_past_5y_pct": "pct_growth",
+    "eps_yoy_ttm_pct": "pct_growth", "sales_yoy_ttm_pct": "pct_growth",
+    "eps_qoq_pct": "pct_growth", "sales_qoq_pct": "pct_growth",
+    "eps_surprise_pct": "pct_signed", "sales_surprise_pct": "pct_signed",
+    # Ownership & short
+    "insider_own_pct": "pct_0_100", "insider_trans_pct": "pct_signed",
+    "inst_own_pct": "pct_0_100", "inst_trans_pct": "pct_signed",
+    "shs_outstanding": "shares", "shs_float": "shares",
+    "short_float_pct": "pct_0_100", "short_ratio": "ratio",
+    "short_interest": "shares",
+    # Margins & returns
+    "roa_pct": "pct_margin", "roe_pct": "pct_margin", "roic_pct": "pct_margin",
+    "gross_margin_pct": "pct_margin", "oper_margin_pct": "pct_margin",
+    "profit_margin_pct": "pct_margin",
+    # Technicals
+    "sma20_pct": "pct_signed", "sma50_pct": "pct_signed",
+    "sma200_pct": "pct_signed",
+    "high_52w": "price", "high_52w_pct": "pct_signed",
+    "low_52w": "price", "low_52w_pct": "pct_signed",
+    "finviz_rsi14": "rsi",
+    # Options header
+    "finviz_beta": "beta",
+    "volatility_week_pct": "volatility", "volatility_month_pct": "volatility",
+    # Performance
+    "perf_week_pct": "pct_signed", "perf_month_pct": "pct_signed",
+    "perf_quarter_pct": "pct_signed", "perf_half_y_pct": "pct_signed",
+    "perf_ytd_pct": "pct_signed", "perf_year_pct": "pct_signed",
+    "perf_3y_pct": "pct_growth", "perf_5y_pct": "pct_growth",
+    "perf_10y_pct": "pct_growth",
+}
+
+
+def field_range(name: str) -> tuple:
+    """(spin_lo, spin_hi, default_lo, default_hi, step, decimals) for a field."""
+    return RANGE_KINDS[FIELD_KINDS.get(name, "ratio")]
+
+
+def is_open_bound(name: str, value, *, upper: bool) -> bool:
+    """Is this bound sitting at its limit, i.e. meaning "no limit"?"""
+    if value is None:
+        return True
+    lo, hi = field_range(name)[0], field_range(name)[1]
+    return value >= hi if upper else value <= lo

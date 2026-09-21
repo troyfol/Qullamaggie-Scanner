@@ -3309,6 +3309,36 @@ directories, and the previous `_internal/`.
 
 ## Changelog
 
+### v7.0.1 - filter ranges scaled to what they measure, and a universe-lookup fix (2026-09-20)
+
+**The attribute sweep never offered itself.** `_finviz_universe_symbols`
+called `data_engine.load_universe()`, but `main_window` imports
+`load_universe` directly from `ticker_universe` and never binds `data_engine`
+as a name. The `NameError` was swallowed into an empty list and the launch
+prompt returned on its "no universe loaded" guard, so the only visible symptom
+was one WARNING line. Refresh Finviz Attributes and Finviz Attribute Coverage
+were affected the same way. It now reads the `_universe_df` the launch path
+already loaded, falling back to the real `load_universe()`.
+
+The tests missed it because the cadence fixture stubbed
+`_finviz_universe_symbols`, the one function that was broken. Four tests now
+call the real method.
+
+**Every filter row is scaled to its own measure.** The shared +/-1e12 sentinel
+made the panel unreadable and stepped a market cap in hundredths. Bounds,
+defaults, step and decimals now come from `finviz_snapshot.field_range`, so
+Short Float runs 0-100 in steps of 1, Market Cap runs 0-5T in steps of 100M
+with no decimals, Recom runs 1-5, Beta runs -5 to 10. Historical Volatility
+and Yang-Zhang cap at 300% rather than 999, ATR% at 50, the price z-score at
++/-5 sigma.
+
+Defaults still sit AT the limits, so a row enabled but untouched filters
+nothing: a bound resting on its limit is read as "no limit on this side".
+Readable defaults must not become silently filtering defaults.
+
+Funnel stage labels now render large bounds with suffixes
+(`Market Cap >= 2B and <= 500B` rather than `>= 2e+09`).
+
 ### v7.0.0 - Price z-score, realized volatility, and the finviz attribute layer (2026-09-20)
 
 **Price standard deviations from the mean.** How many sample standard

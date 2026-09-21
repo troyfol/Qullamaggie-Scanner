@@ -280,21 +280,21 @@ class ScanParams:
     hv_display_only: bool = False
     hv_lookback: int = 20
     hv_min: float = 0.0
-    hv_max: float = 999.0
+    hv_max: float = 300.0
 
     # Yang-Zhang Volatility — the gap-aware estimator
     yz_enabled: bool = False
     yz_display_only: bool = False
     yz_lookback: int = 20
     yz_min: float = 0.0
-    yz_max: float = 999.0
+    yz_max: float = 300.0
 
     # ATR as a percentage of price
     atr_pct_enabled: bool = False
     atr_pct_display_only: bool = False
     atr_pct_period: int = 14
     atr_pct_min: float = 0.0
-    atr_pct_max: float = 999.0
+    atr_pct_max: float = 50.0
 
     # HV Rank — current HV min-max scaled against its own trailing window
     hv_rank_enabled: bool = False
@@ -320,8 +320,8 @@ class ScanParams:
     price_zscore_enabled: bool = False
     price_zscore_display_only: bool = False
     price_zscore_period: str = "1y"
-    price_zscore_min: float = -99.0
-    price_zscore_max: float = 99.0
+    price_zscore_min: float = -5.0
+    price_zscore_max: float = 5.0
 
     # --- Beta vs benchmark, computed per period (v7.0.0) ----------------
     # Sits beside the scraped `finviz_beta` under the Options header. Finviz
@@ -330,8 +330,8 @@ class ScanParams:
     beta_calc_enabled: bool = False
     beta_calc_display_only: bool = False
     beta_calc_lookback: int = 252
-    beta_calc_min: float = -99.0
-    beta_calc_max: float = 99.0
+    beta_calc_min: float = -5.0
+    beta_calc_max: float = 10.0
 
     # --- Finviz snapshot attributes (v7.0.0) ----------------------------
     # 80 range filters held in ONE dict rather than 320 flat dataclass
@@ -2136,11 +2136,21 @@ def _build_filter_stages(params: ScanParams) -> list[tuple[str, Callable]]:
         if _lo is None and _hi is None:
             continue
         _pretty = _fv_labels.get(_name, _name)
+
+        def _num(v):
+            """Readable bound for the funnel log. `%g` renders a two-billion
+            market cap as `2e+09`, which is unreadable in a stage name."""
+            a = abs(v)
+            for cut, suf in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+                if a >= cut:
+                    return f"{v / cut:g}{suf}"
+            return f"{v:g}"
+
         _bits = []
         if _lo is not None:
-            _bits.append(f">= {_lo:g}")
+            _bits.append(f">= {_num(_lo)}")
         if _hi is not None:
-            _bits.append(f"<= {_hi:g}")
+            _bits.append(f"<= {_num(_hi)}")
         stages.append((
             f"{_pretty} {' and '.join(_bits)}",
             _finviz_stage(_name, _lo, _hi),

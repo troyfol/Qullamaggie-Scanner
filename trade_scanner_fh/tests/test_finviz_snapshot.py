@@ -619,3 +619,128 @@ def test_scavenge_is_wired_to_the_earnings_path_not_the_sweep():
     src = inspect.getsource(finviz_fill._fetch_one_ticker)
     assert "last_snapshot()" in src
     assert "queue_row" in src
+
+
+# ----------------------------------------------------------------------
+# Universe lookup — the real method, NOT stubbed
+# ----------------------------------------------------------------------
+#
+# The `win` fixture above replaces `_finviz_universe_symbols`, which is
+# exactly how a NameError in that method reached a shipped build: every
+# cadence test stubbed the one function that was broken. These call the real
+# thing.
+
+def test_universe_symbols_uses_the_cached_frame(qapp):
+    from trade_scanner_fh.gui.main_window import MainWindow
+    w = MainWindow.__new__(MainWindow)
+    w._universe_df = pd.DataFrame({"symbol": [" aapl ", "MSFT", ""]})
+    assert w._finviz_universe_symbols() == ["AAPL", "MSFT"]
+
+
+def test_universe_symbols_falls_back_when_no_cache(qapp, monkeypatch):
+    """No cached frame yet (the due-check can fire before a load) must hit
+    ticker_universe.load_universe, not a name that does not exist."""
+    from trade_scanner_fh.gui import main_window as mw_mod
+    w = mw_mod.MainWindow.__new__(mw_mod.MainWindow)
+    w._universe_df = None
+    monkeypatch.setattr(mw_mod, "load_universe",
+                        lambda: pd.DataFrame({"symbol": ["SPY", "QQQ"]}))
+    assert w._finviz_universe_symbols() == ["SPY", "QQQ"]
+
+
+def test_universe_symbols_never_raises_a_nameerror(qapp, monkeypatch):
+    """The shipped bug: `data_engine.load_universe()` raised NameError, the
+    except swallowed it into [], and the prompt silently bailed on its
+    'no universe' guard. Nothing user-visible said why."""
+    from trade_scanner_fh.gui import main_window as mw_mod
+    w = mw_mod.MainWindow.__new__(mw_mod.MainWindow)
+    w._universe_df = None
+    seen = []
+    monkeypatch.setattr(mw_mod.log, "warning",
+                        lambda *a, **k: seen.append(a))
+    monkeypatch.setattr(mw_mod, "load_universe",
+                        lambda: pd.DataFrame({"symbol": ["X"]}))
+    assert w._finviz_universe_symbols() == ["X"]
+    assert not seen, f"unexpected warning: {seen}"
+
+
+def test_universe_symbols_includes_etfs(qapp):
+    """ETFs have no earnings tab, so the sweep is the ONLY thing that ever
+    fetches their Beta and volatility. They must not be filtered out."""
+    from trade_scanner_fh.gui.main_window import MainWindow
+    w = MainWindow.__new__(MainWindow)
+    w._universe_df = pd.DataFrame({"symbol": ["AAPL", "SPY"],
+                                   "etf": [False, True]})
+    assert "SPY" in w._finviz_universe_symbols()
+
+
+# ----------------------------------------------------------------------
+# Per-field spinbox ranges (v7.0.1)
+# ----------------------------------------------------------------------
+
+def test_every_filterable_field_has_a_kind():
+    """An unmapped field silently falls back to the generic ratio shape,
+    which is wrong for a market cap or a share count."""
+    assert [f for f in fs.FILTERABLE_FIELDS if f not in fs.FIELD_KINDS] == []
+
+
+def test_ranges_are_scaled_to_what_the_field_measures():
+    """The complaint this fixes: every row used to read +/-1e12."""
+    cases = {
+        "short_float_pct": (0.0, 100.0),
+        "insider_own_pct": (0.0, 100.0),
+        "finviz_rsi14": (0.0, 100.0),
+        "recom": (1.0, 5.0),
+        "finviz_beta": (-5.0, 10.0),
+    }
+    for name, (lo, hi) in cases.items():
+        got_lo, got_hi = fs.field_range(name)[0], fs.field_range(name)[1]
+        assert (got_lo, got_hi) == (lo, hi), name
+
+
+def test_money_fields_step_in_meaningful_units():
+    """A 0.01 step on a figure in the billions is unusable."""
+    for name in ("market_cap", "enterprise_value", "income", "sales"):
+        step = fs.field_range(name)[4]
+        assert step >= 1e6, (name, step)
+        assert fs.field_range(name)[5] == 0, "no decimals on dollar figures"
+
+
+def test_open_bound_detection_is_per_field():
+    assert fs.is_open_bound("short_float_pct", 100.0, upper=True) is True
+    assert fs.is_open_bound("short_float_pct", 20.0, upper=True) is False
+    assert fs.is_open_bound("short_float_pct", 0.0, upper=False) is True
+    assert fs.is_open_bound("recom", 1.0, upper=False) is True
+    assert fs.is_open_bound("recom", 2.0, upper=False) is False
+    assert fs.is_open_bound("pe", None, upper=True) is True
+
+
+def test_panel_rows_carry_the_fields_own_scale(qapp):
+    panel = W.IndicatorPanel()
+    for name in fs.FILTERABLE_FIELDS:
+        lo, hi, dlo, dhi, step, dp = fs.field_range(name)
+        sb = panel.rows[f"fv_{name}"].spinboxes["fv_min"]
+        assert sb.minimum() == pytest.approx(lo), name
+        assert sb.maximum() == pytest.approx(hi), name
+        assert sb.singleStep() == pytest.approx(step), name
+        assert sb.decimals() == dp, name
+
+
+def test_defaults_remain_inert_despite_the_new_scales(qapp):
+    """Readable defaults must not become silently FILTERING defaults:
+    enabling a row you have not touched should still cut nothing."""
+    import datetime as dt
+    panel = W.IndicatorPanel()
+    for name in fs.FILTERABLE_FIELDS:
+        panel.rows[f"fv_{name}"].set_enabled(True)
+    p = panel.build_scan_params(dt.date(2025, 1, 1), dt.date(2025, 6, 1))
+    bounded = {k: v for k, v in p.finviz_filters.items()
+               if v["min"] is not None or v["max"] is not None}
+    assert bounded == {}, bounded
+
+
+def test_large_bounds_render_readably_in_the_funnel():
+    p = sc.ScanParams(finviz_filters={
+        "market_cap": {"enabled": True, "min": 2e9, "max": 5e11}})
+    labels = [n for n, _f in sc._build_filter_stages(p)]
+    assert "Market Cap >= 2B and <= 500B" in labels
