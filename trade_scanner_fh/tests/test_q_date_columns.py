@@ -11,6 +11,14 @@ def _row(symbol: str, **extras) -> dict:
         "close": 100.0, "price": 100.0, "pct_gain": 25.0,
     }
     base.update(extras)
+    # v8.0.0: the scanner records which Q-X blocks a streak COUNTED
+    # (`_consec_*_beats_qs`) and the streak colour reads that. A trailing
+    # streak counts Q-1..Q-n, which is what these hand-built rows describe.
+    for _side in ("eps", "rev"):
+        _n = base.get(f"consec_{_side}_beats")
+        if (isinstance(_n, (int, float)) and _n == _n
+                and f"_consec_{_side}_beats_qs" not in base):
+            base[f"_consec_{_side}_beats_qs"] = list(range(1, int(_n) + 1))
     return base
 
 

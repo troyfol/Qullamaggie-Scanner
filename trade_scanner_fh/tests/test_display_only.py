@@ -240,11 +240,13 @@ def test_display_only_checkbox_added_to_filter_rows(panel):
     # Generated finviz rows: assert they match their generator EXACTLY, which
     # is a stronger guard than a hand list - it catches a field added to
     # finviz_snapshot that never reached the panel, and vice versa.
+    # v8.0.0 added the eleven display-only Info rows.
     from trade_scanner_fh import finviz_snapshot as _fvs
     expected_fv = {
         f"fv_{k}" for k in
         [n for n, _l in _fvs.OPTIONS_FIELDS]
         + [n for _g, items in _fvs.FINVIZ_GROUPS for n, _l in items]
+        + [n for n, _l in _fvs.INFO_FIELDS]
     }
     actual_fv = {k for k in actual_supported if k.startswith("fv_")}
     assert actual_fv == expected_fv, (
@@ -726,11 +728,12 @@ def test_populate_per_row_safety_isolates_bad_rows(_qapp):
     orig = table._populate_row
     call_count = {"n": 0}
 
-    def faulty_populate_row(r, row_data, cols):
+    def faulty_populate_row(r, row_data, cols, *styles):
+        # v8.0.0: populate also passes the row's colour-rule styles.
         call_count["n"] += 1
         if r == 1:
             raise RuntimeError("simulated row crash")
-        return orig(r, row_data, cols)
+        return orig(r, row_data, cols, *styles)
 
     table._populate_row = faulty_populate_row
     table.populate(df)

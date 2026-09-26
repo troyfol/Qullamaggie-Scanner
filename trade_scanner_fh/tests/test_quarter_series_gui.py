@@ -284,6 +284,9 @@ def test_span_cell_colours_when_an_indicator_lands_on_either_end(qapp):
     gap_colour = _colour_of(table, row, cols, "max_gap_date")
     span_colour = _colour_of(table, row, cols, "accel_eps_yoy_span")
     assert span_colour == gap_colour
+    # v8.0.0: and it IS a match colour. Without this the equality above
+    # also held with no colouring at all — both cells at the default.
+    assert span_colour in {c.name() for c in W.ResultsTable._ALIGN_PALETTE}
 
     # And on the end date, via the primary candidate.
     row_end = dict(row, max_gap_date=end,

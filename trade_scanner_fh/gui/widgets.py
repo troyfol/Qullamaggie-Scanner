@@ -12,7 +12,7 @@ Contains reusable components that the main window composes:
 from __future__ import annotations
 
 import logging
-import random
+import math
 import re
 from datetime import date, datetime
 from pathlib import Path
@@ -21,7 +21,9 @@ from typing import Optional
 import pandas as pd
 
 from PyQt6.QtCore import QSortFilterProxyModel, Qt, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor, QFont, QStandardItem, QStandardItemModel
+from PyQt6.QtGui import (
+    QColor, QFont, QStandardItem, QStandardItemModel, QValidator,
+)
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QHBoxLayout, QHeaderView, QLabel,
     QMenu, QPushButton, QScrollArea, QSpinBox, QTableView, QTextEdit,
@@ -85,6 +87,98 @@ class QtLogHandler(logging.Handler):
             self._signal.emit(msg)
         except Exception:
             pass
+
+
+# ============================================================================
+# Human-readable large-number spinbox (v8.0.0)
+# ============================================================================
+#
+# Market caps, incomes and share counts run to twelve or thirteen digits. A
+# plain QDoubleSpinBox shows them as `5000000000000`, which does not fit its
+# 100px box and cannot be read at a glance, and a fixed step is either useless
+# at 5T or enormous at 300M. This box shows and accepts K / M / B / T suffixes
+# and steps by roughly a tenth of the current magnitude.
+
+_HUMAN_SUFFIXES: tuple = (("T", 1e12), ("B", 1e9), ("M", 1e6), ("K", 1e3))
+_HUMAN_SCALE: dict = {s: m for s, m in _HUMAN_SUFFIXES}
+_HUMAN_RE = re.compile(r"^([+-]?)(\d*\.?\d*)\s*([KMBT]?)$", re.IGNORECASE)
+
+
+def format_human_number(value: float) -> str:
+    """`2500000000` -> `2.50B`; `-50e9` -> `-50.00B`; `632` -> `632`."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(v):
+        return ""
+    a = abs(v)
+    for suffix, scale in _HUMAN_SUFFIXES:
+        if a >= scale:
+            return f"{v / scale:.2f}{suffix}"
+    return f"{v:.0f}"
+
+
+def parse_human_number(text: str):
+    """`2.5B` / `2,500M` / `2500000000` -> 2.5e9. None when unparseable.
+
+    Case-insensitive, tolerates commas and surrounding space. A bare sign or
+    a lone decimal point is not a number (it is an INTERMEDIATE state while
+    typing — see `HumanDoubleSpinBox.validate`).
+    """
+    t = (text or "").strip().replace(",", "")
+    m = _HUMAN_RE.match(t)
+    if m is None:
+        return None
+    sign, digits, suffix = m.groups()
+    if digits in ("", "."):
+        return None
+    try:
+        v = float(digits)
+    except ValueError:
+        return None
+    v *= _HUMAN_SCALE.get(suffix.upper(), 1.0) if suffix else 1.0
+    return -v if sign == "-" else v
+
+
+class HumanDoubleSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox that reads and writes K / M / B / T suffixes.
+
+    Stepping is relative to the current magnitude (about a tenth of its
+    leading digit) with `singleStep()` as the floor, so arrows move 300M to
+    400M, and 2.5B to 2.6B, rather than by one fixed amount that is wrong at
+    one end of a range spanning five orders of magnitude.
+    """
+
+    def textFromValue(self, value: float) -> str:  # noqa: N802 (Qt API)
+        return format_human_number(value)
+
+    def valueFromText(self, text: str) -> float:  # noqa: N802 (Qt API)
+        v = parse_human_number(text)
+        return self.value() if v is None else v
+
+    def validate(self, text: str, pos: int):  # noqa: D401 (Qt API)
+        t = (text or "").strip().replace(",", "")
+        if t in ("", "+", "-", ".", "+.", "-."):
+            return (QValidator.State.Intermediate, text, pos)
+        if _HUMAN_RE.match(t) is None:
+            return (QValidator.State.Invalid, text, pos)
+        v = parse_human_number(t)
+        if v is None:
+            return (QValidator.State.Intermediate, text, pos)
+        if self.minimum() <= v <= self.maximum():
+            return (QValidator.State.Acceptable, text, pos)
+        # Out of range while typing (e.g. "5" on the way to "50B" against a
+        # negative floor is fine, "9T" past a 5T cap is not yet) — let the
+        # user keep typing; fixup/interpretText clamps on commit.
+        return (QValidator.State.Intermediate, text, pos)
+
+    def stepBy(self, steps: int) -> None:  # noqa: N802 (Qt API)
+        v = self.value()
+        base = max(abs(v), self.singleStep() * 10.0)
+        inc = 10.0 ** (math.floor(math.log10(base)) - 1)
+        inc = max(inc, self.singleStep())
+        self.setValue(v + steps * inc)
 
 
 # ============================================================================
@@ -232,12 +326,18 @@ class IndicatorRow(QWidget):
                 sb.setSingleStep(p.get("step", 1))
                 sb.setValue(p["default"])
             else:
-                sb = QDoubleSpinBox()
+                # `human`: K / M / B / T display + entry for figures in the
+                # billions (v8.0.0). Decimals still set — they govern the
+                # stored value's rounding, the suffix text is display only.
+                sb = HumanDoubleSpinBox() if p.get("human") else QDoubleSpinBox()
                 sb.setMinimum(p.get("min", 0.0))
                 sb.setMaximum(p.get("max", 999999999.0))
                 sb.setSingleStep(p.get("step", 0.01))
                 sb.setDecimals(p.get("decimals", 2))
                 sb.setValue(p["default"])
+                if p.get("human"):
+                    sb.setToolTip(
+                        "Accepts K / M / B / T — e.g. 2.5B, 300M, -50B.")
 
             sb.setFixedWidth(100)
             self.spinboxes[p["name"]] = sb
@@ -419,11 +519,14 @@ def _finviz_range_fields(name: str) -> list[dict]:
     """
     from .. import finviz_snapshot as _fvs
     lo, hi, dlo, dhi, step, dp = _fvs.field_range(name)
+    human = _fvs.is_big_number(name)
     return [
         {"name": "fv_min", "label": "Min", "type": "float",
-         "default": dlo, "min": lo, "max": hi, "step": step, "decimals": dp},
+         "default": dlo, "min": lo, "max": hi, "step": step, "decimals": dp,
+         "human": human},
         {"name": "fv_max", "label": "Max", "type": "float",
-         "default": dhi, "min": lo, "max": hi, "step": step, "decimals": dp},
+         "default": dhi, "min": lo, "max": hi, "step": step, "decimals": dp,
+         "human": human},
     ]
 
 
@@ -432,12 +535,13 @@ def _finviz_scan_params(rows: dict) -> dict:
 
     Only rows the user actually switched on are emitted. An untouched row
     contributes NO key at all, which keeps a preset small and makes
-    `active_finviz_filters()` cheap regardless of how many fields exist.
+    `active_finviz_filters()` cheap regardless of how many fields exist. The
+    emitted keys are also exactly the fields `run_scan` joins, i.e. the FV
+    columns the table shows (v8.0.0).
 
-    The +/-1e12 sentinels become None so the filter treats that side as OPEN.
-    Without this, asking for "Short Float >= 20" would also silently assert
-    "<= 1e12", which is harmless for a percentage and wrong for a market cap
-    the day finviz lists something larger.
+    A bound sitting at its spinbox limit becomes None so the filter treats
+    that side as OPEN. Without this, asking for "Short Float >= 20" would also
+    silently assert "<= 100".
     """
     from .. import finviz_snapshot as _fvs
     out: dict = {}
@@ -475,6 +579,18 @@ def _finviz_scan_params(rows: dict) -> dict:
             "display_only": bool(row.is_display_only()),
             "min": target, "max": target,
         }
+    # Info fields (v8.0.0) have no band to filter on — their row only asks for
+    # the column. Emitted as display-only with open bounds whatever the Filter
+    # toggle says (it is disabled in the panel, but a hand-edited preset could
+    # still set it), so they can never reach `active_finviz_filters()`.
+    for name, _label in _fvs.INFO_FIELDS:
+        row = rows.get(f"fv_{name}")
+        if row is None:
+            continue
+        if not (row.is_enabled() or row.is_display_only()):
+            continue
+        out[name] = {"enabled": False, "display_only": True,
+                     "min": None, "max": None}
     return out
 
 
@@ -1048,15 +1164,26 @@ class IndicatorPanel(QScrollArea):
 
         from .. import finviz_snapshot as _fvs
 
+        # Frequency (v8.0.0) sits BEFORE Lookback on purpose: a preset
+        # restores parameters in this order, and choosing a frequency by hand
+        # resets Lookback to that frequency's natural span (see
+        # `_wire_beta_frequency`) — restoring Lookback second keeps the
+        # preset's own value. Weekly / Monthly use simple period returns,
+        # the convention finviz's 5Y monthly Beta follows.
         self._add("beta_calc", "Beta (calc, vs SPY)", [
+            {"name": "frequency", "label": "Returns", "type": "combo",
+             "default": "daily", "width": 100,
+             "choices": [("daily", "Daily"), ("weekly", "Weekly"),
+                         ("monthly", "Monthly")]},
             {"name": "lookback", "label": "Lookback", "type": "int",
-             "default": 252, "min": 20, "max": 1260},
+             "default": 252, "min": 12, "max": 1260},
             {"name": "min_beta", "label": "Min", "type": "float",
              "default": -5.0, "min": -5.0, "max": 10.0, "step": 0.1},
             {"name": "max_beta", "label": "Max", "type": "float",
              "default": 10.0, "min": -5.0, "max": 10.0, "step": 0.1},
         ])
         self.rows["beta_calc"].set_enabled(False)
+        self._wire_beta_frequency()
 
         for _key, _label in _fvs.OPTIONS_FIELDS:
             if _key in _fvs.BOOL_FIELDS:
@@ -1083,8 +1210,28 @@ class IndicatorPanel(QScrollArea):
                           target=_body)
                 self.rows[f"fv_{_key}"].set_enabled(False)
 
+        # Info (v8.0.0): the eleven parsed fields that are shown but never
+        # filtered — latest-day price/volume figures and the free-text cells.
+        # Display Only is the only meaningful state, so the Filter toggle is
+        # switched off and disabled rather than removed, keeping every row's
+        # two checkboxes in the same columns down the panel.
+        _body = self._collapsible("Info")
+        for _key, _label in _fvs.INFO_FIELDS:
+            self._add(f"fv_{_key}", _label, [], target=_body)
+            _row = self.rows[f"fv_{_key}"]
+            _row.set_enabled(False)
+            _row.toggle.setEnabled(False)
+            _row.toggle.setToolTip(
+                "Info fields are shown, never filtered — use Display Only "
+                "(the red box) to add this column to the results.")
+
         self.vbox.addStretch()
         self.setWidget(container)
+
+        # Every row's built-in state, captured once the panel is complete.
+        # `from_dict` restores it for any row a preset does not mention —
+        # see the note there for why that matters (v8.0.0).
+        self._row_defaults: dict = self.to_dict()
 
     # ── Phase 7 §7.2 grey-out wiring ──────────────────────────────────
 
@@ -1278,6 +1425,37 @@ class IndicatorPanel(QScrollArea):
         lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         lbl.setStyleSheet("color: #4a90d9; margin-top: 8px;")
         self.vbox.addWidget(lbl)
+
+    # Lookback, in periods of the chosen frequency, that a hand-picked
+    # frequency resets to: one year of daily returns, two of weekly, five of
+    # monthly — the last is finviz's own Beta basis.
+    _BETA_FREQ_LOOKBACK = {"daily": 252, "weekly": 104, "monthly": 60}
+
+    def _wire_beta_frequency(self):
+        """Choosing Daily / Weekly / Monthly by hand resets Lookback to that
+        frequency's natural span, so 252 daily periods do not silently become
+        252 months. `activated` fires only on a user's choice, never on a
+        preset restore, so a saved Lookback is left exactly as saved."""
+        row = self.rows["beta_calc"]
+        combo = row.spinboxes["frequency"]
+        tip = ("Beta of the stock's returns against SPY, computed from the "
+               "scan's own prices as of the scan END date.\n"
+               "Daily: log returns (default 252 = 1 year).\n"
+               "Weekly: Friday-close returns (104 = 2 years).\n"
+               "Monthly: month-end returns (60 = 5 years) — the basis of "
+               "finviz's Beta, which this then matches as of the scan date.\n"
+               "Price history starts ~5 years back, so a backdated monthly "
+               "scan uses the months that exist.")
+        combo.setToolTip(tip)
+        row.spinboxes["lookback"].setToolTip(
+            "Number of return periods at the chosen frequency.")
+
+        def _on_activated(_index):
+            freq = combo.currentData()
+            if freq in self._BETA_FREQ_LOOKBACK:
+                row.set_value("lookback", self._BETA_FREQ_LOOKBACK[freq])
+
+        combo.activated.connect(_on_activated)
 
     def _add(self, key: str, label: str, params: list[dict],
              *, display_only_supported: bool = True, target=None):
@@ -1601,6 +1779,7 @@ class IndicatorPanel(QScrollArea):
             beta_calc_enabled=r["beta_calc"].is_enabled(),
             beta_calc_display_only=r["beta_calc"].is_display_only(),
             beta_calc_lookback=int(r["beta_calc"].value("lookback")),
+            beta_calc_frequency=r["beta_calc"].value("frequency") or "daily",
             beta_calc_min=r["beta_calc"].value("min_beta"),
             beta_calc_max=r["beta_calc"].value("max_beta"),
 
@@ -1631,14 +1810,61 @@ class IndicatorPanel(QScrollArea):
             out[key] = entry
         return out
 
-    def from_dict(self, d: dict):
+    def from_dict(self, d: dict, *, preset_version=None):
         """Restore control states from a dict (for preset load).
 
         Legacy-preset migration (surge row): pre-trend-mode presets
         store `use_hl: bool`. If we see one without a `mode` key, map
         it to the equivalent new mode value. Newer presets save `mode`
         directly and the boolean is ignored.
+
+        Legacy-preset migration (finviz rows, v8.0.0): presets stamped
+        before schema 7 were written against the v7 spinbox ranges. A bound
+        they left OPEN (at the old limit) is mapped to the new limit so it
+        stays open; see `finviz_snapshot.migrate_v7_bounds` for why a plain
+        restore would silently turn it into a real filter.
+
+        Opt-in: only a caller that knows the dict came from an old preset
+        FILE passes `preset_version` (MainWindow's preset loader does). The
+        default None means "current", deliberately — a v8 dict run through
+        the migration would have its genuine "Income >= 0" (0.0 is a v7
+        limit) turned back into an open bound, the very bug being fixed.
         """
+        if preset_version is not None and preset_version < 7:
+            from .. import finviz_snapshot as _fvs
+            migrated = {}
+            for name in _fvs.FILTERABLE_FIELDS:
+                entry = d.get(f"fv_{name}")
+                if not isinstance(entry, dict):
+                    continue
+                if "fv_min" not in entry and "fv_max" not in entry:
+                    continue
+                lo, hi = _fvs.migrate_v7_bounds(
+                    name, entry.get("fv_min"), entry.get("fv_max"))
+                new_entry = dict(entry)
+                if lo is not None:
+                    new_entry["fv_min"] = lo
+                if hi is not None:
+                    new_entry["fv_max"] = hi
+                migrated[f"fv_{name}"] = new_entry
+            if migrated:
+                d = {**d, **migrated}
+
+        # Rows the preset does not mention are reset to their built-in
+        # defaults (v8.0.0), not left as the session had them.
+        #
+        # `to_dict` writes EVERY row, so a row absent from a saved preset is
+        # a row that did not exist when the preset was saved — and its only
+        # truthful reading is "off". Leaving it in its session state made a
+        # preset's scan depend on whatever was clicked before loading it:
+        # every preset written before v7.0.0 omits the Beta / volatility /
+        # z-score rows and all 80+ finviz rows, so an "Income >= 0" or
+        # "P/E 5..40" switched on for one scan silently rode along into the
+        # next preset's scan and changed its results.
+        defaults = getattr(self, "_row_defaults", None) or {}
+        missing = {k: v for k, v in defaults.items() if k not in d}
+        if missing:
+            d = {**missing, **d}
         # Surge legacy migration — apply BEFORE the generic loop so the
         # mode value lands in the combo properly.
         surge_entry = d.get("surge")
@@ -1655,6 +1881,16 @@ class IndicatorPanel(QScrollArea):
         for key, entry in d.items():
             if key not in self.rows:
                 continue
+            # A row the preset DOES mention may still predate some of its
+            # settings (Series / Backward Only arrived in v6.3.0, Period Avg /
+            # Max in v6.4.0, Beta's Returns in v8.0.0; `display_only` itself is
+            # missing from the oldest files). Those settings fall back to the
+            # built-in default, the same rule as a missing row — otherwise
+            # the session's value rode along into the preset's scan. Defaults
+            # first, so the preset's own values always win and the restore
+            # order stays the row's declared order.
+            if isinstance(entry, dict) and key in defaults:
+                entry = {**defaults[key], **entry}
             row = self.rows[key]
             row.set_enabled(entry.get("enabled", True))
             for pname, val in entry.items():
@@ -1831,10 +2067,16 @@ RESULT_COLUMNS = [
     # summarise. Both are the metric averaged (or maximised) over exactly the
     # quarters that produced that count — see `earnings_series.window_values`.
     # NaN means "no qualifying window", which the table renders as N/A.
+    # v8.0.0: the growth filters gained the accelerating filters' Span / V
+    # pair, so the run a count describes can be read off the row.
     ("Consec YoY EPS Grw", "consec_eps_growth",  lambda x: str(int(x))),
+    ("Consec YoY EPS Grw Span", "consec_eps_growth_span", str),
+    ("Consec YoY EPS Grw V", "consec_eps_growth_vals", str),
     ("Consec YoY EPS Grw Avg", "consec_eps_growth_period_avg", _fmt_period_pct),
     ("Consec YoY EPS Grw Max", "consec_eps_growth_period_max", _fmt_period_pct),
     ("Consec YoY Rev Grw", "consec_rev_growth",  lambda x: str(int(x))),
+    ("Consec YoY Rev Grw Span", "consec_rev_growth_span", str),
+    ("Consec YoY Rev Grw V", "consec_rev_growth_vals", str),
     ("Consec YoY Rev Grw Avg", "consec_rev_growth_period_avg", _fmt_period_pct),
     ("Consec YoY Rev Grw Max", "consec_rev_growth_period_max", _fmt_period_pct),
     ("Accel EPS Surp Q",  "accel_eps_surp_len",  lambda x: str(int(x))),
@@ -1909,13 +2151,16 @@ def _finviz_result_columns() -> list:
         cols.append((f"FV {label}", key, fmt))
     # Parsed but deliberately not filterable: the stale latest-day values, the
     # per-period duplicates, and the four free-text fields. Still worth
-    # rendering and exporting.
+    # rendering and exporting. Labelled from INFO_FIELDS (v8.0.0) — the same
+    # text the panel's Info rows carry — with the generated title-case form
+    # kept only as a fallback for a field added to the page map later.
     for key in _fvs.COLUMN_ONLY_FIELDS:
         if key in seen:
             continue
         seen.add(key)
         fmt = str if key in _fvs.TEXT_FIELDS else _fmt_fv_num
-        label = key.replace("finviz_", "").replace("_", " ").title()
+        label = _fvs.FIELD_LABELS.get(
+            key, key.replace("finviz_", "").replace("_", " ").title())
         cols.append((f"FV {label}", key, fmt))
     return cols
 
@@ -1935,6 +2180,15 @@ _ACCEL_KEY_TO_PREFIX: dict[str, str] = {
     for p in _ACCEL_COLUMN_PREFIXES
     for suffix in ("len", "span", "vals")
 }
+# v8.0.0: the growth filters' Span / V cells condense a run exactly as the
+# accelerating ones do, so they anchor the same way. The growth COUNT cell is
+# deliberately left out — it never took part in date matching and still
+# does not.
+_ACCEL_KEY_TO_PREFIX.update({
+    f"{p}_{suffix}": p
+    for p in ("consec_eps_growth", "consec_rev_growth")
+    for suffix in ("span", "vals")
+})
 # Period column intentionally absent — the timeframe selector dropdown above
 # the results table now identifies which period is being viewed. Multi-period
 # Excel/CSV exports re-add a `Period` column at write time when needed.
@@ -2003,7 +2257,7 @@ _ACCEL_PREFIXES: tuple[str, ...] = (
 def _series_filter_keys(prefix: str) -> frozenset:
     count_key = f"{prefix}_len" if prefix in _ACCEL_PREFIXES else prefix
     keys = {count_key, f"{prefix}_period_avg", f"{prefix}_period_max"}
-    if prefix in _ACCEL_PREFIXES:
+    if prefix in _ACCEL_PREFIXES or "_growth" in prefix:
         keys |= {f"{prefix}_span", f"{prefix}_vals"}
     return frozenset(keys)
 
@@ -2075,6 +2329,63 @@ def present_earnings_column_types(columns) -> list:
     ]
 
 
+# ── Finviz column CATEGORIES (the "Hide FV Columns" dropdown, v8.0.0) ─────
+#
+# Same idea as the earnings types above, one level coarser: a category is a
+# whole heading of the panel (Options, Valuation, ..., Info), so one tick
+# hides every FV column that heading produced. The partition comes from
+# `finviz_snapshot.COLUMN_GROUPS`, the same structure the panel and the
+# column list are built from, so the three cannot drift apart.
+#
+# Type ids are prefixed `fv_` and the earnings ids are `q_` / `series_`, so
+# both families share ONE hidden-type set on the results table without any
+# chance of an id meaning two things.
+def _fv_column_type_labels() -> tuple:
+    from .. import finviz_snapshot as _fvs
+    return tuple(
+        (f"fv_{gid}", title) for gid, title, _keys in _fvs.COLUMN_GROUPS
+    )
+
+
+FV_COLUMN_TYPES: tuple[tuple[str, str], ...] = _fv_column_type_labels()
+FV_COLUMN_TYPE_LABELS: dict[str, str] = dict(FV_COLUMN_TYPES)
+
+
+def fv_column_type_of(key: str):
+    """The FV category a results column belongs to, or None.
+
+    None for every non-finviz column — including `beta_calc`, which lives
+    under the Options heading in the panel but is computed, not scraped.
+    """
+    from .. import finviz_snapshot as _fvs
+    gid = _fvs.GROUP_OF.get(key)
+    return None if gid is None else f"fv_{gid}"
+
+
+def present_fv_column_types(columns) -> list:
+    """`[(type_id, label, n_columns)]` for the FV categories in `columns`.
+
+    Same contract as `present_earnings_column_types`: pass the layout BEFORE
+    hiding is applied, or a category drops out of the menu the moment it is
+    ticked and can never be un-ticked.
+    """
+    counts: dict[str, int] = {}
+    for _h, key, _f in columns:
+        type_id = fv_column_type_of(key)
+        if type_id is not None:
+            counts[type_id] = counts.get(type_id, 0) + 1
+    return [
+        (tid, FV_COLUMN_TYPE_LABELS[tid], counts[tid])
+        for tid, _label in FV_COLUMN_TYPES
+        if tid in counts
+    ]
+
+
+def column_type_of(key: str):
+    """The hideable type of a column across BOTH families, or None."""
+    return earnings_column_type_of(key) or fv_column_type_of(key)
+
+
 def _format_optional(val, fmt) -> str:
     """Format a possibly-None / NaN cell value, returning '' for missing."""
     if val is None:
@@ -2104,6 +2415,13 @@ _Q_COL_RE = re.compile(r"^q(\d+)_(.+)$")
 _ALWAYS_VISIBLE_KEYS = {
     "symbol", "close", "pct_gain", "gain_start_date",
 }
+
+# The only column the user may NOT hide (v8.0.0). Everything downstream of a
+# row — Send to Watchlist, the HOTKEY sender, row selection, the TXT export —
+# reads the ticker from it. Close / % Gain / Gain Start stay in
+# `_ALWAYS_VISIBLE_KEYS` (they are always LAID OUT, data or not) but became
+# hideable in v8.0.0; before that every one of the four was locked.
+_UNHIDEABLE_KEYS = frozenset({"symbol"})
 
 
 # ── Match-color anchoring (generalized 2026-05) ─────────────────────
@@ -2267,7 +2585,7 @@ def _anchor_date_value(key: str, row_data):
 
 def _build_dynamic_columns(
     df, *, interleave_quarters: bool = False,
-    hidden_types=frozenset(),
+    hidden_types=frozenset(), hidden_keys=frozenset(),
 ) -> tuple[list[tuple], int, int]:
     """Phase 8 §8.3 + 2026-05 update: build the table's column set
     from RESULT_COLUMNS, filtered to only the columns whose key is
@@ -2338,6 +2656,16 @@ def _build_dynamic_columns(
         (h, k, f) for h, k, f in RESULT_COLUMNS
         if k in _ALWAYS_VISIBLE_KEYS or k in df_columns
     ]
+    # The computed Beta names its own basis ("Beta calc 60M"), because the
+    # same key can now hold a daily, weekly or monthly regression and finviz
+    # publishes a 5-year monthly one next to it. The scanner stamps the basis
+    # on every row; one label per frame is all a header can show.
+    if "_beta_calc_basis" in df_columns:
+        basis = next((b for b in df["_beta_calc_basis"]
+                      if isinstance(b, str) and b), None)
+        if basis:
+            cols = [(f"Beta calc {basis}" if k == "beta_calc" else h, k, f)
+                    for h, k, f in cols]
 
     def _eps_block_for_quarter(k: int) -> list[tuple]:
         return [
@@ -2376,6 +2704,11 @@ def _build_dynamic_columns(
         """
         label = "EPS" if side == "eps" else "Rev"
         base = f"consec_{side}_beats"
+        # v8.0.0: the growth filters draw Q-X blocks as well, so a block
+        # no longer implies a beats counter — emitting it unconditionally put
+        # an all-N/A "Consec EPS Beats" column into every growth-only scan.
+        if base not in df_columns:
+            return []
         out: list[tuple] = [
             (f"Consec {label} Beats", base, lambda x: str(int(x))),
         ]
@@ -2439,53 +2772,32 @@ def _build_dynamic_columns(
     # interleave decision, and the underlying frame are all computed from the
     # full data, so hiding a type does exactly one thing. It also leaves every
     # value intact for the export dialog to re-offer.
+    #
+    # `hidden_types` covers both dropdown families (Hide Q Columns and, from
+    # v8.0.0, Hide FV Columns) — their ids never collide.
     if hidden_types:
         cols = [
             (h, k, f) for h, k, f in cols
             if k in _ALWAYS_VISIBLE_KEYS
-            or earnings_column_type_of(k) not in hidden_types
+            or column_type_of(k) not in hidden_types
+        ]
+
+    # Individually hidden columns (header right-click / Columns dialog)
+    # go through the SAME mechanism, after the type filter (v8.0.0).
+    #
+    # Before v8.0.0 they were dropped from `df` by `_apply_view_filters`
+    # instead, which is exactly the trap described above: the Q-i blocks and
+    # the Consec Beats counters are emitted by quarter INDEX, not by presence
+    # in the frame, so a deleted `Q-2 Date` came straight back as an empty
+    # column — and deleting the highest `q{N}_reported_eps` would have
+    # shrunk `n_eps` and taken that quarter's whole block with it.
+    if hidden_keys:
+        cols = [
+            (h, k, f) for h, k, f in cols
+            if k in _UNHIDEABLE_KEYS or k not in hidden_keys
         ]
 
     return cols, n_eps, n_rev
-
-
-def restore_rows_at_positions(df, rows, positions):
-    """F2 undo-delete: reinsert previously-deleted rows at their
-    original positional indices.
-
-    ``rows`` is the snapshot DataFrame of the deleted rows (in original
-    top-to-bottom order) and ``positions`` their 0-based positional
-    indices in the PRE-DELETE frame. Inserting in ascending position
-    order exactly reconstructs the original frame: by the time row p_k
-    is inserted, every original row above it (kept rows + already-
-    restored p_1..p_{k-1}) occupies the first p_k slots again.
-
-    Defensive clamping: positions beyond the current frame length
-    append at the end (covers the frame having shrunk via a later
-    paste/reorder — single-level undo only promises best effort once
-    the frame was mutated again). Pure function — no Qt, no I/O —
-    so it's unit-testable headless.
-    """
-    if rows is None or len(rows) == 0:
-        return df
-    if df is None:
-        df = pd.DataFrame(columns=rows.columns)
-    n = len(rows)
-    pos_list = [int(p) for p in list(positions)[:n]]
-    # Missing positions (shouldn't happen — same-length lists are
-    # snapshotted together) append at the end.
-    while len(pos_list) < n:
-        pos_list.append(len(df) + n)
-    pairs = sorted(zip(pos_list, range(n)), key=lambda t: t[0])
-    new_df = df
-    for pos, ridx in pairs:
-        pos = min(max(pos, 0), len(new_df))
-        piece = rows.iloc[[ridx]]
-        new_df = pd.concat(
-            [new_df.iloc[:pos], piece, new_df.iloc[pos:]],
-            ignore_index=True,
-        )
-    return new_df
 
 
 def _date_to_ordinal(val):
@@ -2499,6 +2811,12 @@ def _date_to_ordinal(val):
         return ts.toordinal()
     except Exception:
         return None
+
+
+# Default for `ResultsTable._populate_row(row_styles=...)`: "no styles were
+# computed for me — evaluate this row on its own". Distinct from None, which
+# populate passes to mean "evaluated, nothing to paint".
+_EVALUATE_ROW = object()
 
 
 class NumericSortProxy(QSortFilterProxyModel):
@@ -2538,15 +2856,19 @@ class ReorderableHeader(QHeaderView):
     # turn that into a list of column keys via the model.
     order_changed = pyqtSignal(list)
 
-    # Emitted when the user picks "Delete column(s)" from the header
-    # right-click menu. Payload is the list of LOGICAL section indices
-    # to remove. Receivers (`ResultsTable`) translate the logical
-    # indices into column keys via `_active_columns` and forward to
-    # MainWindow which tracks deleted keys + re-renders. Always-visible
-    # core columns (symbol/close/pct_gain/gain_start_date) are filtered
-    # out by the menu BEFORE the action is offered, so this signal
-    # never carries them.
-    columns_deletion_requested = pyqtSignal(list)
+    # Emitted when the user picks "Hide column(s)" from the header
+    # right-click menu (v8.0.0; this was "Delete column(s)"). Payload is
+    # the list of LOGICAL section indices. `ResultsTable` translates them
+    # into column keys via `_active_columns`, drops the Ticker column (the
+    # one column that cannot be hidden), and forwards to MainWindow.
+    columns_hide_requested = pyqtSignal(list)
+
+    # Unhide (v8.0.0). Payloads are column KEYS — the entries come from the
+    # unhide provider, not from visible sections, since a hidden column has
+    # no section.
+    columns_unhide_requested = pyqtSignal(list)
+    columns_unhide_all_requested = pyqtSignal()
+    hide_undo_requested = pyqtSignal()
 
     # Column cut+paste — symmetric with the row cut/paste. Cut stashes
     # the selected logical-index list on a single-shot clipboard.
@@ -2590,8 +2912,13 @@ class ReorderableHeader(QHeaderView):
             "Ctrl/Shift+click multiple headers: build a multi-column "
             "selection (selected columns highlight in gold).\n"
             "Drag any selected column to move the whole block at once.\n"
-            "Right-click for Send to Front / End / Reset."
+            "Right-click for Send to Front / End, Hide / Unhide, Reset."
         )
+        # Supplies the "Unhide columns" submenu (v8.0.0). Set by the owning
+        # ResultsTable; returns [(label, key, enabled)]. None = no submenu.
+        self._unhide_provider = None
+        # Returns True while a hide can be undone. None = never.
+        self._undo_available_fn = None
         # Multi-section drag tracking. Qt's built-in `setSectionsMovable`
         # only handles single-section drag; for multi-select drag, we
         # intercept mouse events here. `_block_drag_pending` is True
@@ -2830,6 +3157,46 @@ class ReorderableHeader(QHeaderView):
         order = [self.logicalIndex(v) for v in range(n)]
         self.order_changed.emit(order)
 
+    def _add_unhide_items(self, menu) -> None:
+        """The Unhide columns submenu + Unhide all + Undo hide (v8.0.0).
+
+        Entries come from the provider because a hidden column has no header
+        section to right-click. Disabled entries are columns a Hide Q / Hide
+        FV Columns dropdown suppresses — the dropdown trumps the right-click,
+        so they are shown (so the user can see why) but cannot be unhidden
+        from here.
+        """
+        items = []
+        if self._unhide_provider is not None:
+            try:
+                items = list(self._unhide_provider() or [])
+            except Exception as exc:
+                log.debug("column unhide provider failed: %s", exc)
+        undo = False
+        if self._undo_available_fn is not None:
+            try:
+                undo = bool(self._undo_available_fn())
+            except Exception:
+                undo = False
+        if not items and not undo:
+            return
+        menu.addSeparator()
+        if items:
+            sub = menu.addMenu(f"Unhide columns ({len(items)})")
+            for label, key, enabled in items:
+                act = sub.addAction(label)
+                act.setEnabled(bool(enabled))
+                act.triggered.connect(
+                    lambda _c=False, k=key: self.columns_unhide_requested.emit([k])
+                )
+            n_ok = sum(1 for _l, _k, e in items if e)
+            a_all = menu.addAction(f"Unhide all columns ({n_ok})")
+            a_all.setEnabled(n_ok > 0)
+            a_all.triggered.connect(self.columns_unhide_all_requested.emit)
+        if undo:
+            a_undo = menu.addAction("Undo hide\tCtrl+Z")
+            a_undo.triggered.connect(self.hide_undo_requested.emit)
+
     @pyqtSlot('QPoint')
     def _on_context_menu(self, point):
         logical_under_cursor = self.logicalIndexAt(point)
@@ -2840,6 +3207,12 @@ class ReorderableHeader(QHeaderView):
         elif logical_under_cursor >= 0:
             targets = [logical_under_cursor]
         else:
+            # Empty header area (right of the last column): still offer
+            # unhide, which is the one action that needs no target.
+            menu = QMenu(self)
+            self._add_unhide_items(menu)
+            if not menu.isEmpty():
+                menu.exec(self.mapToGlobal(point))
             return
 
         menu = QMenu(self)
@@ -2868,12 +3241,13 @@ class ReorderableHeader(QHeaderView):
                 f"Paste {n_cut} column{'s' if n_cut > 1 else ''} after this"
             )
         menu.addSeparator()
-        # Delete column(s) — receiver decides whether targets include
-        # always-visible core columns and trims them. Single signal
-        # round-trip; no header-side knowledge of `_ALWAYS_VISIBLE_KEYS`.
+        # Hide column(s) (v8.0.0 — replaced Delete). The receiver drops the
+        # Ticker column if it is among the targets; no header-side knowledge
+        # of which column that is.
         a_delete = menu.addAction(
-            f"Delete {n_targets} column{'s' if n_targets > 1 else ''}"
+            f"Hide {n_targets} column{'s' if n_targets > 1 else ''}"
         )
+        self._add_unhide_items(menu)
         menu.addSeparator()
         a_reset = menu.addAction("Reset to Default (order + visibility)")
         a_clear = menu.addAction("Clear Multi-Select")
@@ -2892,9 +3266,10 @@ class ReorderableHeader(QHeaderView):
             self.reset_to_default_requested.emit()
             return
         if chosen is a_delete:
-            # Deleting cut columns invalidates the clipboard.
+            # Hiding changes the section set, which invalidates the logical
+            # indices a pending column cut holds.
             self._cut_columns_clipboard = []
-            self.columns_deletion_requested.emit(list(targets))
+            self.columns_hide_requested.emit(list(targets))
             self.clear_selection()
             return
         if chosen is a_cut:
@@ -3006,14 +3381,15 @@ class ResultsTable(QTableView):
     # switches and Excel exports.
     column_order_changed = pyqtSignal(list)
 
-    # Emitted when the user requests deletion of selected rows (via
-    # Delete key or right-click → "Delete selected row(s)"). Payload is
-    # the list of symbols to remove from the underlying scan results
-    # for the current period. MainWindow's slot mutates
-    # `_period_results` and re-renders so the deletion persists across
-    # view-filter toggles, sort changes, and tab switches. Reset on
-    # next scan.
-    rows_deletion_requested = pyqtSignal(list)
+    # Emitted when the user hides the selected rows (Delete key or
+    # right-click → "Hide row(s)"). v8.0.0 — this was a hard delete from the
+    # active period. Payload is the list of symbols; MainWindow adds them to
+    # its hidden-row set, which applies to EVERY period, survives new scans
+    # and is saved with presets. Nothing is removed from the scan results.
+    rows_hide_requested = pyqtSignal(list)
+    # Unhide (v8.0.0): specific symbols from the submenu, or everything.
+    rows_unhide_requested = pyqtSignal(list)
+    rows_unhide_all_requested = pyqtSignal()
 
     # Cut+paste row-reorder. Cut just stashes selected symbols on the
     # clipboard (no display change). Paste targets a row and asks the
@@ -3027,23 +3403,21 @@ class ResultsTable(QTableView):
     # the move persists across re-renders.
     rows_paste_requested = pyqtSignal(list, str)
 
-    # F2 undo-delete. Emitted on Ctrl+Z (table focused) or the
-    # context-menu "Undo delete" action. MainWindow owns the actual
-    # snapshot (rows + original positions captured at delete time) and
-    # restores it into `_period_results`; the table only tracks WHETHER
-    # an undo is available (via set_undo_available) so the context menu
-    # can show/hide the action without reaching into window state.
-    # Single-level: a new delete overwrites the snapshot; a new scan
-    # clears it.
-    undo_delete_requested = pyqtSignal()
+    # Undo the most recent hide (v8.0.0; was F2 undo-delete). Emitted on
+    # Ctrl+Z (table focused) or the "Undo hide" menu action. MainWindow owns
+    # the undo stack; the table only tracks WHETHER an undo is available (via
+    # set_hide_undo_available) so the menus can show the action.
+    hide_undo_requested = pyqtSignal()
 
-    # Emitted when the user requests deletion of one or more columns
-    # via the header right-click menu. Payload is the list of column
-    # KEYS (already filtered to exclude always-visible core columns).
-    # MainWindow tracks the deleted keys in a per-active-period set
-    # and excludes them from rendering on every re-populate. Reset on
-    # next scan.
-    columns_deletion_requested = pyqtSignal(list)
+    # Emitted when the user hides one or more columns via the header
+    # right-click menu. Payload is the list of column KEYS, with the Ticker
+    # column already filtered out. MainWindow keeps them in
+    # `_deleted_column_keys` (one set for every period, kept across scans,
+    # saved with presets) and hands them back via `set_hidden_column_keys`
+    # before each populate, which removes them from the column LAYOUT.
+    columns_hide_requested = pyqtSignal(list)
+    columns_unhide_requested = pyqtSignal(list)
+    columns_unhide_all_requested = pyqtSignal()
 
     # Forwarded straight from ReorderableHeader. Full-reset semantics —
     # MainWindow clears both `_results_column_order` and
@@ -3065,12 +3439,29 @@ class ResultsTable(QTableView):
         self._reorderable_header = ReorderableHeader(self)
         self.setHorizontalHeader(self._reorderable_header)
         self._reorderable_header.order_changed.connect(self._on_header_reordered)
-        self._reorderable_header.columns_deletion_requested.connect(
-            self._on_header_columns_deletion_requested
+        self._reorderable_header.columns_hide_requested.connect(
+            self._on_header_columns_hide_requested
         )
         self._reorderable_header.reset_to_default_requested.connect(
             self.columns_reset_requested
         )
+        # Header unhide actions carry keys already; forward unchanged.
+        self._reorderable_header.columns_unhide_requested.connect(
+            self.columns_unhide_requested
+        )
+        self._reorderable_header.columns_unhide_all_requested.connect(
+            self.columns_unhide_all_requested
+        )
+        self._reorderable_header.hide_undo_requested.connect(
+            self.hide_undo_requested
+        )
+        self._reorderable_header._undo_available_fn = (
+            lambda: self._hide_undo_available
+        )
+        # Supplies the body menu's "Unhide rows" submenu (v8.0.0); set by
+        # MainWindow via `set_unhide_providers`. Returns [(label, symbol,
+        # enabled)].
+        self._row_unhide_provider = None
         self.verticalHeader().setDefaultSectionSize(24)
         # Re-entrancy guard for populate(). The chunked-render loop
         # yields to QApplication.processEvents() every 200 rows so
@@ -3124,6 +3515,13 @@ class ResultsTable(QTableView):
         # default so a table that is never told otherwise behaves exactly as
         # it did before the Hide Q Columns control existed.
         self._hidden_column_types: frozenset = frozenset()
+        # Individually hidden column KEYS (v8.0.0). Applied to the layout,
+        # never to the frame — see the foot of `_build_dynamic_columns`.
+        self._hidden_column_keys: frozenset = frozenset()
+        # Colour rules (v8.0.0). A table nobody configures paints the
+        # pre-v8 schemes, because the defaults ARE those schemes.
+        from . import coloring as _coloring
+        self._color_rules: list = _coloring.default_rules()
 
         # Delete-rows wiring: enable the multi-select + custom context
         # menu so the user can right-click → "Delete selected row(s)".
@@ -3139,14 +3537,23 @@ class ResultsTable(QTableView):
         # with a different df).
         self._cut_clipboard: list[str] = []
 
-        # F2 undo-delete availability flag. MainWindow flips it on
-        # after a row delete and off after an undo / a fresh scan.
-        # Drives whether the context menu offers "Undo delete" and
-        # whether Ctrl+Z emits the request (passes through to the
-        # default handler otherwise).
-        self._undo_available: bool = False
+        # Whether MainWindow's hide undo stack is non-empty (v8.0.0). Drives
+        # whether the menus offer "Undo hide" and whether Ctrl+Z emits the
+        # request (it passes through to the default handler otherwise).
+        self._hide_undo_available: bool = False
 
-    # ── Delete-rows: collect symbols + emit the request signal ───────
+    def set_unhide_providers(self, rows=None, columns=None) -> None:
+        """Wire the callables that fill the two Unhide submenus (v8.0.0).
+
+        Each returns `[(label, key, enabled)]`. The table cannot compute
+        these itself: hidden rows are not in the model and hidden columns
+        have no header section, and whether a column is suppressed by a
+        type dropdown is MainWindow state.
+        """
+        self._row_unhide_provider = rows
+        self._reorderable_header._unhide_provider = columns
+
+    # ── Hide rows: collect symbols + emit the request signal ─────────
 
     def _selected_symbols(self) -> list[str]:
         """Return the symbols (in the underlying df 'symbol' column) for
@@ -3198,12 +3605,22 @@ class ResultsTable(QTableView):
             return ""
         return item.text().strip()
 
+    def _row_unhide_items(self) -> list:
+        if self._row_unhide_provider is None:
+            return []
+        try:
+            return list(self._row_unhide_provider() or [])
+        except Exception as exc:
+            log.debug("row unhide provider failed: %s", exc)
+            return []
+
     def _show_row_context_menu(self, pos):
         """Right-click context menu on the table body. Offers:
           - Cut N selected row(s): stash on clipboard for later paste.
           - Paste N row(s) after this row: only when clipboard is
             non-empty AND the target row isn't itself in the clipboard.
-          - Delete N selected row(s): hard-delete from active period.
+          - Hide N selected row(s) (v8.0.0 — was a hard delete).
+          - Unhide rows ▸ / Unhide all rows / Undo hide.
 
         Cut + Paste together let the user reorder rows without changing
         scan output — the MainWindow paste handler mutates
@@ -3214,12 +3631,11 @@ class ResultsTable(QTableView):
         selected = self._selected_symbols()
         target = self._symbol_at_viewport_pos(pos)
         clipboard = list(self._cut_clipboard)
+        unhide = self._row_unhide_items()
 
-        # No menu when there's nothing useful to offer:
-        # - no selection AND no clipboard AND no target row (clicked
-        #   on empty space) AND no pending undo → bail.
+        # No menu when there's nothing useful to offer.
         if (not selected and not clipboard and not target
-                and not self._undo_available):
+                and not self._hide_undo_available and not unhide):
             return
 
         menu = QMenu(self)
@@ -3251,22 +3667,36 @@ class ResultsTable(QTableView):
         if selected:
             menu.addSeparator()
             n = len(selected)
-            del_label = (
-                f"Delete {n} selected rows" if n > 1
-                else f"Delete row '{selected[0]}'"
+            hide_label = (
+                f"Hide {n} selected rows\tDel" if n > 1
+                else f"Hide row '{selected[0]}'\tDel"
             )
-            del_act = menu.addAction(del_label)
-            del_act.triggered.connect(
-                lambda: self.rows_deletion_requested.emit(selected)
+            hide_act = menu.addAction(hide_label)
+            hide_act.triggered.connect(
+                lambda: self.rows_hide_requested.emit(selected)
             )
 
-        # F2 undo-delete: offered only while a snapshot is pending
-        # (single level — flag is cleared by MainWindow after the
-        # restore or on a fresh scan). Ctrl+Z is the keyboard twin.
-        if self._undo_available:
+        # Unhide (v8.0.0). The submenu opens on hover, as QMenu submenus do.
+        # A hidden ticker that would stay invisible if unhidden (not in this
+        # period, or removed by a view filter) is still listed — labelled so
+        # the reason is clear, and enabled so it can be cleared.
+        if unhide:
             menu.addSeparator()
-            undo_act = menu.addAction("Undo delete\tCtrl+Z")
-            undo_act.triggered.connect(self.undo_delete_requested.emit)
+            sub = menu.addMenu(f"Unhide rows ({len(unhide)})")
+            for label, sym, enabled in unhide:
+                act = sub.addAction(label)
+                act.setEnabled(bool(enabled))
+                act.triggered.connect(
+                    lambda _c=False, s=sym: self.rows_unhide_requested.emit([s])
+                )
+            a_all = menu.addAction(f"Unhide all rows ({len(unhide)})")
+            a_all.triggered.connect(self.rows_unhide_all_requested.emit)
+
+        if self._hide_undo_available:
+            if not unhide:
+                menu.addSeparator()
+            undo_act = menu.addAction("Undo hide\tCtrl+Z")
+            undo_act.triggered.connect(self.hide_undo_requested.emit)
 
         if menu.isEmpty():
             return
@@ -3283,19 +3713,16 @@ class ResultsTable(QTableView):
 
     def clear_cut_clipboard(self) -> None:
         """Clear the cut clipboard. Called by MainWindow after a paste,
-        a delete, or on every fresh scan populate."""
+        a hide, or on every fresh scan populate."""
         self._cut_clipboard = []
 
-    def set_undo_available(self, available: bool) -> None:
-        """F2 undo-delete: MainWindow flips this after a row delete
-        (True) and after an undo / fresh scan (False). Public for
-        tests."""
-        self._undo_available = bool(available)
+    def set_hide_undo_available(self, available: bool) -> None:
+        """MainWindow keeps this equal to "the hide undo stack is not
+        empty". Public for tests."""
+        self._hide_undo_available = bool(available)
 
-    def undo_available(self) -> bool:
-        """Whether a deleted-row snapshot is pending. Public for
-        tests."""
-        return self._undo_available
+    def hide_undo_available(self) -> bool:
+        return self._hide_undo_available
 
     def _fire_paste(self, cut_symbols: list[str], target: str) -> None:
         """Emit the paste signal. The MainWindow handler does the
@@ -3306,24 +3733,22 @@ class ResultsTable(QTableView):
         self.rows_paste_requested.emit(cut_symbols, target)
 
     def keyPressEvent(self, event):
-        """Delete key on a selected row → emit deletion request.
-        Ctrl+Z with a pending undo snapshot → emit undo request
-        (F2 undo-delete; scoped to the table like the Delete key so
-        it never steals Ctrl+Z from text-edit widgets elsewhere in
-        the window). Falls through to the default handler for
-        everything else so sort hotkeys / arrow navigation still
-        work."""
+        """Delete / Backspace on selected rows → hide them (v8.0.0; this was
+        a hard delete). Ctrl+Z while a hide can be undone → unhide the last
+        batch. Both are scoped to the table so Ctrl+Z is never stolen from
+        text fields elsewhere in the window; everything else falls through
+        so sort hotkeys and arrow navigation still work."""
         from PyQt6.QtCore import Qt as _Qt
         if event.key() in (_Qt.Key.Key_Delete, _Qt.Key.Key_Backspace):
             symbols = self._selected_symbols()
             if symbols:
-                self.rows_deletion_requested.emit(symbols)
+                self.rows_hide_requested.emit(symbols)
                 event.accept()
                 return
         if (event.key() == _Qt.Key.Key_Z
                 and event.modifiers() & _Qt.KeyboardModifier.ControlModifier
-                and self._undo_available):
-            self.undo_delete_requested.emit()
+                and self._hide_undo_available):
+            self.hide_undo_requested.emit()
             event.accept()
             return
         super().keyPressEvent(event)
@@ -3402,6 +3827,46 @@ class ResultsTable(QTableView):
     def hidden_column_types(self) -> frozenset:
         return self._hidden_column_types
 
+    def set_hidden_column_keys(self, keys) -> None:
+        """Set which individual column keys the next populate omits.
+
+        Same contract as `set_hidden_column_types`: flips state and drops the
+        width cache; the caller drives the re-render.
+        """
+        new = frozenset(keys or ())
+        if self._hidden_column_keys == new:
+            return
+        self._hidden_column_keys = new
+        self._cached_column_widths = {}
+
+    @property
+    def hidden_column_keys(self) -> frozenset:
+        return self._hidden_column_keys
+
+    def set_color_rules(self, rules) -> None:
+        """Replace the colour rules the next populate paints with. Same
+        contract as the other setters: the caller drives the re-render."""
+        self._color_rules = [r.copy() for r in rules or []]
+
+    @property
+    def color_rules(self) -> list:
+        return [r.copy() for r in self._color_rules]
+
+    def columns_before_key_hiding(self, df) -> list:
+        """The layout with type-hiding applied but individual hides NOT.
+
+        What the Columns dialog lists: a column the user unticked must stay
+        in that list (unticked) or it can never be ticked back — the bug the
+        dialog had before v8.0.0, when it listed the live layout. A column a
+        TYPE dropdown suppresses is left out, as before; the dropdown is the
+        control for it.
+        """
+        cols, _n_eps, _n_rev = _build_dynamic_columns(
+            df, interleave_quarters=self._interleave_quarters,
+            hidden_types=self._hidden_column_types,
+        )
+        return cols
+
     def unfiltered_columns_for(self, df) -> list:
         """The layout this frame WOULD produce with nothing type-hidden.
 
@@ -3457,22 +3922,20 @@ class ResultsTable(QTableView):
         self.column_order_changed.emit(keys)
 
     @pyqtSlot(list)
-    def _on_header_columns_deletion_requested(self, logical_indices: list):
-        """Translate the header's logical-index payload into column
-        keys, filter out the always-visible core columns (symbol,
-        close, pct_gain, gain_start_date — deleting these would break
-        export and core display invariants), and forward to
-        MainWindow via the public signal."""
+    def _on_header_columns_hide_requested(self, logical_indices: list):
+        """Translate the header's logical-index payload into column keys,
+        drop the Ticker column (the one column that cannot be hidden — see
+        `_UNHIDEABLE_KEYS`), and forward to MainWindow."""
         keys: list[str] = []
         for li in logical_indices:
             if 0 <= li < len(self._active_columns):
                 key = self._active_columns[li][1]
-                if key in _ALWAYS_VISIBLE_KEYS:
+                if key in _UNHIDEABLE_KEYS:
                     continue
                 if key not in keys:
                     keys.append(key)
         if keys:
-            self.columns_deletion_requested.emit(keys)
+            self.columns_hide_requested.emit(keys)
 
     def populate(self, df):
         """Fill table from a scan results DataFrame.
@@ -3542,6 +4005,7 @@ class ResultsTable(QTableView):
             cols, n_eps, n_rev = _build_dynamic_columns(
                 df, interleave_quarters=self._interleave_quarters,
                 hidden_types=self._hidden_column_types,
+                hidden_keys=self._hidden_column_keys,
             )
             self._active_columns = cols
             self._active_n_eps_quarters = n_eps
@@ -3580,11 +4044,24 @@ class ResultsTable(QTableView):
             except Exception as exc:
                 log.warning("row pre-extract failed (%s) — using iloc", exc)
                 records = None
+            # Colour rules (v8.0.0): evaluated once for the whole frame,
+            # vectorised where the rule allows, then applied per row. A
+            # failure here costs the render its colours, never its rows.
+            styles = None
+            try:
+                from . import coloring as _coloring
+                styles = _coloring.evaluate(
+                    df, self._color_rules, [c[1] for c in cols],
+                    records=records,
+                )
+            except Exception as exc:
+                log.warning("colour rules skipped for this render: %s", exc,
+                            exc_info=True)
             for r in range(n):
                 try:
                     self._populate_row(
                         r, records[r] if records is not None else df.iloc[r],
-                        cols,
+                        cols, styles[r] if styles else None,
                     )
                 except Exception as exc:
                     # Per-row safety net: a single bad row MUST NOT
@@ -3641,102 +4118,28 @@ class ResultsTable(QTableView):
                 self.columnWidth(i) for i in range(len(cols))
             ]
 
-    def _populate_row(self, r: int, row_data, cols):
+    def _populate_row(self, r: int, row_data, cols, row_styles=_EVALUATE_ROW):
         """Render a single result row into the model. Extracted from
         `populate()` so each row can be wrapped in its own try/except
         without polluting the bulk-insert loop. Operates only on the
         current model — no signal emissions, no I/O — so it's cheap
-        to call per-row even at 15k rows."""
-        # Per-row streak counts drive the green-text decision.
-        # NaN-safe coerce: when consec-beats display-only is on
-        # but the ticker has no Zacks history, pandas writes NaN
-        # into the column. `int(nan or 0)` raises ValueError
-        # because Python evaluates `bool(nan) is True`, so
-        # `nan or 0` returns nan rather than 0. The dedicated
-        # helper preserves the "missing data → 0 streak" intent
-        # and prevents one untested ticker from crashing the
-        # entire populate loop (which on the main thread would
-        # take down the GUI).
-        eps_streak = _safe_streak(row_data.get("consec_eps_beats"))
-        rev_streak = _safe_streak(row_data.get("consec_rev_beats"))
+        to call per-row even at 15k rows.
 
-        # Display-only fail flags from the scanner. Keys are column
-        # names; True means "would have failed the filter currently
-        # in display-only mode." Empty / None means no display-only
-        # filters apply to this row.
-        fail_flags = row_data.get("_display_only_fails")
-        if not isinstance(fail_flags, dict):
-            fail_flags = {}
+        Colours (v8.0.0) come from `row_styles`, the colour-rule engine's
+        verdict for this row (gui/coloring.py). The three schemes that used
+        to be hard-coded here — beats-streak green, display-only fail red,
+        and the earnings date-match palette — are now `default_rules()`,
+        which reproduce them cell for cell (a differential test holds the
+        engine to the pre-v8 logic).
 
-        # Per-row earnings-aligned date map drives the multi-color
-        # highlight. Each unique (ticker, date) pair seeds its own
-        # pseudo-random palette pick; the within-row loop linear-probes
-        # forward through the palette to avoid collisions when two
-        # seeds happen to land on the same index.
-        aligned_iso = row_data.get("_earnings_aligned_dates")
-        # Fuzzy match support: when set, this dict maps any matched
-        # date (indicator OR report) to a CANONICAL iso (always the
-        # report date). The color map is then keyed by canonical iso
-        # so paired-but-not-identical dates share one color. Absent
-        # for exact-only match results — falls back to the legacy
-        # one-color-per-iso behavior.
-        canon_map = row_data.get("_earnings_aligned_canon")
-        if not isinstance(canon_map, dict):
-            canon_map = None
-        aligned_color_map = {}
-        if isinstance(aligned_iso, list) and aligned_iso:
-            # Seed colors off canonical isos when present (one color
-            # per match group), else off the raw iso list (legacy).
-            seed_isos = (
-                sorted(set(canon_map.values()))
-                if canon_map else sorted(set(aligned_iso))
-            )
-            # Earnings-anchor gate: a color group must include at least
-            # one earnings-source cell anchoring to the canonical iso.
-            # Without this gate, pairs of non-earnings indicator dates
-            # (e.g. gap_date + surge_date) that both land near the same
-            # earnings event would share a color even with no visible
-            # earnings cell — a false visual pairing the user can't
-            # interpret. Walk the rendered cols once to collect the set
-            # of canonical isos that have an earnings cell on this row.
-            earnings_anchored_isos: set[str] = set()
-            for _h, _k, _f in cols:
-                if not _is_earnings_anchor_key(_k):
-                    continue
-                # Candidates, not a single anchor: an accelerating
-                # series' span cell can pair on either end of the
-                # series, so both of its report dates count toward the
-                # earnings-anchor gate.
-                for anchor_v in _anchor_date_candidates(_k, row_data):
-                    try:
-                        _ts = pd.Timestamp(anchor_v)
-                        if pd.isna(_ts):
-                            continue
-                    except (TypeError, ValueError):
-                        continue
-                    _v_iso = _ts.normalize().date().isoformat()
-                    _lookup = (
-                        canon_map.get(_v_iso, _v_iso) if canon_map else _v_iso
-                    )
-                    earnings_anchored_isos.add(_lookup)
-            seed_isos = [
-                iso for iso in seed_isos if iso in earnings_anchored_isos
-            ]
-
-            palette_n = len(self._ALIGN_PALETTE)
-            used: set[int] = set()
-            symbol = row_data.get("symbol", "")
-            for iso in seed_isos:
-                seed = f"{symbol}|{iso}"
-                base = random.Random(seed).randrange(palette_n)
-                idx = base
-                for _ in range(palette_n):
-                    if idx not in used:
-                        break
-                    idx = (idx + 1) % palette_n
-                used.add(idx)
-                aligned_color_map[iso] = self._ALIGN_PALETTE[idx]
-
+        `populate()` evaluates the rules for the whole frame and passes each
+        row's result (None = nothing to paint). A caller rendering one row
+        on its own omits the argument and the row is evaluated alone —
+        correct for every rule except a top/bottom-percent rank, which
+        needs the whole period and so only means something via populate.
+        """
+        if row_styles is _EVALUATE_ROW:
+            row_styles = self._styles_for_lone_row(row_data, cols)
         for c, (header, key, fmt) in enumerate(cols):
             val = row_data.get(key)
             item = QStandardItem()
@@ -3754,84 +4157,32 @@ class ResultsTable(QTableView):
                 item.setText("N/A")
                 item.setData(None, Qt.ItemDataRole.UserRole)
 
-            # Phase 8 §8.3: green-text the streak cells (Q-1..
-            # Q-{streak}) so the user can see exactly where the
-            # streak breaks. Audit L6: explicit suffix-based metric
-            # detection — substring `"rev" in key` would silently
-            # misclassify a future column rename. The Q-i Date column
-            # uses `report_date_eps` / `report_date_rev` suffixes so
-            # each block colors its own date independently.
-            qm = _Q_COL_RE.match(key)
-            if qm is not None:
-                q_num = int(qm.group(1))
-                suffix = qm.group(2)
-                is_rev = (
-                    suffix.endswith("_rev")
-                    or suffix.startswith("reported_rev")
-                    or suffix.startswith("surprise_rev")
-                    or suffix.startswith("yoy_rev")
-                    or suffix == "report_date_rev"
-                )
-                is_eps = (
-                    suffix.endswith("_eps")
-                    or suffix.startswith("reported_eps")
-                    or suffix.startswith("surprise_eps")
-                    or suffix.startswith("yoy_eps")
-                    or suffix == "report_date_eps"
-                )
-                if is_rev and q_num <= rev_streak:
-                    item.setForeground(self._STREAK_GREEN)
-                elif is_eps and q_num <= eps_streak:
-                    item.setForeground(self._STREAK_GREEN)
-
-            # Display-only red-on-fail: paint values that would have
-            # been filtered out in red. Runs AFTER streak-green so a
-            # Q-i cell that broke the streak AND fails the threshold
-            # ends up red (the more specific signal). Date columns
-            # don't have thresholds, so they never receive fail flags.
-            if fail_flags.get(key) is True:
-                item.setForeground(self._FAIL_RED)
-
-            # Earnings-alignment color (generalized 2026-05): every
-            # cell has an "anchor date" (see `_anchor_date_value`).
-            # If that anchor matches one of the row's
-            # aligned_color_map entries, the cell gets the matching
-            # palette color. This means the entire "unit" — gap value
-            # + gap date, or a Q-i triplet of date / reported / surp $
-            # / surp % — shares a color when the unit's date is part
-            # of an alignment match. Runs AFTER streak-green and
-            # red-on-fail so the alignment color wins on conflict
-            # (date-pair signal is more specific than the others).
-            if aligned_color_map:
-                # Candidates in priority order: the first one that has a
-                # color wins. Single-anchor columns yield exactly one, so
-                # this is the previous behavior for every column except
-                # an accelerating series' three cells, which may pair on
-                # either end of the series' report-date span.
-                for anchor_val in _anchor_date_candidates(key, row_data):
-                    try:
-                        ts = pd.Timestamp(anchor_val)
-                        if pd.isna(ts):
-                            continue
-                        v_iso = ts.normalize().date().isoformat()
-                        # When a canonical map is present, route
-                        # the cell's iso through it so paired-
-                        # but-not-identical dates land on the
-                        # same color entry. No-op for exact-only
-                        # match results (legacy behavior).
-                        lookup_iso = (
-                            canon_map.get(v_iso, v_iso)
-                            if canon_map else v_iso
-                        )
-                        color = aligned_color_map.get(lookup_iso)
-                        if color is not None:
-                            item.setForeground(color)
-                            break
-                    except Exception:
-                        continue
+            if row_styles is not None:
+                text, background, bold = row_styles.resolve(key)
+                if text is not None:
+                    item.setForeground(QColor(text))
+                if background is not None:
+                    item.setBackground(QColor(background))
+                if bold:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
 
             item.setEditable(False)
             self.model_src.setItem(r, c, item)
+
+    def _styles_for_lone_row(self, row_data, cols):
+        try:
+            from . import coloring as _coloring
+            rec = dict(row_data)
+            styles = _coloring.evaluate(
+                pd.DataFrame([rec]), self._color_rules,
+                [c[1] for c in cols], records=[rec],
+            )
+            return styles[0] if styles else None
+        except Exception as exc:
+            log.warning("colour rules skipped for a single row: %s", exc)
+            return None
 
     def get_symbols(self) -> list[str]:
         """Return ticker symbols in current sort order (via proxy model)."""

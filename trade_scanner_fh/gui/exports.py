@@ -30,7 +30,6 @@ import csv
 import logging
 import re
 from datetime import datetime
-from functools import lru_cache
 from typing import Optional
 
 import pandas as pd
@@ -82,6 +81,43 @@ def _neutralize_formulas(df: "pd.DataFrame") -> "pd.DataFrame":
         if df[col].dtype == object:
             df[col] = [_neutralize_formula(v) for v in df[col]]
     return df
+
+
+_Q_SIDE_RE = re.compile(r"^q\d+_.+_(eps|rev)$")
+
+
+def _unique_export_headers(pairs: list) -> list:
+    """Make every `(header, key)` header unique, renaming only the clashes.
+
+    The results table shows the EPS and the Rev block's date columns both as
+    "Q-k Date" — harmless on screen, fatal in an export built by header. Every
+    export used to key its frame by header text, so the Rev date overwrote the
+    EPS date and one column per quarter vanished; each later column shifted
+    left while the colour pass, which places by position, still counted the
+    lost one — so from v8.0.0 every colour after the first clash landed one
+    cell over. A clashing Q-X column gains its side ("Q-1 Date (EPS)" /
+    "Q-1 Date (Rev)"); anything else that still clashes gains its key. A
+    header that was already unique is left exactly as it was.
+    """
+    counts: dict = {}
+    for header, _key in pairs:
+        counts[header] = counts.get(header, 0) + 1
+    out, used = [], set()
+    for header, key in pairs:
+        name = header
+        if counts[header] > 1:
+            m = _Q_SIDE_RE.match(key or "")
+            if m:
+                name = f"{header} ({'EPS' if m.group(1) == 'eps' else 'Rev'})"
+            else:
+                name = f"{header} [{key}]"
+        base, n = name, 2
+        while name in used:
+            name = f"{base} ({n})"
+            n += 1
+        used.add(name)
+        out.append((name, key))
+    return out
 
 
 class ExportsController:
@@ -145,16 +181,20 @@ class ExportsController:
             k: (h, f) for h, k, f in layout
         }
 
-        out_cols: list[tuple[str, Optional[str]]] = []
+        data_cols: list[tuple[str, str]] = []
         if prepend_period is not None:
-            out_cols.append(("Period", "_period_synthetic"))
+            data_cols.append(("Period", "_period_synthetic"))
         for key in keys:
             entry = by_key.get(key)
             if entry is None:
                 continue
-            header, fmt_func = entry
+            data_cols.append((entry[0], key))
+        # Unique headers BEFORE the frame is built — it is keyed by header.
+        out_cols: list[tuple[str, Optional[str]]] = []
+        for header, key in _unique_export_headers(data_cols):
             out_cols.append((header, key))
-            if wants_news and fmt_func is _fmt_date:
+            entry = by_key.get(key)
+            if wants_news and entry is not None and entry[1] is _fmt_date:
                 out_cols.append((f"News_{header}", None))
 
         out: dict[str, object] = {}
@@ -302,23 +342,37 @@ class ExportsController:
         # column list, never the DataFrame). Append them here so the dialog
         # defaults to exactly what is on screen while still letting the user
         # tick a hidden type back into the output.
+        # Both dropdown families count (v8.0.0: Hide FV Columns joined Hide Q
+        # Columns); their type ids never collide, so one set covers both.
+        # Individually hidden columns (right-click / Columns dialog) are
+        # re-offered the same way from v8.0.0: unticked, so the default
+        # export is exactly what is on screen, but one tick away.
         prechecked = {k for _h, k, _f in export_columns}
+        hidden_types: set = set()
+        for attr in ("_hidden_earnings_col_types", "_hidden_fv_col_types"):
+            try:
+                hidden_types |= set(getattr(win, attr))
+            except (AttributeError, RuntimeError, TypeError):
+                pass
         try:
-            hidden_types = set(win._hidden_earnings_col_types)
-        except AttributeError:
-            hidden_types = set()
-        if hidden_types:
-            from .widgets import earnings_column_type_of
+            hidden_keys = set(win._deleted_column_keys)
+        except (AttributeError, RuntimeError, TypeError):
+            hidden_keys = set()
+        offered_hidden = False
+        if hidden_types or hidden_keys:
+            from .widgets import column_type_of
             for col in win._hide_types_source_columns():
                 key = col[1]
-                if (key not in prechecked
-                        and earnings_column_type_of(key) in hidden_types):
+                if key in prechecked:
+                    continue
+                if key in hidden_keys or column_type_of(key) in hidden_types:
                     export_columns.append(col)
+                    offered_hidden = True
 
         dlg = ExcelExportDialog(
             export_columns,
             periods=win._period_order, parent=win,
-            prechecked=prechecked if hidden_types else None,
+            prechecked=prechecked if offered_hidden else None,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -386,149 +440,110 @@ class ExportsController:
         active view filters (Earnings Only / Color Match Only) so the
         export matches what the user sees in the table.
 
-        When `apply_colors=True`, mirrors the on-screen text colors
-        (match-color palette + streak green + display-only red) into
-        per-cell font colors via openpyxl. Colors are only applied to
-        the active period's sheet — non-active periods retain their
-        underlying values (the table model only holds one period at a
-        time so we can't read foregrounds for the others)."""
+        When `apply_colors=True`, every sheet is coloured by the colour
+        rules (v8.0.0): text colour, background fill and bold, exactly as
+        the rules paint the table. Before v8.0.0 colours were read back off
+        the live table model, which only ever holds the period on screen,
+        so only that one sheet was coloured."""
         win = self.win
         used_names: set[str] = set()
-        sheet_to_period: dict[str, str] = {}
+        sheet_frames: dict[str, "pd.DataFrame"] = {}
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
             for label in periods:
                 raw = win._period_results.get(label, pd.DataFrame())
                 df = win._apply_view_filters(raw)
                 export_df = win._build_export_df(df, keys, wants_news)
                 sheet = win._sanitize_sheet_name(label, used_names)
-                sheet_to_period[sheet] = label
+                sheet_frames[sheet] = df
                 export_df.to_excel(writer, sheet_name=sheet, index=False)
 
             if apply_colors:
-                # Colors come from the live table model. The model only
-                # holds the active period's render, so we apply colors
-                # only to that sheet. Other sheets keep plain values —
-                # acceptable: typical sequenced-run workflow exports the
-                # current view, and if the user really wants every
-                # period colored they can switch tabs and re-export.
-                active_period = win._active_period or ""
-                active_sheet = next(
-                    (s for s, p in sheet_to_period.items()
-                     if p == active_period),
-                    None,
-                )
-                if active_sheet is not None:
+                for sheet, df in sheet_frames.items():
                     win._apply_xlsx_cell_colors(
-                        writer.book[active_sheet], keys, wants_news,
+                        writer.book[sheet], keys, wants_news, df=df,
                     )
 
-    def _apply_xlsx_cell_colors(self, ws, keys: list[str], wants_news: bool):
-        """Walk the live ResultsTable model and stamp matching font
-        colors onto each cell of `ws`. The export sheet's column layout
-        is what `_build_export_df` produced — same `keys` order plus
-        any News_<header> insertions when `wants_news` is True. Row
-        order matches `_apply_view_filters(active_df)` since
-        `_build_export_df` doesn't re-sort.
+    def _apply_xlsx_cell_colors(self, ws, keys: list[str], wants_news: bool,
+                                df=None):
+        """Stamp the colour rules' verdict onto `ws` — font colour, solid
+        fill and bold per cell.
+
+        `df` is the view-filtered frame the sheet was written from (rows in
+        the same order: `_build_export_df` never re-sorts). Omitted, it is
+        the active period's, for callers that predate multi-sheet colour.
+        The rules are evaluated against the SHEET's columns, so a rule
+        whose target or anchor is not exported simply has no cell here.
         """
-        from openpyxl.styles import Font
+        from openpyxl.styles import Font, PatternFill
+        from . import coloring
 
         win = self.win
-        # Map exported column index → live-table source column index.
-        # The export's column order is the user's drag-reordered visual
-        # order from `_ordered_active_columns_for_export`. We need the
-        # SOURCE-MODEL column for each exported header.
-        active = win.results_table.active_columns
-        key_to_src_col = {k: c for c, (_h, k, _f) in enumerate(active)}
-
+        if df is None:
+            raw = win._period_results.get(win._active_period or "",
+                                          pd.DataFrame())
+            df = win._apply_view_filters(raw)
+        if df is None or df.empty:
+            return
+        try:
+            rules = win.results_table.color_rules
+        except (AttributeError, RuntimeError):
+            rules = coloring.default_rules()
         export_cols = win._ordered_export_columns_with_news(keys, wants_news)
-        # export_cols is the list of (header, source_key_or_None,
-        # is_news_placeholder) for each column in the sheet.
+        layout = [k for _h, k, news in export_cols if k and not news]
+        try:
+            styles = coloring.evaluate(df, rules, layout)
+        except Exception as exc:
+            log.warning("Excel export: colour rules skipped: %s", exc)
+            return
 
-        n_rows = win.results_table.model_src.rowCount()
-        # Skip header row (xlsx row 1 is the header).
-        for r_excel in range(2, n_rows + 2):
-            r_src = r_excel - 2
-            for c_excel, (_header, src_key, is_news) in enumerate(
+        for r, rs in enumerate(styles):
+            if rs is None:
+                continue
+            for c_excel, (_header, key, is_news) in enumerate(
                 export_cols, start=1,
             ):
-                if is_news or src_key is None:
+                if is_news or key is None:
                     continue
-                src_col = key_to_src_col.get(src_key)
-                if src_col is None:
+                text, background, bold = rs.resolve(key)
+                if text is None and background is None and not bold:
                     continue
-                item = win.results_table.model_src.item(r_src, src_col)
-                if item is None:
-                    continue
-                qcolor = item.foreground().color()
-                # Default brush returns invalid color (alpha=0 / no
-                # explicit setForeground call). Skip those — leaves
-                # cell at openpyxl default.
-                if not qcolor.isValid() or qcolor.alpha() == 0:
-                    continue
-                # Treat near-white default as "no color set". Qt's
-                # invalid foreground brush sometimes returns black or
-                # near-black depending on context. Only apply colors
-                # that ARE in the curated palette / streak-green /
-                # fail-red set — others are likely the implicit
-                # default and shouldn't pollute the export.
-                rgb = (qcolor.red(), qcolor.green(), qcolor.blue())
-                if not win._is_export_color(rgb):
-                    continue
-                hex_rgb = f"FF{qcolor.red():02X}{qcolor.green():02X}{qcolor.blue():02X}"
-                cell = ws.cell(row=r_excel, column=c_excel)
+                cell = ws.cell(row=r + 2, column=c_excel)  # row 1 = header
                 old = cell.font
                 cell.font = Font(
-                    name=old.name, size=old.size, bold=old.bold,
-                    italic=old.italic, color=hex_rgb,
+                    name=old.name, size=old.size, italic=old.italic,
+                    bold=bool(bold) or old.bold,
+                    color=(f"FF{text[1:].upper()}" if text else old.color),
                 )
+                if background:
+                    argb = f"FF{background[1:].upper()}"
+                    cell.fill = PatternFill(fill_type="solid",
+                                            start_color=argb, end_color=argb)
 
     def _ordered_export_columns_with_news(
         self, keys: list[str], wants_news: bool,
     ) -> list[tuple[str, "str | None", bool]]:
-        """Return [(header, source_key|None, is_news), ...] matching
-        the layout produced by `_build_export_df`. News placeholders
-        carry source_key=None and is_news=True; real columns carry
-        their key plus is_news=False. Used by the color exporter to
-        align Excel cells with live-table source columns.
+        """Return [(header, source_key|None, is_news), ...] in EXACTLY the
+        column order `_build_export_df` writes: `keys` order (the user's
+        drag order), with a News placeholder after each date column.
 
-        Iterates the LIVE active layout (same as `_build_export_df`)
-        so dynamic q-i columns are included when their keys are in
-        `keys` (i.e., the user checked the EPS / Rev bundle toggle)."""
+        v8.0.0 fix: this used to walk the live layout in its canonical
+        order instead, so once columns had been dragged the colour of one
+        column could be stamped onto its neighbour in the sheet."""
         try:
             active = list(self.win.results_table.active_columns)
         except (AttributeError, RuntimeError):
             active = []
         layout = active if active else list(RESULT_COLUMNS)
+        by_key = {k: (h, f) for h, k, f in layout}
+        data = [(by_key[k][0], k) for k in keys if k in by_key]
         out: list[tuple[str, "str | None", bool]] = []
-        for header, key, fmt_func in layout:
-            if key not in keys:
-                continue
+        # Same header de-duplication as `_build_export_df`, so the two lists
+        # agree cell for cell — see `_unique_export_headers`.
+        for header, key in _unique_export_headers(data):
             out.append((header, key, False))
-            if wants_news and fmt_func is _fmt_date:
+            if wants_news and by_key[key][1] is _fmt_date:
                 out.append((f"News_{header}", None, True))
         return out
-
-    @staticmethod
-    @lru_cache(maxsize=1)
-    def _export_color_set() -> frozenset:
-        """The (r, g, b) tuples the table deliberately renders: the curated
-        align palette, streak green, and display-only fail red.
-
-        Audit 2026-08-12 (EFF-10): built once instead of linear-scanning a
-        12-entry palette per exported cell inside a rows × cols loop. Cached
-        on the class because the palette is defined at class-definition time
-        and never changes at runtime."""
-        from .widgets import ResultsTable
-        colors = list(ResultsTable._ALIGN_PALETTE)
-        colors.append(ResultsTable._STREAK_GREEN)
-        colors.append(ResultsTable._FAIL_RED)
-        return frozenset((c.red(), c.green(), c.blue()) for c in colors)
-
-    def _is_export_color(self, rgb: tuple[int, int, int]) -> bool:
-        """True iff `rgb` is one of the colors we deliberately apply in the
-        table render. All other colors (including the implicit default
-        foreground) are skipped."""
-        return rgb in self._export_color_set()
 
     def _write_csv_export(
         self, path: str, periods: list[str], keys: list[str], wants_news: bool,

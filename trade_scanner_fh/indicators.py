@@ -1171,13 +1171,65 @@ def hv_percentile(
     return float((prior < current).sum() / prior.size * 100.0)
 
 
+# Non-daily beta periods: Friday-close weeks (pandas "W-FRI") and calendar
+# months (pandas "ME"). A partial final week / month ends on the scan END
+# date, which is what a point-in-time reading wants.
+_BETA_PERIODS = ("weekly", "monthly")
+
+BETA_FREQUENCIES = ("daily", "weekly", "monthly")
+
+
+def _period_end_positions(index, frequency: str):
+    """Row positions of the last session in each week / month of `index`.
+
+    Exactly the rows `frame.resample("W-FRI" | "ME").last().dropna()` keeps on
+    a NaN-free frame — a test pins the two equal — at a fraction of the cost:
+    resample measured 6.9 ms (weekly) / 4.3 ms (monthly) per call against
+    1.1 ms for the whole daily beta, which across a full-universe scan is
+    about a minute of CPU. Here each date maps to an integer period key and
+    the last row before every key change is taken.
+
+    Weeks run Saturday..Friday (W-FRI): day 0 of the epoch, 1970-01-01, is a
+    Thursday, so day 2 is the first Saturday and `(day - 2) // 7` numbers
+    the weeks. Months come straight from datetime64[M].
+    """
+    values = np.asarray(index.values).astype("datetime64[D]")
+    if frequency == "monthly":
+        keys = values.astype("datetime64[M]").astype(np.int64)
+    else:
+        keys = (values.astype(np.int64) - 2) // 7
+    if keys.size == 0:
+        return keys
+    change = np.empty(keys.size, dtype=bool)
+    change[:-1] = keys[1:] != keys[:-1]
+    change[-1] = True
+    return np.flatnonzero(change)
+
+
+def beta_basis(frequency: str, lookback: int) -> str:
+    """Short label for a beta's basis: "252D", "104W", "60M"."""
+    unit = {"weekly": "W", "monthly": "M"}.get(frequency, "D")
+    return f"{int(lookback)}{unit}"
+
+
 def beta_vs_benchmark(
     df: pd.DataFrame, benchmark: pd.DataFrame, *, lookback: int = 252,
+    frequency: str = "daily",
 ) -> float:
-    """Ordinary-least-squares beta of daily returns against a benchmark.
+    """Ordinary-least-squares beta of returns against a benchmark.
 
     ``beta = cov(stock, bench) / var(bench)`` over the last `lookback`
-    overlapping sessions.
+    overlapping periods of the chosen `frequency`:
+
+      daily    log returns of consecutive sessions (unchanged since v7.0.0);
+      weekly   simple returns of Friday closes;
+      monthly  simple returns of month-end closes.
+
+    Weekly and monthly use SIMPLE returns because that is how published betas
+    are built. finviz's Beta is a 5-year monthly one: measured 2026-09-26,
+    ``frequency="monthly", lookback=60`` over our own closes matched it within
+    0.05 on 96% of tickers and within 0.1 on 98.7% of $10B+ names. Daily keeps
+    log returns so existing daily results do not move.
 
     Complements the static Beta scraped from finviz rather than replacing it.
     Finviz publishes ONE number per ticker with no period attached; this one
@@ -1203,11 +1255,25 @@ def beta_vs_benchmark(
     if len(joined) < 3:
         return np.nan
 
-    # lookback RETURNS needs lookback + 1 closes, same contract as the HV
-    # estimators.
-    tail = joined.iloc[-(int(lookback) + 1):]
-    rs = np.diff(np.log(tail["s"].to_numpy(dtype=float)))
-    rb = np.diff(np.log(tail["b"].to_numpy(dtype=float)))
+    freq = str(frequency or "daily").lower()
+    if freq not in _BETA_PERIODS:
+        # lookback RETURNS needs lookback + 1 closes, same contract as the HV
+        # estimators.
+        tail = joined.iloc[-(int(lookback) + 1):]
+        rs = np.diff(np.log(tail["s"].to_numpy(dtype=float)))
+        rb = np.diff(np.log(tail["b"].to_numpy(dtype=float)))
+    else:
+        # Period ends are taken AFTER the inner join, so both legs of every
+        # period close on the same session and a halted stock cannot pair its
+        # stale close with the benchmark's fresh one.
+        if not isinstance(joined.index, pd.DatetimeIndex):
+            return np.nan
+        closes = joined.iloc[_period_end_positions(joined.index, freq)]
+        tail = closes.iloc[-(int(lookback) + 1):]
+        st = tail["s"].to_numpy(dtype=float)
+        bt = tail["b"].to_numpy(dtype=float)
+        rs = st[1:] / st[:-1] - 1.0
+        rb = bt[1:] / bt[:-1] - 1.0
     if rs.size < 2 or rb.size < 2:
         return np.nan
 

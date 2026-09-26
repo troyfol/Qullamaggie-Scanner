@@ -330,6 +330,8 @@ class ScanParams:
     beta_calc_enabled: bool = False
     beta_calc_display_only: bool = False
     beta_calc_lookback: int = 252
+    # "daily" | "weekly" | "monthly" (v8.0.0); lookback counts periods of it.
+    beta_calc_frequency: str = "daily"
     beta_calc_min: float = -5.0
     beta_calc_max: float = 10.0
 
@@ -369,6 +371,23 @@ class ScanParams:
             if spec["enabled"] and not spec["display_only"]:
                 out.append((name, spec))
         return out
+
+    def shown_finviz_fields(self) -> list:
+        """Every finviz field whose COLUMN was asked for, sorted.
+
+        A row asks for its column by being set to Filter or Display Only —
+        the same Off / Filter / Display Only contract every other column in
+        the results table follows. `run_scan` joins exactly these fields from
+        the snapshot store and nothing else (v8.0.0); before that it joined
+        all ~90 on every scan, so the table carried every FV column whether
+        or not a single finviz row was switched on.
+        """
+        out = []
+        for name in (self.finviz_filters or {}):
+            spec = self.finviz_filter(name)
+            if spec["enabled"] or spec["display_only"]:
+                out.append(name)
+        return sorted(out)
 
     # --- Volume / Liquidity ---
     # #11  Volume dry-up ratio
@@ -771,6 +790,16 @@ class ScanParams:
             _if_live("hv_rank", self.hv_rank_window + self.hv_rank_lookback),
             _if_live("hv_pct", self.hv_pct_window + self.hv_pct_lookback),
             zscore_bars,
+            # Beta regresses `lookback` RETURNS, so it reads one more close
+            # than that. Missing before v8.0.0: a 252-bar beta could straddle
+            # a split seam the quarantine had been told was out of reach.
+            # Weekly / monthly periods are converted at 5 and 23 sessions
+            # (plus one partial period), over-stating like the rest of this
+            # method.
+            _if_live("beta_calc", {
+                "weekly": (self.beta_calc_lookback + 2) * 5,
+                "monthly": (self.beta_calc_lookback + 2) * 23,
+            }.get(self.beta_calc_frequency, self.beta_calc_lookback + 1)),
             1,
         )
 
@@ -1048,7 +1077,11 @@ def _compute_ticker(
             and benchmark_data and "SPY" in benchmark_data:
         row["beta_calc"] = indicators.beta_vs_benchmark(
             full_to_end, benchmark_data["SPY"],
-            lookback=params.beta_calc_lookback)
+            lookback=params.beta_calc_lookback,
+            frequency=params.beta_calc_frequency)
+        # The header reads this ("Beta calc 60M"); table-internal.
+        row["_beta_calc_basis"] = indicators.beta_basis(
+            params.beta_calc_frequency, params.beta_calc_lookback)
 
     # --- Price z-score (v7.0.0) ---
     # The truncation flag rides on the row under an underscore key so the
@@ -1303,7 +1336,14 @@ def _compute_ticker(
                     or params.consec_rev_beats_enabled
                     or params.consec_rev_beats_display_only
                 )
-                if _individual_active and not _beats_active:
+                # v8.0.0: the growth filters draw Q-X blocks too, so their
+                # Q-1 Date makes last_report_date just as redundant.
+                _q_blocks_active = _beats_active or any(
+                    getattr(params, f"{prefix}_enabled")
+                    or getattr(params, f"{prefix}_display_only")
+                    for prefix, _metric in _GROWTH_FILTERS
+                )
+                if _individual_active and not _q_blocks_active:
                     row["last_report_date"] = mr.get("report_date")
 
                 # Beats streaks computed only on the past slice — future
@@ -1319,7 +1359,6 @@ def _compute_ticker(
                 # the last 4 quarters and doesn't want 20 columns of
                 # noise. Cap is independent per side so EPS and Rev
                 # can use different limits.
-                MAX_BEATS_QUARTERS = 20
                 _eps_cap = params.consec_eps_beats_quarter_cap
                 _eps_n = MAX_BEATS_QUARTERS if _eps_cap <= 0 else min(_eps_cap, MAX_BEATS_QUARTERS)
                 _rev_cap = params.consec_rev_beats_quarter_cap
@@ -1341,21 +1380,9 @@ def _compute_ticker(
                         0 if _eps_series is None else _eps_series.length
                     )
                     _write_period_stats(row, "consec_eps_beats", _eps_series)
-                    for k, (_, q) in enumerate(
-                        past_pref.head(_eps_n).iterrows(), 1
-                    ):
-                        # Per-block date key so the EPS-streak and
-                        # Rev-streak green-highlight logic can color
-                        # each block's date cells independently. Same
-                        # underlying value (a quarterly report covers
-                        # both EPS and Rev) but rendered twice when
-                        # both blocks are visible — that gives clean
-                        # within-block visual scanning.
-                        row[f"q{k}_report_date_eps"] = q.get("report_date")
-                        row[f"q{k}_reported_eps"] = q.get("reported_eps")
-                        row[f"q{k}_surprise_eps_dollar"] = q.get("surprise_eps")
-                        row[f"q{k}_surprise_eps_pct"] = q.get("surprise_eps_pct")
-                        row[f"q{k}_yoy_eps_pct"] = q.get("yoy_eps_pct")
+                    _write_run_quarters(
+                        row, "consec_eps_beats", past_pref, _eps_series)
+                    _write_q_blocks(row, past_pref, "eps", _eps_n)
                 if params.consec_rev_beats_enabled or params.consec_rev_beats_display_only:
                     _rev_series = _beats_series(
                         _rev_pool, "surprise_rev_pct", params, "consec_rev_beats",
@@ -1364,14 +1391,9 @@ def _compute_ticker(
                         0 if _rev_series is None else _rev_series.length
                     )
                     _write_period_stats(row, "consec_rev_beats", _rev_series)
-                    for k, (_, q) in enumerate(
-                        past_pref.head(_rev_n).iterrows(), 1
-                    ):
-                        row[f"q{k}_report_date_rev"] = q.get("report_date")
-                        row[f"q{k}_reported_rev"] = q.get("reported_rev")
-                        row[f"q{k}_surprise_rev_dollar"] = q.get("surprise_rev")
-                        row[f"q{k}_surprise_rev_pct"] = q.get("surprise_rev_pct")
-                        row[f"q{k}_yoy_rev_pct"] = q.get("yoy_rev_pct")
+                    _write_run_quarters(
+                        row, "consec_rev_beats", past_pref, _rev_series)
+                    _write_q_blocks(row, past_pref, "rev", _rev_n)
 
                 # --- Quarter-series filters (earnings-filters-spec) ---
                 # Both families read the same `past_pref` slice the beats
@@ -1431,6 +1453,76 @@ _ACCEL_FILTERS: tuple[tuple[str, str], ...] = (
 
 # The two Consecutive YoY Growth filters, as
 # (param prefix, history column).
+# Most Q-X blocks a filter may draw per side. Beats has always capped its
+# display here; the growth filters (v8.0.0) share the ceiling.
+MAX_BEATS_QUARTERS = 20
+
+# The per-quarter fields each side's Q-X block carries, as
+# (block column suffix, earnings_history column).
+_Q_BLOCK_FIELDS: dict = {
+    "eps": (("report_date_eps", "report_date"),
+            ("reported_eps", "reported_eps"),
+            ("surprise_eps_dollar", "surprise_eps"),
+            ("surprise_eps_pct", "surprise_eps_pct"),
+            ("yoy_eps_pct", "yoy_eps_pct")),
+    "rev": (("report_date_rev", "report_date"),
+            ("reported_rev", "reported_rev"),
+            ("surprise_rev_dollar", "surprise_rev"),
+            ("surprise_rev_pct", "surprise_rev_pct"),
+            ("yoy_rev_pct", "yoy_rev_pct")),
+}
+
+
+def _write_q_blocks(row: dict, past_pref, side: str, n: int) -> None:
+    """Write Q-1..Q-n of one side's quarter blocks from `past_pref`.
+
+    Q-k is the k-th most recent REPORT (the frame is report_date DESC), the
+    order the table has always used. Each block carries its own date key
+    (`q{k}_report_date_eps` / `_rev`) so the EPS and Rev blocks can be
+    coloured independently even though one report covers both. Idempotent:
+    beats and growth both call this for the same side and simply agree on
+    the values, so the side shows as many blocks as its widest filter asks.
+    """
+    if n <= 0:
+        return
+    fields = _Q_BLOCK_FIELDS[side]
+    for k, (_, q) in enumerate(past_pref.head(n).iterrows(), 1):
+        for suffix, col in fields:
+            row[f"q{k}_{suffix}"] = q.get(col)
+
+
+def _run_quarter_indices(past_pref, periods) -> list:
+    """The Q-k numbers (1-based, report order) of the quarters in `periods`.
+
+    Bridges the two orders the earnings code keeps: a series walks FISCAL
+    quarters, the Q-X blocks list REPORTS. Matching on the normalised
+    `period_ending` — the key `build_quarter_points` itself dedupes on —
+    puts each counted quarter in the right block whatever order it was
+    reported in, and leaves bridged quarters (absent from `periods`) out.
+    """
+    if not periods or past_pref is None or "period_ending" not in past_pref:
+        return []
+    wanted = {pd.Timestamp(p).normalize() for p in periods}
+    pe = pd.to_datetime(past_pref["period_ending"].head(MAX_BEATS_QUARTERS),
+                        errors="coerce")
+    return [k for k, p in enumerate(pe, 1)
+            if pd.notna(p) and pd.Timestamp(p).normalize() in wanted]
+
+
+def _write_run_quarters(row: dict, prefix: str, past_pref, series) -> None:
+    """Record which Q-X blocks `series` counted, as `_{prefix}_qs`.
+
+    Table-internal (leading underscore, never in RESULT_COLUMNS). The colour
+    rules' "is counted in the run of" test reads it, which is what lets a
+    rule shade the quarters a streak or run actually used — Q-2..Q-4 when a
+    growth run stepped over an N/A Q-1 — instead of assuming Q-1..Q-length.
+    """
+    periods = () if series is None else getattr(series, "periods", ())
+    if series is not None and getattr(series, "length", 0) <= 0:
+        periods = ()
+    row[f"_{prefix}_qs"] = _run_quarter_indices(past_pref, periods)
+
+
 def _beats_series(pool, metric_col: str, params, prefix: str):
     """The resolved beats run for one ticker, or None when the pool is empty.
 
@@ -1581,9 +1673,9 @@ def _populate_quarter_series(row: dict, params: "ScanParams", past_pref) -> None
         if not (getattr(params, f"{prefix}_enabled")
                 or getattr(params, f"{prefix}_display_only")):
             continue
+        cap = getattr(params, f"{prefix}_quarter_cap")
         points = es.build_quarter_points(
-            past_pref, metric_col,
-            quarter_cap=getattr(params, f"{prefix}_quarter_cap"),
+            past_pref, metric_col, quarter_cap=cap,
         )
         # `run_series` directly rather than the `consecutive_growth_run`
         # wrapper: identical arguments (the wrapper is a thin pass-through
@@ -1598,17 +1690,43 @@ def _populate_quarter_series(row: dict, params: "ScanParams", past_pref) -> None
             max_bridged=config.SERIES_MAX_BRIDGED_GROWTH,
             selection=getattr(params, f"{prefix}_selection"),
             backward_only=getattr(params, f"{prefix}_backward_only"),
+            trailing_missing=es.trailing_missing_quarters(
+                past_pref, points, quarter_cap=cap),
         )
-        row[prefix] = 0 if growth is None else growth.length
+        length = 0 if growth is None else growth.length
+        row[prefix] = length
         _write_period_stats(row, prefix, growth)
+        # v8.0.0: the growth filters show their quarters the way the beats
+        # filters always have. Span / V condense the run like the
+        # accelerating filters' cells; the Q-X blocks show every quarter the
+        # run could read — the whole capped pool, or, uncapped, back to the
+        # run's oldest counted quarter (at least Q-1) so a 25-year pool does
+        # not become 20 blocks of noise.
+        if length > 0:
+            row[f"{prefix}_span"] = _fmt_series_span(
+                growth.start_period, growth.end_period)
+            row[f"{prefix}_vals"] = _fmt_series_values(
+                growth.start_value, growth.end_value)
+            row[f"_{prefix}_start_date"] = growth.start_report_date
+            row[f"_{prefix}_end_date"] = growth.end_report_date
+        else:
+            row[f"{prefix}_span"] = None
+            row[f"{prefix}_vals"] = None
+        _write_run_quarters(row, prefix, past_pref, growth)
+        side = "eps" if "_eps_" in prefix else "rev"
+        if cap and cap > 0:
+            n_blocks = min(int(cap), MAX_BEATS_QUARTERS)
+        else:
+            n_blocks = max([1] + list(row[f"_{prefix}_qs"]))
+        _write_q_blocks(row, past_pref, side, n_blocks)
 
     for prefix, metric_key in _ACCEL_FILTERS:
         if not (getattr(params, f"{prefix}_enabled")
                 or getattr(params, f"{prefix}_display_only")):
             continue
+        cap = getattr(params, f"{prefix}_quarter_cap")
         points = es.build_quarter_points(
-            past_pref, es.METRIC_COLUMNS[metric_key],
-            quarter_cap=getattr(params, f"{prefix}_quarter_cap"),
+            past_pref, es.METRIC_COLUMNS[metric_key], quarter_cap=cap,
         )
         result = es.accelerating_series(
             points,
@@ -1618,7 +1736,10 @@ def _populate_quarter_series(row: dict, params: "ScanParams", past_pref) -> None
             selection=getattr(params, f"{prefix}_selection"),
             backward_only=getattr(params, f"{prefix}_backward_only"),
             max_bridged=config.SERIES_MAX_BRIDGED_ACCEL,
+            trailing_missing=es.trailing_missing_quarters(
+                past_pref, points, quarter_cap=cap),
         )
+        _write_run_quarters(row, prefix, past_pref, result)
         if result is None:
             # No quarter in the pool carries this metric at all. Leave
             # `_len` as NaN rather than 0: 0 would read as "a series of
@@ -1762,10 +1883,14 @@ def _compute_display_only_fails(
     # Range filters (v7.0.0): red on EITHER side of the band, so a
     # display-only volatility row marks the names its bounds would have cut
     # regardless of which end they fell off.
+    # `beta_calc` joined in v8.0.0 — it shipped in v7.0.0 as a range filter
+    # like the rest of this group but was never added here, so display-only
+    # Beta (calc) painted nothing red.
     for _pfx, _col in (
         ("hv", "hv"), ("yz", "yz_vol"), ("atr_pct", "atr_pct"),
         ("hv_rank", "hv_rank"), ("hv_pct", "hv_pct"),
         ("price_zscore", "price_zscore"),
+        ("beta_calc", "beta_calc"),
     ):
         _flag_min(_pfx, _col, f"{_pfx}_min")
         _flag_max(_pfx, _col, f"{_pfx}_max")
@@ -2721,6 +2846,73 @@ def build_scan_context(params_list: list[ScanParams]) -> ScanContext:
 # Main scan entry point
 # ============================================================================
 
+def _needs_benchmarks(params: ScanParams) -> bool:
+    """Does any live column read the benchmark OHLCV (SPY / ONEQ / sectors)?
+
+    "Live" is `enabled OR display_only`, the same condition `_compute_ticker`
+    uses to decide whether to compute each of these columns. Before v8.0.0
+    the loader checked only the three RS `_enabled` flags, which broke two
+    things silently:
+
+    * Beta (calc) regresses against SPY and was not in the check at all, so
+      it was never computed unless an RS filter happened to be on. As a
+      FILTER that was worse than a missing column: the stage fails closed on
+      a missing column, so every scan returned zero results.
+    * An RS row in Display Only mode (with no RS filter enabled) never got
+      its column either.
+    """
+    return any(
+        getattr(params, f"{prefix}_enabled", False)
+        or getattr(params, f"{prefix}_display_only", False)
+        for prefix in ("rs_market", "rs_nasdaq", "rs_sector", "beta_calc")
+    )
+
+
+def _apply_finviz_display_only_fails(df: pd.DataFrame,
+                                     params: ScanParams) -> pd.DataFrame:
+    """Merge display-only red-on-fail flags for the finviz rows into
+    `_display_only_fails`.
+
+    `_compute_display_only_fails` runs per ticker inside `_compute_ticker`,
+    before the snapshot store is joined, so it cannot see finviz values. Until
+    v8.0.0 nothing else looked either, and a finviz row in Display Only mode
+    painted nothing red. This runs on the joined frame instead, with the same
+    rule as every other display-only range: a cell whose value falls outside
+    the row's band is flagged; a blank cell is not (absent data is not a
+    fail — the same convention `_flag_min` / `_flag_max` follow).
+
+    Bounds are the ones `_finviz_scan_params` emitted, so a side left at its
+    limit is None and flags nothing on that side. The two yes/no rows ride in
+    as min == max == 1.0 / 0.0 and therefore flag the opposite answer.
+    """
+    if df is None or df.empty:
+        return df
+    for name in (params.finviz_filters or {}):
+        spec = params.finviz_filter(name)
+        if not spec["display_only"] or name not in df.columns:
+            continue
+        lo, hi = spec["min"], spec["max"]
+        if lo is None and hi is None:
+            continue
+        vals = pd.to_numeric(df[name], errors="coerce")
+        bad = pd.Series(False, index=df.index)
+        if lo is not None:
+            bad |= vals < float(lo)
+        if hi is not None:
+            bad |= vals > float(hi)
+        bad &= vals.notna()
+        if not bad.any():
+            continue
+        if "_display_only_fails" not in df.columns:
+            df["_display_only_fails"] = None
+        for idx in df.index[bad]:
+            existing = df.at[idx, "_display_only_fails"]
+            flags = dict(existing) if isinstance(existing, dict) else {}
+            flags[name] = True
+            df.at[idx, "_display_only_fails"] = flags
+    return df
+
+
 def run_scan(
     symbols: list[str],
     params: ScanParams,
@@ -2755,7 +2947,7 @@ def run_scan(
     # Copy before mutating so a future LRU cache (Phase 3 I11) stays intact.
     end_ts = pd.Timestamp(params.end_date)
     benchmark_data: dict[str, pd.DataFrame] = {}
-    if params.rs_market_enabled or params.rs_nasdaq_enabled or params.rs_sector_enabled:
+    if _needs_benchmarks(params):
         for ref in config.REFERENCE_TICKERS:
             ref_df = load_ohlcv(ref)
             if ref_df is None:
@@ -2764,7 +2956,7 @@ def run_scan(
                 ref_df = ref_df.copy()
                 ref_df.index = ref_df.index.tz_localize(None)
             benchmark_data[ref] = ref_df.loc[:end_ts]
-        log.info("Loaded %d/%d benchmark tickers for RS",
+        log.info("Loaded %d/%d benchmark tickers for RS / Beta",
                  len(benchmark_data), len(config.REFERENCE_TICKERS))
 
     # ── Run-wide lookups (EFF-3) ──
@@ -2904,13 +3096,19 @@ def run_scan(
     # multi-timeframe run. That is the user's explicit decision: no history is
     # kept for them, so filtering on them means filtering on the most recent
     # values. It is why they are joined here rather than computed per period.
-    if not computed.empty:
+    #
+    # Only the fields a panel row asked for are joined (v8.0.0). The results
+    # table renders any column present in the frame, so joining the whole
+    # store put ~90 FV columns on every scan regardless of the panel. When no
+    # finviz row is on, the store is not even read.
+    shown_fv = set(params.shown_finviz_fields())
+    if not computed.empty and shown_fv:
         try:
             from . import finviz_snapshot as _fvs
             snap = _fvs.load_store()
             if not snap.empty:
                 wanted = [c for c in snap.columns
-                          if c not in (_fvs.SYMBOL_COL,)]
+                          if c != _fvs.SYMBOL_COL and c in shown_fv]
                 # Never let the join clobber a column the scan computed
                 # itself — `sales`, `income` and the perf names could collide
                 # with future scanner columns, and the computed value wins.
@@ -2924,13 +3122,18 @@ def run_scan(
                         left_on="symbol", right_on=_fvs.SYMBOL_COL)
                     if _fvs.SYMBOL_COL != "symbol":
                         computed = computed.drop(columns=[_fvs.SYMBOL_COL])
-                    matched = int(computed[wanted[0]].notna().sum()) \
-                        if wanted else 0
-                    log.info("Finviz snapshot joined: %d of %d tickers "
-                             "carry attributes", matched, len(computed))
+                    matched = int(computed[wanted].notna().any(axis=1).sum())
+                    log.info("Finviz snapshot joined (%d field(s)): %d of %d "
+                             "tickers carry attributes",
+                             len(wanted), matched, len(computed))
         except Exception as exc:
             # A missing or unreadable snapshot store must never stop a scan.
             log.warning("Finviz snapshot join skipped: %s", exc)
+        try:
+            computed = _apply_finviz_display_only_fails(computed, params)
+        except Exception as exc:
+            # Colouring is advisory; it must never cost the scan its results.
+            log.warning("Finviz display-only flags skipped: %s", exc)
 
     # ── Phase B: Funnel filter stages ──
     stages = _build_filter_stages(params)

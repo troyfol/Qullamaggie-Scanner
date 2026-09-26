@@ -106,9 +106,10 @@ def test_last_bar_health_excludes_tickers_with_no_bar_on_that_session():
     assert health.session == sess
     assert (health.null_count, health.total) == (2, 3)
     assert health.pct == pytest.approx(200 / 3, abs=0.01)
-    assert health.pct >= config.OHLCV_NAN_LAST_BAR_WARN_PCT
-    # The diluted denominator that would have stayed quiet:
-    assert (2 / 5) * 100 < config.OHLCV_NAN_LAST_BAR_WARN_PCT
+    # The diluted denominator would have read 40% — the point is that the
+    # rate is computed over the 3 on-session tickers, not all 5. (Before
+    # v8.0.0 this also asserted 40% sat under the old 50% threshold.)
+    assert health.pct > (2 / 5) * 100
 
 
 def test_last_bar_health_is_inert_on_empty_or_dateless_results():
@@ -367,6 +368,66 @@ def test_report_warns_above_threshold_and_stays_quiet_below(_qapp, monkeypatch):
     assert any("99.0%" in ln for ln in loud)
 
     assert _emitted(2, 98) == [], "an ordinary session must not warn"
+
+
+# ----------------------------------------------------------------------
+# v8.0.0 — tightened threshold + burst rule (the 2026-09-24 refresh)
+# ----------------------------------------------------------------------
+
+def _sweep(pattern, sess=pd.Timestamp("2026-09-24")):
+    """ScrapeResults in sweep order; `pattern` is a list of bools (null?)."""
+    return [ScrapeResult(symbol=f"T{i:05d}", last_bar_date=sess,
+                         last_bar_nan=bool(n)) for i, n in enumerate(pattern)]
+
+
+def test_the_2026_09_24_shape_warns():
+    """~0.5% null for the first 9,800 tickers, then ~75% from the onset to the
+    end: 21.5% overall under the old 50% line, which stayed at INFO."""
+    pattern = ([i % 200 == 0 for i in range(9800)]
+               + [i % 4 != 0 for i in range(2600)])
+    h = summarize_last_bar_health(_sweep(pattern))
+    assert h.pct < 50.0, "the old threshold would have stayed quiet"
+    assert h.is_suspect()
+    assert h.burst_pct >= 70.0
+    assert h.burst_start == "T09800", "the worst window starts at the onset"
+
+
+def test_a_late_burst_warns_even_when_the_overall_rate_is_low():
+    """A source that goes bad for one window of a long sweep averages out to
+    almost nothing overall — the burst rule is what catches it."""
+    pattern = [False] * 20000 + [i % 5 < 3 for i in range(400)] + [False] * 600
+    h = summarize_last_bar_health(_sweep(pattern))
+    assert h.pct < config.OHLCV_NAN_LAST_BAR_WARN_PCT
+    assert h.burst_pct == pytest.approx(60.0)
+    assert h.is_suspect()
+
+
+def test_an_ordinary_session_stays_quiet_on_both_rules():
+    """0.25% null, spread out: normal halts and dead stubs."""
+    h = summarize_last_bar_health(_sweep([i % 400 == 7 for i in range(13000)]))
+    assert h.pct < 1.0 and h.burst_pct < 1.0
+    assert not h.is_suspect()
+
+
+def test_a_tiny_run_is_not_judged_on_its_percentage():
+    """One halted name in a three-ticker rebuild is 33% null and means
+    nothing; below OHLCV_NAN_MIN_SAMPLE the overall rate is not judged, and a
+    run shorter than the burst window has no burst figure."""
+    h = summarize_last_bar_health(_sweep([True, False, False]))
+    assert h.pct == pytest.approx(100 / 3)
+    assert h.burst_start is None and h.burst_pct == 0.0
+    assert not h.is_suspect()
+
+
+def test_report_names_the_burst_in_the_warning(_qapp):
+    from trade_scanner_fh.gui import workers as workers_mod
+    worker = workers_mod.UpdateWorker(["X"])
+    worker._results = _sweep([False] * 20000 + [True] * 400)
+    lines = []
+    worker.log_msg.connect(lines.append)
+    worker._report_last_bar_health()
+    assert any("SUSPECT OHLCV REFRESH" in ln and "starting at T20000" in ln
+               and "Deep OHLCV Refresh" in ln for ln in lines), lines
 
 
 def test_report_survives_malformed_results(_qapp):

@@ -355,9 +355,10 @@ def test_panel_has_a_row_for_every_filterable_field(qapp):
 
 
 def test_panel_sections_all_start_collapsed(qapp):
-    """80 rows laid out flat is unusable."""
+    """80 rows laid out flat is unusable. v8.0.0 added the Info section."""
     panel = W.IndicatorPanel()
-    assert len(panel._collapsible_sections) == len(fs.FINVIZ_GROUPS)
+    assert len(panel._collapsible_sections) == len(fs.FINVIZ_GROUPS) + 1
+    assert "Info" in panel._collapsible_sections
     for title, (_btn, body) in panel._collapsible_sections.items():
         assert body.isVisibleTo(panel) is False, title
 
@@ -678,10 +679,12 @@ def test_universe_symbols_includes_etfs(qapp):
 # Per-field spinbox ranges (v7.0.1)
 # ----------------------------------------------------------------------
 
-def test_every_filterable_field_has_a_kind():
+def test_every_filterable_field_has_a_range():
     """An unmapped field silently falls back to the generic ratio shape,
-    which is wrong for a market cap or a share count."""
-    assert [f for f in fs.FILTERABLE_FIELDS if f not in fs.FIELD_KINDS] == []
+    which is wrong for a market cap or a share count. (v8.0.0: per-field
+    ranges replaced v7.0.1's shared kinds; the guard is unchanged.)"""
+    assert [f for f in fs.FILTERABLE_FIELDS if f not in fs.FIELD_RANGES] == []
+    assert [f for f in fs.FIELD_RANGES if f not in fs.FILTERABLE_FIELDS] == []
 
 
 def test_ranges_are_scaled_to_what_the_field_measures():

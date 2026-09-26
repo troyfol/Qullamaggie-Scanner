@@ -42,6 +42,8 @@ def test_l6_green_highlight_only_on_metric_specific_columns(_qapp):
         "symbol": "A", "close": 100.0, "price": 100.0, "pct_gain": 10.0,
         "reported_eps": 2.5,
         "consec_eps_beats": 2,
+        # v8.0.0: the streak colour reads the quarters the streak counted.
+        "_consec_eps_beats_qs": [1, 2],
         "q1_reported_eps": 2.0, "q1_surprise_eps_dollar": 0.1,
         "q1_surprise_eps_pct": 5.0,
         "q2_reported_eps": 1.9, "q2_surprise_eps_dollar": 0.05,
@@ -1023,11 +1025,11 @@ def test_populate_proxy_reattaches_even_on_inner_exception(_qapp):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Delete rows from output window — context menu + Delete key handler
+# Hide rows (v8.0.0; was delete) — Delete key handler
 # ──────────────────────────────────────────────────────────────────────
 
-def test_results_table_delete_key_emits_deletion_request(_qapp):
-    """Delete key on a selected row emits rows_deletion_requested with
+def test_results_table_delete_key_emits_hide_request(_qapp):
+    """Delete key on a selected row emits rows_hide_requested with
     the row's symbol. Multi-select returns multiple symbols in
     selection order."""
     from PyQt6.QtCore import Qt as _Qt
@@ -1044,7 +1046,7 @@ def test_results_table_delete_key_emits_deletion_request(_qapp):
     table.populate(df)
 
     captured: list[list[str]] = []
-    table.rows_deletion_requested.connect(captured.append)
+    table.rows_hide_requested.connect(captured.append)
 
     # Select MSFT (proxy-row 1) — assume identity sort.
     sel = table.selectionModel()
@@ -1075,7 +1077,7 @@ def test_results_table_delete_multiselect_returns_all_symbols(_qapp):
     table.populate(df)
 
     captured: list[list[str]] = []
-    table.rows_deletion_requested.connect(captured.append)
+    table.rows_hide_requested.connect(captured.append)
 
     sel = table.selectionModel()
     for r in (0, 2):
@@ -1093,7 +1095,7 @@ def test_results_table_delete_multiselect_returns_all_symbols(_qapp):
 
 def test_results_table_delete_with_no_selection_is_noop(_qapp):
     """Delete key with no selected row must not emit (no symbols to
-    delete) — falls through to default handler."""
+    hide) — falls through to default handler."""
     from PyQt6.QtCore import Qt as _Qt
     from PyQt6.QtGui import QKeyEvent
     from PyQt6.QtCore import QEvent
@@ -1104,7 +1106,7 @@ def test_results_table_delete_with_no_selection_is_noop(_qapp):
     table.populate(df)
 
     captured: list[list[str]] = []
-    table.rows_deletion_requested.connect(captured.append)
+    table.rows_hide_requested.connect(captured.append)
 
     table.selectionModel().clearSelection()
     evt = QKeyEvent(QEvent.Type.KeyPress, _Qt.Key.Key_Delete, _Qt.KeyboardModifier.NoModifier)
@@ -1363,29 +1365,32 @@ def test_main_window_paste_with_unknown_target_is_noop(_qapp):
     assert win.results_table.cut_clipboard() == []
 
 
-def test_delete_clears_cut_clipboard(_qapp):
-    """Row deletion clears the clipboard so paste can't target a
-    deleted row."""
+def test_hide_clears_cut_clipboard(_qapp):
+    """Hiding rows (v8.0.0; was deleting) clears the clipboard so a paste
+    can't move a row the user can no longer see."""
     df = pd.DataFrame([
         {"symbol": s, "close": 1.0, "pct_gain": 1.0}
         for s in ["AAPL", "MSFT", "NVDA"]
     ])
     win = _shell_for_paste_tests(_qapp, df)
+    win._hidden_row_symbols = set()
+    win._hide_undo_stack = []
     win.results_table._set_cut_clipboard(["NVDA"])
-    win._on_rows_deletion_requested(["MSFT"])
+    win._on_rows_hide_requested(["MSFT"])
     assert win.results_table.cut_clipboard() == []
+    assert win._hidden_row_symbols == {"MSFT"}
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Delete columns — header right-click → drop from rendered df without
-# touching `_period_results`.
+# Hide columns (v8.0.0; was delete) — header right-click → dropped from
+# the rendered layout without touching `_period_results`.
 # ──────────────────────────────────────────────────────────────────────
 
-def test_header_translator_filters_always_visible(_qapp):
-    """The ResultsTable's header→key translator must filter out the
-    always-visible core columns (symbol/close/pct_gain/gain_start_date)
-    even if the header reports their logical indices — deleting them
-    would break export and core display invariants."""
+def test_header_translator_filters_only_the_ticker(_qapp):
+    """The header→key translator drops the Ticker column even if the header
+    reports its logical index — send / HOTKEY / TXT export read the ticker
+    from it. Since v8.0.0 it is the ONLY such column: Close / % Gain /
+    Gain Start became hideable."""
     from trade_scanner_fh.gui.widgets import ResultsTable
 
     df = pd.DataFrame([{
@@ -1395,16 +1400,13 @@ def test_header_translator_filters_always_visible(_qapp):
     table = ResultsTable()
     table.populate(df)
     captured = []
-    table.columns_deletion_requested.connect(captured.append)
+    table.columns_hide_requested.connect(captured.append)
 
     keys_in_table = [k for _h, k, _f in table.active_columns]
-    sym_idx = keys_in_table.index("symbol")
-    avg_vol_idx = keys_in_table.index("avg_vol")
-    sti_idx = keys_in_table.index("sti")
-    table._on_header_columns_deletion_requested(
-        [sym_idx, avg_vol_idx, sti_idx]
-    )
-    assert captured == [["avg_vol", "sti"]]
+    idx = [keys_in_table.index(k)
+           for k in ("symbol", "close", "avg_vol", "sti")]
+    table._on_header_columns_hide_requested(idx)
+    assert captured == [["close", "avg_vol", "sti"]]
 
 
 def _shell_with_deleted_columns(_qapp, deleted_keys: set):
@@ -1415,17 +1417,35 @@ def _shell_with_deleted_columns(_qapp, deleted_keys: set):
     return parent
 
 
-def test_main_window_apply_view_filters_drops_deleted_columns(_qapp):
+def test_main_window_apply_view_filters_keeps_deleted_columns_data(_qapp):
+    """v8.0.0 contract change. Deleted columns used to be dropped from the
+    FRAME here, which is what left a deleted `Q-2 Date` on screen as an empty
+    column (the Q-i blocks are laid out by quarter index, not by presence).
+    They are now removed from the table's column LAYOUT instead, so this
+    filter keeps every column and only filters rows."""
     parent = _shell_with_deleted_columns(_qapp, {"avg_vol", "sti"})
     df = pd.DataFrame([{
         "symbol": "A", "close": 100.0, "pct_gain": 5.0,
         "avg_vol": 1000000.0, "sti": 1.5, "dollar_vol": 99.0,
     }])
     out = parent._apply_view_filters(df)
-    assert "symbol" in out.columns
-    assert "avg_vol" not in out.columns
-    assert "sti" not in out.columns
-    assert "dollar_vol" in out.columns
+    assert set(out.columns) == set(df.columns)
+
+
+def test_deleted_columns_leave_the_rendered_layout(_qapp):
+    """The other half of the contract: `_populate_results` hands the hidden
+    keys to the table, and the table's layout omits them."""
+    from trade_scanner_fh.gui.widgets import ResultsTable
+    parent = _shell_with_deleted_columns(_qapp, {"avg_vol", "sti"})
+    parent.results_table = ResultsTable()
+    df = pd.DataFrame([{
+        "symbol": "A", "close": 100.0, "pct_gain": 5.0,
+        "avg_vol": 1000000.0, "sti": 1.5, "dollar_vol": 99.0,
+    }])
+    parent._populate_results(parent._apply_view_filters(df))
+    keys = [k for _h, k, _f in parent.results_table.active_columns]
+    assert "avg_vol" not in keys and "sti" not in keys
+    assert "dollar_vol" in keys and "symbol" in keys
 
 
 def test_apply_view_filters_tolerates_deleted_col_not_in_df(_qapp):

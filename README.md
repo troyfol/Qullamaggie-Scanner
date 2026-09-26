@@ -108,6 +108,7 @@ features at a live order-entry platform.
 - [Display-only mode & red-on-fail coloring](#display-only-mode--red-on-fail-coloring)
 - [Quarter-series filters — beats, consecutive growth & accelerating quarters](#quarter-series-filters--beats-consecutive-growth--accelerating-quarters)
 - [Match-color anchoring system](#match-color-anchoring-system)
+- [Color rules](#color-rules-v800)
 
 ### Extending it
 
@@ -300,7 +301,8 @@ colouring; **Save Preset** stores the full filter + window + column layout to
 | Symptom | Fix |
 |---------|-----|
 | Scan returns few or no rows | First check the funnel log for `Min Price` cutting almost everything — that means null cached prices, not a filter problem; run `Data → Deep OHLCV Refresh…`. Otherwise the OHLCV download is unfinished: wait for the toolbar status to go green, or `Data → Download Missing Tickers Only`. |
-| `WARNING - SUSPECT OHLCV REFRESH` after a refresh | The provider served the newest session with null prices. Wait for it to settle, then `Data → Deep OHLCV Refresh…` at 1 market day back. |
+| `WARNING - SUSPECT OHLCV REFRESH` after a refresh | The provider served the newest session with null prices — ≥ 5% of it overall, or ≥ 25% in some run of 400 consecutive tickers (v8.0.0; it was 50% overall, which missed a refresh that went bad part-way through). Treat every ticker's newest bar as suspect (volumes are understated too), wait for the session to settle, then `Data → Deep OHLCV Refresh…` over the whole store. |
+| A ticker you expect is missing | It may be hidden — check **Hidden ▾** on the ribbon and the scan's "Hidden rows" log line. Hides persist across scans and presets. |
 | Cached bar is present but wrong (null price, stale volume) | `Data → Deep OHLCV Refresh…`. `Force OHLCV Refresh` will **not** fix it — it re-checks staleness, which passes on any file whose last date is current however bad its values. |
 | Universe missing SEC tickers | No SEC contact email — see [Credentials](#credentials). |
 | Earnings filters all blank | Earnings parquets not filled — see [Filling the data stores](#filling-the-data-stores). |
@@ -1288,13 +1290,11 @@ All three filters are AND-combined when more than one is on. Invariant: a row pa
 
 Implemented at:
 - **Scanner side**: `scanner._compute_display_only_fails(params, row)` (scanner.py:986 ff.) returns a `{column_key: True}` dict for cells that would have failed the threshold. Stashed on the row as `_display_only_fails`.
-- **Widget side**: `ResultsTable._populate_row` (widgets.py:2632 ff.) reads `_display_only_fails` and applies `_FAIL_RED` (`#e74c3c`) foreground to flagged cells.
-
-**Order of foreground precedence** (later wins on conflict):
-1. Default text color
-2. Streak-green (`_STREAK_GREEN = #4caf50`) for cells inside an active beats streak
-3. Red-on-fail (`_FAIL_RED`) for display-only flagged cells
-4. Earnings-alignment palette color (most specific signal — see next section)
+- **Widget side** (v8.0.0): the default colour rule *"Display-only value
+  fails its filter"* (`gui/coloring.py`) paints every flagged cell `#e74c3c`.
+  See [Color rules](#color-rules-v800) — the old hard-coded order (streak
+  green, then fail red, then the match palette) is now the default rules'
+  ranking, and every piece of it can be edited, reordered or turned off.
 
 **To add red-on-fail support to a new filter**, add a corresponding `_flag_min` / `_flag_max` call (or a custom block) inside `_compute_display_only_fails` matching the filter's comparison logic in `_build_filter_stages`. Use the same column-key the value lives under in the row dict.
 
@@ -1489,6 +1489,22 @@ declines — because the pass condition is "there *exists* a run of length ≥ N
 The only prior workaround was setting Q Cap equal to Min, which is blunt and
 still admits a run that misses the newest quarter.
 
+**N/A quarters at the newest end (v8.0.0).** The growth and accelerating pools
+drop a quarter whose metric is N/A — a YoY whose year-ago EPS is under the
+$0.05 base, or that has no year-ago quarter at all — so a run used to end on
+whichever quarter last *had* a value, however long ago. ELOX passed Backward
+Only on a 2023 run: its 2026 report has no YoY and the history between is
+empty. The newest end is now held to the same bridging allowance as any other
+hole: with the default of 1, one N/A newest quarter may be stepped over (ATRO:
+Q-1's YoY is N/A, the run is Q-2..Q-4), two or more fail Backward Only. Beats
+never had the hole — an N/A surprise is a miss. Measured on the live store at
+the EPS YoY preset's settings (cap 4, min 3): 4 of 1,747 passing tickers drop
+(ELOX, INDO, WBX — real multi-year holes — and HEI-A, whose newest quarter
+finnhub stamped 2026-09 against a 2026-07 fiscal close, which reads as two
+missing quarters); uncapped, 68 of 1,825. Without Backward Only nothing
+changes. This amends spec line 94 ("the most recent quarter ... that has
+data"), which never considered a valueless newest quarter.
+
 **Defaults, chosen to preserve each type's prior behaviour:**
 
 | Type | Series | Backward Only | Bridging | Threshold |
@@ -1526,6 +1542,23 @@ A quarter is a hit when its YoY growth clears the Growth % threshold. By
 default the filter reports the **longest qualifying run anywhere in the
 pool** — tick Backward Only to require a live run instead.
 
+**Every quarter behind the count is on screen (v8.0.0).** A growth row draws
+its own Q-X blocks: the whole Q Cap pool, or, uncapped, back to the oldest
+quarter the run counted (at least Q-1, at most 20 — 74 live-store runs are
+longer than that). Before, only the beats filters drew blocks, so a growth
+count over four quarters beside beats blocks capped at three hid a quarter it
+used. Blocks are data, not per filter: a side shows as many as its widest
+active filter asks, and Last Report Date is dropped beside a Q-1 Date exactly
+as it is for beats. The row also gains a **Span** and **V** cell like the
+accelerating filters. The **"Quarter counted in the YoY … growth run"**
+default colour rule shades the YoY cell of each quarter the run counted — not
+Q-1..Q-count: a run that stepped over an N/A Q-1 is Q-2..Q-4.
+
+Note the display is capped, not the calculation's reach beyond it: the count
+never reads past the Q Cap, so the blocks always cover every quarter it could
+have used. Uncapped with a long-running grower in the results, a side can
+reach 20 blocks — set a Q Cap to keep the table narrow.
+
 ### Accelerating Quarters
 
 **Acceleration is measured in percentage points.** `V = 20 → V = 25` is a
@@ -1538,7 +1571,7 @@ move of **+5**, not +25%.
 | `Min Count` | quarters in the series, inclusive of the start. Floors at 2 — a one-quarter "series" has no acceleration step |
 | `Q Cap` | pool size, as above |
 | `Series` | `Longest` (greatest count, ties to the newest end) or `Most Recent` (newest-ending series) |
-| `Backward Only` | anchor on the newest quarter that has data and build only that series. Greys out `Series` |
+| `Backward Only` | anchor on the newest quarter that has data and build only that series; since v8.0.0 no more than the bridging allowance of N/A quarters may sit newer than it. Greys out `Series` |
 
 Series construction is two passes. Pass 1 extends backward from each
 terminal quarter as far as the step rules allow, giving that terminal its
@@ -1575,6 +1608,13 @@ cell's earnings match-colour**: all three cells light up when an
 indicator date pairs with *either* end of the series. This is the one
 place a cell has two anchor candidates rather than one — see
 `_anchor_date_candidates` in widgets.py.
+
+The two growth rows (v8.0.0) emit the same Span / V pair beside their count,
+anchored the same way; their count cell still takes no part in date matching.
+Every series filter also records the Q-X numbers it counted in a
+table-internal `_{prefix}_qs` list — matched on `period_ending`, because a
+late filing puts report order and fiscal order out of step — which is what the
+colour rules' *is counted in the run of* test reads.
 
 When nothing in the pool reaches `Min Count`, the best sub-threshold
 candidate is still reported (with `qualifies=False` internally) so
@@ -1649,6 +1689,90 @@ Default tolerance is **±1 day** — covers common timing offsets (after-hours r
 **Canonical map (paired-color sharing):** when an indicator date X matches a report date Y at offset ≠ 0, both X and Y end up in `_earnings_aligned_dates`. Naively this would assign each its own color (different ISO → different palette seed). To make the pair render in ONE color, the scanner also emits `_earnings_aligned_canon: dict[iso, canonical_iso]` mapping every matched date to its match's canonical (always the report date). The widget keys the color map off canonical isos, so X-cell and Y-cell both look up to Y's color. Tie-break when multiple report dates fall within tolerance: pick the closest (then earliest on ties) — deterministic and stable.
 
 **Backward compat:** exact matches (offset == 0 for all matched indicators in a row) emit no canonical map — the row payload stays lean, and the widget falls back to the legacy one-color-per-iso seeding. Unit-tested by `test_exact_match_does_not_emit_canonical_map` and `test_widget_falls_back_when_no_canonical_map`.
+
+---
+
+## Color rules (v8.0.0)
+
+What colours the results table is a ranked list of **rules**, edited in
+**Color Rules…** (ribbon, next to Hide FV Columns) and **saved with the
+preset** (`color_rules`). A preset saved before v8.0.0 loads the default
+rules, which are exactly the three schemes older versions hard-coded:
+
+| Default rule | Scope | Condition | Paints |
+|---|---|---|---|
+| Earnings date match | row | the scanner's indicator-date ↔ report-date match (Settings → match tolerance) | each matched date's unit, random palette colour per match |
+| Display-only value fails its filter | row | any display-only filter fails | the failing cells, `#e74c3c` |
+| Quarter inside the EPS beats streak | quarter | quarter is counted in the EPS beats streak | that quarter's EPS cells, `#4caf50`, N/A cells left alone |
+| Quarter inside the Rev beats streak | quarter | quarter is counted in the Rev beats streak | that quarter's Rev cells, `#4caf50`, N/A cells left alone |
+| Quarter counted in the YoY EPS growth run | quarter | quarter is counted in the YoY EPS growth run | that quarter's YoY EPS cell, background `#1d3f5c` |
+| Quarter counted in the YoY Rev growth run | quarter | quarter is counted in the YoY Rev growth run | that quarter's YoY Rev cell, background `#1d3f5c` |
+
+**Rules version 2 (v8.0.0 round 2).** The streak rules used to test "quarter
+number ≤ streak", which is only right while the streak ends on Q-1 in report
+order; they now test membership, so they stay right under Most Recent /
+Longest and across a late filing. They also leave N/A cells unpainted: a
+green N/A YoY cell read as "N/A counted as a beat" when the count was
+correct. The growth-run rules are new (background, so they combine with
+streak green). A preset saved by an earlier 8.0.0 build is upgraded on load —
+a default rule is replaced only if it is still exactly the version-1 default
+(its on/off switch is kept); an edited default is left as saved; the two
+growth rules are added after the Rev streak rule.
+
+A test (`tests/test_v8_coloring.py`) compares the engine with these defaults
+against a verbatim copy of the 7.0.2 renderer, cell by cell, on hand-built
+edge cases and a seeded 400-row random corpus — amended in one marked place
+for the N/A rule above.
+
+**A rule** has:
+
+- **Test** — *each row*, or *each quarter* (Q-1…Q-N, with `Q-X` columns
+  meaning "this quarter").
+- **Conditions**, joined by *all* or *any*:
+  - **Value** — any column vs a number (`2.5B` works) or another column;
+    between; blank; in the top / bottom N % of the period; text contains.
+  - **Filter result** — a display-only filter (or any) fails / passes.
+  - **Date** — date A within ± N days of, or at least N days before / after,
+    date B or *any earnings report date* in the row.
+  - **Quarter number** — for per-quarter rules: compared with a number or a
+    column, or **is counted in the run of** a beats / growth / accelerating
+    filter (the quarters that filter actually counted).
+  - **Earnings date match** — the scanner's own matching.
+- **Color** — the whole row, chosen columns (a `Q-X` type means that type at
+  every matching quarter), or the cells the conditions use (plus, for date
+  rules, each matched date's linked value cells).
+- **Style** — text colour, background, bold; each colour **none**, **fixed**
+  (any colour — the full colour picker, custom colours included) or
+  **random** from an editable palette. Random is stable per ticker and
+  distinct between matches in one row; a background draw is salted so text
+  and background never collide by construction.
+- **Leave N/A cells uncolored** — the rule skips a target cell with no value.
+
+**Precedence:** higher in the list wins, **per style channel** — the strongest
+rule that sets a cell's text colour wins its text colour, independently of
+which rule wins its background or bold.
+
+A rule that reads a column the scan did not produce is **inactive**, not an
+error: the editor shows "needs <column>" and the rule stays saved. The editor
+shows each rule's live match count for the period on screen; **Apply**
+repaints immediately.
+
+**Excel export** colours **every period's sheet** (font, fill, bold) by the
+same rules — before v8.0.0 only the period on screen was coloured, because
+colours were read back off the table model.
+
+**Export headers are unique (v8.0.0 round 2).** The EPS and Rev blocks both
+label their date column "Q-k Date". Every export built its sheet keyed by
+header, so with both sides on screen the Rev date overwrote the EPS one and a
+column vanished per quarter (7.0.2 and earlier too — unnoticed because one
+report usually dates both); from v8.0.0 the colour pass, which places by
+position, then painted one cell over. Clashing headers now carry their side —
+`Q-1 Date (EPS)` / `Q-1 Date (Rev)` — in Excel and CSV alike; every other
+header is unchanged.
+
+Implementation: `gui/coloring.py` (pure evaluation — no Qt objects — shared
+by the table and the exporter), `gui/color_rules_dialog.py` (editor),
+`ResultsTable.set_color_rules`, `MainWindow._apply_color_rules`.
 
 ---
 
@@ -2506,18 +2630,49 @@ Schedule…
 
 Each fill writes to its dedicated parquet (`earnings_history` for Finviz/Zacks/Finnhub; `earnings_dates` for Nasdaq/Yahoo) and triggers an auto-reconcile against affected tickers. Internal identifiers, slot method names (e.g. `_on_zacks_fill_done`, `_on_finnhub_fill_done`), and parquet `source` column values use bare source names (`"finviz"`, `"zacks"`, `"finnhub"`, `"nasdaq"`, `"yahoo"`).
 
-### Delete rows from results table
+### Hide rows (v8.0.0 — replaced delete)
 
-Hard-delete rows from the active period's scan output via:
+Rows are **hidden**, never deleted. Hide the selected rows with:
 
-- **`Delete` key** when one or more rows are selected
-- **Right-click → "Delete selected row(s)"** on the results table
+- the **`Delete`** key (or Backspace), or
+- **right-click → "Hide row(s)"** on the results table.
 
-Multi-select via standard Qt extended selection (shift-click for ranges, ctrl-click for non-contiguous). The deletion mutates `MainWindow._period_results[<active_period>]` directly, so it persists across view-filter toggles, sort changes, timeframe-tab switches, and exports. Reset implicitly on the next scan (fresh `_period_results` overwrites the dict).
+A hidden row is keyed by **ticker** and leaves every view at once: the table,
+**every timeframe period**, Excel / CSV / Quick Export, and Send to
+Watchlist. Nothing is removed from `_period_results` — the scan data stays
+intact, which is also why a hidden ticker still counts in the watchlist diff
+(it is hidden, not absent). Hiding is applied in `MainWindow._apply_view_filters`,
+the single path every render and export already takes.
 
-`ResultsTable.rows_deletion_requested` signal is the wire — emitted by both triggers, handled by `MainWindow._on_rows_deletion_requested`.
+Hidden rows **persist across new scans** and are **saved with the preset**
+(`row_hidden`). Because a hide can outlive the scan it was made in, three
+things keep it visible:
 
-**Undo delete (single level, F2).** The most recent deletion batch can be restored via **Ctrl+Z** (results table focused) or **right-click → "Undo delete"**. The delete handler snapshots the doomed rows + their positional indices before mutating; `_on_undo_delete_requested` reinserts them at their original spots via the pure helper `widgets.restore_rows_at_positions`. One level only — a new delete overwrites the snapshot, an undo consumes it (double-undo no-ops), and a fresh scan clears it (alongside the cut clipboard). Wire: `ResultsTable.undo_delete_requested` → `MainWindow._on_undo_delete_requested`; the table only tracks availability (`set_undo_available`) so its context menu can show/hide the action.
+- the ribbon button **"Hidden: N rows · M cols ▾"** (next to Color Rules…),
+  whose menu offers every unhide action;
+- the timeframe dropdown labels (`1D — 309 results (2 hidden)`);
+- a log line after each scan naming any hidden tickers present in its results.
+
+**Unhide** from the body right-click menu: **Unhide rows ▸** (a submenu of
+hidden tickers — ones not in the current period, or removed by a view filter,
+are labelled as such) or **Unhide all rows**. The ribbon menu offers the same,
+and is the unhide path that still works when the HOTKEY sender's right-click
+cue has taken over the table's own menu.
+
+**Undo:** **Ctrl+Z** (table focused) or **Undo hide** unhides the most recent
+*batch*. It is multi-level (newest first, 50 deep) and skips a batch you have
+already unhidden by hand. Hiding columns (right-click or the Columns dialog)
+records batches on the same stack.
+
+**Presets always match the incoming preset** (v8.0.0 rule): loading a preset
+REPLACES the hidden rows, hidden columns, Hide Q Columns types and Hide FV
+Columns categories with the preset's own — a key the preset lacks means
+*nothing hidden*. The undo stack goes with the outgoing preset.
+
+Implementation: `gui/hiding.py` (`HideManager`; state stays on the window as
+`_hidden_row_symbols`, `_deleted_column_keys`, `_hide_undo_stack`). Signals:
+`ResultsTable.rows_hide_requested` / `rows_unhide_requested` /
+`rows_unhide_all_requested` / `hide_undo_requested`.
 
 ### Watchlist diffing (Chg column + per-period log lines)
 
@@ -2544,17 +2699,38 @@ Reorder rows manually via right-click:
 
 The paste signal (`ResultsTable.rows_paste_requested(cut_symbols, target_symbol)`) is handled by `MainWindow._on_rows_paste_requested`, which mutates `_period_results[active_period]` and re-renders. The reorder persists across view-filter toggles, sort changes, and tab switches.
 
-Clipboard is cleared on paste, on row deletion (any cut symbol may have been deleted), and on the next scan. Pasting onto a row that's part of the cut set is rejected (would orphan the target).
+Clipboard is cleared on paste, on a row hide (a cut ticker may now be hidden), and on the next scan. Pasting onto a row that's part of the cut set is rejected (would orphan the target).
 
-### Delete columns from view
+### Hide columns (v8.0.0 — replaced delete)
 
-Right-click any column header → **"Delete N columns"** removes those columns from the rendered table. Hidden columns persist across view-filter toggles, sort changes, and tab switches but DON'T touch `_period_results` — the scan data is preserved, only the rendered slice is trimmed.
+Right-click any column header → **"Hide N columns"**. Multi-column: ctrl/
+shift-click several headers first. A hidden column is removed from the table's
+column **layout** (`ResultsTable.set_hidden_column_keys` →
+`_build_dynamic_columns(hidden_keys=)`), never from the data — the same
+mechanism as Hide Q Columns. Before v8.0.0 "Delete column" dropped the column
+from the frame instead, and because the per-quarter blocks are laid out by
+quarter index, a deleted `Q-2 Date` came straight back as an empty column.
 
-The always-visible core columns (`symbol`, `close`, `pct_gain`, `gain_start_date`) are filtered out before the deletion request reaches MainWindow — they can never be hidden via this menu (would break export and core display invariants).
+- **Only the Ticker column cannot be hidden** (`_UNHIDEABLE_KEYS`). Close, %
+  Gain and Gain Start became hideable in v8.0.0.
+- **Hide Q Columns / Hide FV Columns trump the right-click.** A column one of
+  those dropdowns suppresses is listed in the header's **Unhide columns ▸**
+  submenu disabled, with the dropdown named, and **Unhide all columns** leaves
+  it hidden.
+- A hidden column the current scan does not produce is listed as
+  "(not in this scan)" and can still be cleared.
+- The **Columns ▾** dialog shows hidden columns unticked (before v8.0.0 they
+  dropped out of its list and only Reset to Default could bring them back).
+- Hidden columns keep their slot in the saved order through a header drag, so
+  an unhidden column returns where it was.
+- Excel export writes exactly what is on screen; hidden columns are re-offered
+  **unticked** in the export dialog.
+- Hidden columns persist across scans and are saved with the preset
+  (`column_hidden`). **Reset to Default** (header or Columns dialog) clears
+  order and column hides; it never touches row hides.
 
-Hidden-column set is reset on every fresh scan so a new scan with different filters / column shape doesn't have to fight stale hides.
-
-Multi-column hide: shift/ctrl-click multiple headers to build the multi-select group (selected headers highlight with a marker), then right-click → "Delete N columns".
+Because the data survives, a colour rule can still read a hidden column —
+"compute it (Display Only), hide it, colour by it" is a supported workflow.
 
 ### Cut + Paste columns (manual reorder)
 
@@ -2703,9 +2879,9 @@ Note that `FAIL_NOT_FOUND` tickers are ALREADY auto-added to the skip list by `_
 
 Tested in `tests/test_audit_gui_fixes.py`: `test_send_misses_to_skip_list_*` (6 tests covering dedup, normalization, idempotence, empty/blank handling, and rollback on save failure).
 
-### Preset format (v6)
+### Preset format (v7)
 
-JSON files at `scanner_data/presets/{name}.json`. `PRESET_SCHEMA_VERSION = 6`. v6 fields:
+JSON files at `scanner_data/presets/{name}.json`. `PRESET_SCHEMA_VERSION = 7`. v7 fields:
 
 ```json
 {
@@ -2729,10 +2905,32 @@ JSON files at `scanner_data/presets/{name}.json`. `PRESET_SCHEMA_VERSION = 6`. v
   "view_interleave_quarters": bool,
   "column_order": [str, ...],
   "column_hidden": [str, ...],
+  "row_hidden": [str, ...],
+  "hidden_earnings_col_types": [str, ...],
+  "hidden_fv_col_types": [str, ...],
+  "color_rules": {"version": 1, "rules": [ ... ]},
   "omit_previously_scanned": bool,
   "omit_earlier_period_hits": bool
 }
 ```
+
+**v7 changes (v8.0.0, replaced v6):**
+
+- **Added** `row_hidden`, `hidden_fv_col_types` and `color_rules`.
+- **Loading replaces every hide set** with the preset's — a missing key means
+  nothing hidden (before, a missing key kept the session's choice).
+- **Indicator rows the preset does not mention are reset to their defaults**
+  instead of keeping the session's state. Every preset written before v7.0.0
+  omits the Beta / volatility / z-score / finviz rows, so a filter switched on
+  for one scan used to ride along into the next preset's scan.
+- **So are settings a mentioned row predates** (round 2): Series / Backward
+  Only (v6.3.0), Period Avg / Max (v6.4.0), Beta's Returns (v8.0.0), and
+  `display_only` in the oldest files. The EPS YoY preset has no Period Avg
+  settings, so a Period Avg filter switched on beforehand rode into its scan.
+- The finviz rows' spinbox ranges changed (per field, data-profiled). A pre-v7
+  preset's bound that sat AT an old limit — "no limit on this side" — is
+  mapped to the new limit on load (`finviz_snapshot.migrate_v7_bounds`), so an
+  open bound stays open instead of becoming a real filter.
 
 **v6 changes (replaced v5):**
 
@@ -3010,7 +3208,7 @@ data directory.
 
 ## Testing
 
-Test suite at `trade_scanner_fh/tests/` — **1,928 tests, all passing** as of 2026-09-19 (v6.3.3 added 18, v6.3.2 added 40, v6.3.1 added 16, v6.3.0 added 93 across the disagreement merge, the failure taxonomy, the trim scoping, both new features and the unified series engine; v6.2.0 brought it to 1,759; v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
+Test suite at `trade_scanner_fh/tests/` — **2,339 tests, all passing** as of 2026-09-26 (v8.0.0 added 236 across the eight fixes, hide / unhide, the colour-rule engine and its editor, and the round-2 fixes from user testing; v6.3.3 added 18, v6.3.2 added 40, v6.3.1 added 16, v6.3.0 added 93 across the disagreement merge, the failure taxonomy, the trim scoping, both new features and the unified series engine; v6.2.0 brought it to 1,759; v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
 
 ```bash
 cd c:/python/EDA_Project/Trade_Scanner_FH
@@ -3024,6 +3222,15 @@ last measure (2026-06):
 c:/python/envs/eda-pipeline/python.exe -m pytest trade_scanner_fh/tests -q \
     --cov=trade_scanner_fh --cov-report=term
 ```
+
+**Isolation (v8.0.0).** An autouse fixture in `conftest.py`,
+`_isolate_main_window`, stubs `MainWindow._startup`,
+`_load_universe_and_update` and the coordinator's background split-artifact
+rebuild, and backs `_qsettings()` with a throwaway INI file. Without it a
+real `MainWindow()` in a test could start the launch universe / OHLCV
+pipeline (network, writes into the package dev store) and a closed test
+window wrote its geometry into the user's registry. A suite run now writes
+nothing outside its temp directories.
 
 **Canonical fixtures** live in
 [`tests/conftest.py`](trade_scanner_fh/tests/conftest.py) (centralized
@@ -3112,6 +3319,11 @@ client's rate limiter).
 | `test_acl_hardening.py` | DATA_DIR ACL hardening against the REAL `icacls` — pre-existing files stay readable, non-empty DACL, v1-sentinel rerun |
 | `test_period_stats_and_hidden_types.py` | **v6.4.0.** Period Avg / Max over the resolved window (engine + scanner + columns), the checkbox-gated thresholds, and hide-by-column-type. Contains the regression guard proving that hiding `Q-X Reported EPS` cannot collapse the EPS block or switch off Interleave |
 | `test_volatility_and_zscore.py` | **v7.0.0.** Price z-score (period selection, ddof=1, the 20-bar floor, truncation flagging) and the realized-volatility set, each checked against a hand-written computation rather than a frozen constant. Also pins that `max_trailing_bars()` only counts the long new lookbacks when the indicator will actually run |
+| `test_v8_bugfixes.py` | **v8.0.0.** The eight fixes end to end (FV join scope, layout-level column hiding, per-field ranges + suffix spinbox + v7 preset migration, benchmark loading for Beta / display-only RS, display-only red for Beta and finviz, the Columns dialog, the Beta lookback), the preset row-reset rule, and Hide FV Columns |
+| `test_v8_hide_unhide.py` | **v8.0.0.** Hide / unhide rows and columns through the real menus, Delete key and Ctrl+Z, every export path, Send to Watchlist, presets replacing every hide set, the ribbon indicator and timeframe labels, order preservation through a drag |
+| `test_v8_coloring.py` | **v8.0.0.** The colour-rule engine — including a verbatim copy of the 7.0.2 renderer as an oracle that the default rules must match cell for cell (hand-built edge cases + a 400-row random corpus) — plus every condition kind, operator, scope, target, per-channel precedence and the JSON round trip |
+| `test_v8_color_rules_ui.py` | **v8.0.0.** The Color Rules editor (lossless round trip of any rule, building rules through the widgets, list operations, palette editor, live status), and its wiring into the table, presets and multi-sheet Excel colouring, including unique export headers |
+| `test_v8_series_display.py` | **v8.0.0 round 2.** Built from ATRO / ELOX / a late filing: the Backward Only tail limit (growth + accelerating), counted-quarter membership in fiscal order, growth Q-X blocks / Span / V, the phantom beats column, `in_run` + skip-N/A colouring, the rules v1 → v2 upgrade, the dialog round trip, preset settings falling back to defaults, and Beta at weekly / monthly (exact slopes, the fast period picker against pandas resample, the scan path) |
 | `test_finviz_snapshot.py` | **v7.0.0 - 7.0.2.** Snapshot parsing (duplicate `EPS next Y`, the seven two-value cells, short ETF grids, the `Change %` label), the not-found gate that decides permanent skip-listing, the store's merge-never-replace rule, the sweep's block/abort behaviour, the launch cadence prompt, per-field spinbox ranges, sweep log visibility, the attributes skip list's reason codes end to end, its editor, and the gap fill's target selection and clock handling |
 
 ### Test invariants
@@ -3310,6 +3522,14 @@ directories, and the previous `_internal/`.
 
 ---
 
+## v8 module map
+
+| Module | Role |
+|---|---|
+| `gui/coloring.py` | Colour rule engine: model, JSON, `default_rules()`, vectorised evaluation, per-channel precedence |
+| `gui/color_rules_dialog.py` | The Color Rules editor (non-modal; Apply repaints live) |
+| `gui/hiding.py` | `HideManager` — hide / unhide rows and columns, undo stack, preset replace, indicators |
+
 ## v7 module map
 
 Four modules were added in the v7 line. Everything else in `trade_scanner_fh/`
@@ -3329,6 +3549,91 @@ therefore refreshes that ticker's attributes at no extra cost, independently
 of whether the sweep ever runs.
 
 ## Changelog
+
+### v8.0.0 — hide / unhide, colour rules, and eight fixes (2026-09-26)
+
+**Hide instead of delete.** Rows and columns are hidden (right-click, Delete
+key, Columns dialog) and unhidden (right-click submenus, Unhide all, the new
+**Hidden ▾** ribbon button, multi-level Ctrl+Z). Hidden rows leave every
+period, every export and Send to Watchlist; hides persist across scans and
+presets; only the Ticker column cannot be hidden; Hide Q / Hide FV Columns
+trump the right-click. See [Hide rows](#hide-rows-v800--replaced-delete) and
+[Hide columns](#hide-columns-v800--replaced-delete).
+
+**Color rules.** A ranked, per-preset list of rules — value / filter / date /
+per-quarter conditions, text colour + background + bold, fixed or random
+colours with an editable palette — replaces the three hard-coded schemes,
+which ship as the defaults and reproduce the old colours cell for cell. Excel
+export now colours every period. See [Color rules](#color-rules-v800).
+
+**Hide FV Columns ▾.** The finviz counterpart of Hide Q Columns: one tick per
+panel heading hides that category's FV columns.
+
+**Fixes**
+
+1. **Every FV column showed on every scan.** `run_scan` joined all ~90
+   snapshot columns; it now joins only the finviz rows set to Filter or Display
+   Only (and skips the store entirely when none are). The 11 fields with no
+   panel row got a collapsed **Info** section of display-only rows.
+2. **Deleting a column left an empty column** (quarter blocks are laid out by
+   index) — fixed by hiding from the layout.
+3. **Finviz spinbox ranges** are now per field, profiled against 11,594 real
+   tickers; big numbers read and type as `2.5B`. **"Income ≥ 0" was
+   impossible to express** (a bound at its limit means "open", and Income's
+   floor was 0); Enterprise Value, EV/EBITDA and EV/Sales had the same hole.
+4. **Beta (calc) never appeared** — SPY was only loaded when an RS filter was
+   *enabled*; as a filter it zeroed every scan.
+5. **RS in display-only mode** had the same SPY gap.
+6. **Display-only red** never fired for Beta (calc) or any finviz row.
+7. **The Columns dialog could not bring a hidden column back.**
+8. **The split-seam quarantine ignored Beta (calc)'s lookback.**
+
+Found during testing and fixed:
+
+- **Loading a preset kept every row it did not mention** in the session's
+  state, so filters leaked between presets (every pre-v7 preset omits the v7
+  rows).
+- **The Hide menus listed every type before any scan.**
+- **Excel colours could land on the wrong column** after a column drag.
+- **The null-bar warning missed a refresh that went bad part-way through.**
+  The 2026-09-24 evening refresh came back 21.5% null (SPY and every sector ETF
+  included) — 0–2% for A–O, 65–84% from Q onward, starting ≈20:10 ET — and the
+  50% run-wide threshold kept it at INFO. Not a block (0 errors, steady pace);
+  volumes were short even where prices were fine. New thresholds: 5% overall,
+  or 25% in any run of 400 consecutive tickers.
+- **Test isolation:** a real `MainWindow()` in a test could start the launch
+  universe / OHLCV pipeline (network, writes to the package dev store), and a
+  closed test window wrote its geometry into the real registry. A `conftest`
+  fixture now isolates both for every test.
+
+**Round 2 — from user testing (2026-09-26)**
+
+- **"Calculated Beta is wildly off finviz's."** Not a bug: finviz publishes a
+  **5-year monthly** beta vs SPY (recomputed from our closes it matches within
+  0.05 on 96% of tickers); ours was 1 year of daily returns. Beta (calc) now
+  has a **Returns** choice — Daily (default, unchanged), Weekly, Monthly;
+  choosing one by hand sets Lookback to 252 / 104 / 60 — and Monthly × 60
+  reproduces finviz as of the scan date (within 0.1 on 98.3%; all $10B+
+  names). Weekly / Monthly use simple period returns. The header names the
+  basis (`Beta calc 60M`); finviz's is labelled *5Y monthly*.
+- **"N/A columns counted as beats."** The count was right (an N/A surprise is
+  a miss — 0 of 5,659 shaded quarters had one); the streak green painted the
+  whole block, including a YoY cell N/A under the $0.05 base. Rules version 2:
+  streak rules leave N/A cells alone and colour the quarters actually counted.
+- **A growth count used quarters that were not on screen**, and **Backward
+  Only let a years-old growth run pass** past N/A newest quarters — see
+  [Series and Backward Only](#series-and-backward-only) and
+  [Consecutive YoY Growth](#consecutive-yoy-growth). Growth rows now draw
+  their own Q-X blocks, Span and V, and a default rule shades their counted
+  quarters.
+- **A growth-only scan showed an all-N/A "Consec EPS Beats" column.**
+- **Settings a preset predated kept the session's value** (Period Avg / Max,
+  Series, Backward Only, display-only).
+- **Exports lost a date column per quarter** when both EPS and Rev blocks were
+  on screen, and v8 colours then landed one cell over — see
+  [Color rules](#color-rules-v800).
+
+`PRESET_SCHEMA_VERSION` 6 → 7 (see [Preset format](#preset-format-v7)).
 
 ### v7.0.2 - attributes skip list editor, gap fill, reason fix, and sweep visibility (2026-09-21)
 

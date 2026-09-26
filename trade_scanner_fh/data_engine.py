@@ -310,11 +310,26 @@ def trading_days_back(n: int, *, sessions: Optional[pd.DatetimeIndex] = None) ->
 
 
 class LastBarHealth(NamedTuple):
-    """Null-price rate on the most recent session covered by a set of results."""
+    """Null-price rate on the most recent session covered by a set of results.
+
+    `burst_pct` is the worst null rate over any `OHLCV_NAN_BURST_WINDOW`
+    consecutive on-session results, in processing order, and `burst_start`
+    the symbol that window opens on (v8.0.0). Both stay at their defaults when
+    the run is shorter than the window.
+    """
     session: Optional[pd.Timestamp]
     null_count: int
     total: int
     pct: float
+    burst_pct: float = 0.0
+    burst_start: Optional[str] = None
+
+    def is_suspect(self) -> bool:
+        """Should this run be reported as a bad refresh?"""
+        if (self.total >= config.OHLCV_NAN_MIN_SAMPLE
+                and self.pct >= config.OHLCV_NAN_LAST_BAR_WARN_PCT):
+            return True
+        return self.burst_pct >= config.OHLCV_NAN_BURST_WARN_PCT
 
 
 def summarize_last_bar_health(results, session=None) -> LastBarHealth:
@@ -340,9 +355,26 @@ def summarize_last_bar_health(results, session=None) -> LastBarHealth:
     on_session = [r for r in considered if r.last_bar_date == sess]
     if not on_session:
         return LastBarHealth(sess, 0, 0, 0.0)
-    nulls = sum(1 for r in on_session if getattr(r, "last_bar_nan", False))
+    flags = [bool(getattr(r, "last_bar_nan", False)) for r in on_session]
+    nulls = sum(flags)
+
+    # Worst window, O(n) with a running sum. Order is the order the results
+    # arrived in, which is the refresh's own (alphabetical) sweep order.
+    burst_pct, burst_start = 0.0, None
+    win = int(config.OHLCV_NAN_BURST_WINDOW)
+    if win > 0 and len(flags) >= win:
+        running = sum(flags[:win])
+        best, best_at = running, 0
+        for i in range(win, len(flags)):
+            running += flags[i] - flags[i - win]
+            if running > best:
+                best, best_at = running, i - win + 1
+        burst_pct = best / win * 100.0
+        burst_start = getattr(on_session[best_at], "symbol", None)
+
     return LastBarHealth(
-        sess, nulls, len(on_session), nulls / len(on_session) * 100.0
+        sess, nulls, len(on_session), nulls / len(on_session) * 100.0,
+        burst_pct, burst_start,
     )
 
 

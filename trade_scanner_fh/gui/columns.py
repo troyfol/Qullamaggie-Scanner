@@ -59,9 +59,46 @@ class ColumnManager:
         """Persist the user's column order. Threaded into Excel
         export and re-applied across timeframe switches. Also pushes
         into the open Columns dropdown so it stays in sync with a
-        header drag."""
-        self.win._results_column_order = list(keys)
+        header drag.
+
+        `keys` comes from the header, which only knows VISIBLE columns. A
+        hidden column is merged back into the order next to the column it
+        followed before (v8.0.0) — otherwise any drag would silently drop it
+        from the saved order, and on unhide it would land at the far end
+        instead of where the user last had it.
+        """
+        self.win._results_column_order = self._merge_hidden_into_order(
+            list(keys))
         self.win._sync_columns_dialog()
+
+    def _merge_hidden_into_order(self, visible: list) -> list:
+        win = self.win
+        try:
+            hidden = set(win._deleted_column_keys)
+        except (AttributeError, RuntimeError):
+            hidden = set()
+        if not hidden:
+            return visible
+        base = list(getattr(win, "_results_column_order", []) or [])
+        if not base:
+            full = self._layout_with_hidden_columns()
+            base = [c[1] for c in full] if full else []
+        out = list(visible)
+        placed = set(out)
+        # Walk the previous order so a run of adjacent hidden columns keeps
+        # its internal order: each is anchored on whatever precedes it in
+        # `base` — which, for the second of two hidden columns, is the first.
+        for i, key in enumerate(base):
+            if key not in hidden or key in placed:
+                continue
+            anchor_pos = -1
+            for j in range(i - 1, -1, -1):
+                if base[j] in placed:
+                    anchor_pos = out.index(base[j])
+                    break
+            out.insert(anchor_pos + 1, key)
+            placed.add(key)
+        return out
 
     def _on_interleave_quarters_toggled(self, checked: bool):
         """User toggled the Interleave Q EPS+Rev checkbox. Flip the
@@ -106,9 +143,15 @@ class ColumnManager:
         except (AttributeError, RuntimeError):
             active = []
         if active and self.win.results_table.model_src.rowCount() > 0:
-            # Live populated table — already in the user's visual order
-            # via `_apply_saved_order` after populate. Mirror that order
-            # in the dialog.
+            # Live populated table. List the layout BEFORE individual hiding
+            # so an unticked column stays in the list, unticked, and can be
+            # ticked back (v8.0.0). Listing the live `active` layout — as
+            # this did before — dropped every hidden column from the dialog
+            # on the next sync, leaving Reset to Default (which also throws
+            # away the column order) as the only way to get one back.
+            full = self._layout_with_hidden_columns()
+            if full is not None:
+                return full
             return self.win._reorder_for_visual(active)
         # No scan in flight; consult the saved order if we have one
         # (preset-loaded scenario). Use a synthetic canonical build
@@ -124,6 +167,35 @@ class ColumnManager:
                     seen.add(k)
             return out
         return []
+
+    def _layout_with_hidden_columns(self):
+        """The active period's column layout with individually hidden columns
+        INCLUDED, in the order the table uses, or None if no frame is
+        available.
+
+        Order mirrors `ResultsTable._apply_saved_order`: keys in the saved
+        order first, in that order; every other key after them in canonical
+        order. Type-hidden columns (Hide Q / Hide FV) stay out — their
+        dropdowns are the control for them.
+        """
+        win = self.win
+        try:
+            label = getattr(win, "_active_period", None)
+            df = win._period_results.get(label) if label else None
+            if df is None:
+                return None
+            layout = win.results_table.columns_before_key_hiding(df)
+        except (AttributeError, RuntimeError, TypeError) as exc:
+            log.debug("columns dialog: full layout unavailable: %s", exc)
+            return None
+        saved = list(getattr(win, "_results_column_order", []) or [])
+        if not saved:
+            return layout
+        by_key = {c[1]: c for c in layout}
+        ordered = [by_key[k] for k in saved if k in by_key]
+        seen = {c[1] for c in ordered}
+        ordered.extend(c for c in layout if c[1] not in seen)
+        return ordered
 
     def _reorder_for_visual(self, active: list[tuple]) -> list[tuple]:
         """Return `active` reordered to match the table header's
@@ -144,7 +216,9 @@ class ColumnManager:
         rather than spawning a second copy. Pre-scan + no-preset state
         falls through to a status-bar nudge instead of a useless empty
         popup."""
-        from .widgets import _ALWAYS_VISIBLE_KEYS as _CORE_KEYS
+        # Only Ticker is locked (v8.0.0); Close / % Gain / Gain Start became
+        # hideable along with every other column.
+        from .widgets import _UNHIDEABLE_KEYS as _CORE_KEYS
         win = self.win
         cols = win._current_columns_for_dialog()
         if not cols:
@@ -172,19 +246,26 @@ class ColumnManager:
 
     def _on_columns_dialog_updated(self, ordered_keys: list, hidden_keys: list):
         """Drag/check change inside the dropdown popup. Mirror onto
-        MainWindow state and re-render. Always-visible keys can never
-        appear in `hidden_keys` (the dialog blocks that), so this is a
-        plain assignment."""
-        from .widgets import _ALWAYS_VISIBLE_KEYS as _CORE_KEYS
-        # Belt-and-suspenders: drop core keys from the hidden set in
-        # case a future bug lets them slip through the dialog filter.
+        MainWindow state and re-render. The Ticker column can never appear
+        in `hidden_keys` (the dialog locks it).
+
+        Columns newly unticked here are recorded as one hide batch, so
+        Ctrl+Z undoes them exactly as it undoes a right-click hide."""
+        from .widgets import _UNHIDEABLE_KEYS as _CORE_KEYS
+        # Belt-and-suspenders: drop the locked key from the hidden set in
+        # case a future bug lets it slip through the dialog filter.
         sanitized_hidden = {k for k in hidden_keys if k not in _CORE_KEYS}
+        before = set(getattr(self.win, "_deleted_column_keys", set()))
         self.win._results_column_order = list(ordered_keys)
         self.win._deleted_column_keys = sanitized_hidden
         try:
             self.win._reapply_view_filters_for_active_period()
         except Exception as exc:
             log.debug("re-render after columns dialog update failed: %s", exc)
+        try:
+            self.win._hide_mgr.record_dialog_hides(before, sanitized_hidden)
+        except Exception as exc:
+            log.debug("recording dialog hides failed: %s", exc)
 
     def _on_columns_dialog_reset(self):
         """User clicked Reset to Default inside the popup. Clears both
@@ -216,6 +297,10 @@ class ColumnManager:
         except Exception as exc:
             log.debug("re-render after column reset failed: %s", exc)
         win._sync_columns_dialog()
+        try:
+            win._hide_mgr.refresh_indicators()
+        except Exception as exc:
+            log.debug("hidden indicator refresh after reset failed: %s", exc)
 
     def _sync_columns_dialog(self) -> None:
         """Push the current MainWindow column state into the open
@@ -255,27 +340,3 @@ class ColumnManager:
         saved_set = set(kept)
         additions = [k for k in canonical_keys if k not in saved_set]
         win._results_column_order = additions + kept
-
-    def _on_columns_deletion_requested(self, keys: list):
-        """User hid one or more columns via the header right-click
-        menu. Add the keys to the per-session hide-set and re-render.
-        Always-visible core columns are filtered upstream by the
-        ResultsTable translator slot, so this slot doesn't need to
-        re-check them."""
-        if not keys:
-            return
-        added = False
-        for k in keys:
-            if k and k not in self.win._deleted_column_keys:
-                self.win._deleted_column_keys.add(k)
-                added = True
-        if not added:
-            return
-        log.info(
-            "Hid %d column(s) from view: %s",
-            len(keys), ", ".join(keys),
-        )
-        try:
-            self.win._reapply_view_filters_for_active_period()
-        except Exception as exc:
-            log.debug("re-render after column delete failed: %s", exc)

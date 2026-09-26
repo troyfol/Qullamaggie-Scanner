@@ -221,6 +221,40 @@ def build_quarter_points(
     return points
 
 
+def trailing_missing_quarters(
+    ticker_history: Optional[pd.DataFrame],
+    points: Sequence[QuarterPoint],
+    *,
+    quarter_cap: int = 0,
+) -> int:
+    """Fiscal quarters in the pool that are NEWER than its newest point.
+
+    `missing_before` measures the holes between points, so a hole at the
+    newest end of the pool is invisible to it: a quarter that was reported
+    but carries no value for the metric is dropped by `build_quarter_points`,
+    and the run then simply ends on the last quarter that has one. This is
+    the count Backward Only needs to hold that tail to the same bridging
+    allowance as any other hole (v8.0.0).
+
+    Counted in fiscal-period steps from the newest point to the newest
+    period in the same capped pool, so a reported-but-valueless quarter and
+    a quarter absent between them both count, exactly as `missing_before`
+    counts them. 0 when the newest quarter has a value, when there are no
+    points, or when the history carries no usable period.
+    """
+    if not points or ticker_history is None or ticker_history.empty:
+        return 0
+    if "period_ending" not in ticker_history.columns:
+        return 0
+    cap = int(quarter_cap or 0)
+    df = ticker_history.head(cap) if cap > 0 else ticker_history
+    periods = pd.to_datetime(df["period_ending"], errors="coerce").dropna()
+    if periods.empty:
+        return 0
+    newest = pd.Timestamp(periods.max()).normalize()
+    return _period_steps(points[-1].period, newest)
+
+
 # ----------------------------------------------------------------------
 # Shared step rules (spec 3.1, 3.2)
 # ----------------------------------------------------------------------
@@ -285,6 +319,20 @@ def window_values(
     )
 
 
+def window_periods(
+    points: Sequence[QuarterPoint], start_i: int, end_i: int,
+) -> tuple:
+    """The fiscal periods of the quarters `window_values` reads, oldest first.
+
+    Same indices, same finite filter, so the quarters the table colours are
+    exactly the quarters Period Avg / Max averaged.
+    """
+    return tuple(
+        p.period for p in points[start_i:end_i + 1]
+        if p.value is not None and np.isfinite(p.value)
+    )
+
+
 def series_avg(values: Sequence[float]) -> float:
     """Mean of a resolved window, or NaN when the window is empty.
 
@@ -331,6 +379,10 @@ class RunSeries:
     absent from `points` entirely, so they cannot leak in. Defaulted to the
     empty tuple: a few tests construct this dataclass directly, and an
     unsupplied window simply reports N/A rather than raising.
+
+    `periods` (v8.0.0) is the fiscal period of every quarter that COUNTED,
+    oldest first — bridged quarters excluded. The results table uses it to
+    colour exactly those quarters rather than guessing from the length.
     """
     length: int
     start_value: float
@@ -341,6 +393,7 @@ class RunSeries:
     end_report_date: Optional[pd.Timestamp]
     qualifies: bool
     values: tuple = ()
+    periods: tuple = ()
 
 
 def _runs(
@@ -387,6 +440,7 @@ def run_series(
     max_bridged: int = MAX_BRIDGED_MISSING,
     selection: str = SELECT_LONGEST,
     backward_only: bool = False,
+    trailing_missing: int = 0,
 ) -> Optional[RunSeries]:
     """Resolve the qualifying run for one ticker, or None when the pool is
     empty.
@@ -403,6 +457,13 @@ def run_series(
     anchor is never stepped back to hunt for an earlier run. This is the
     trailing-streak semantic `compute_consecutive_beats` has always had, and
     it is what the beats filters default to.
+
+    ``trailing_missing`` (v8.0.0, from `trailing_missing_quarters`) is the
+    number of quarters in the pool newer than the newest point. Under
+    Backward Only it is held to `max_bridged`, the same allowance as a hole
+    between points: before this, a growth pool whose newest reports had no
+    YoY value anchored on whatever quarter last had one, so a run from years
+    earlier passed as current (ELOX: an eleven-quarter-old run).
 
     Together those three modes are why this one function backs both the beats
     and growth filters. Their historical behaviours are just two points in
@@ -421,7 +482,10 @@ def run_series(
 
     runs = _runs(points, threshold, inclusive, max_bridged)
     if backward_only:
-        # Only a run that actually reaches the newest quarter counts.
+        # Only a run that actually reaches the newest quarter counts — and
+        # "the newest quarter" is the pool's, not the newest one with a value.
+        if int(trailing_missing) > int(max_bridged):
+            runs = []
         runs = [r for r in runs if r[1] == n - 1]
     if not runs:
         # A pool with no qualifying run at all still reports a zero-length
@@ -462,6 +526,7 @@ def run_series(
         end_report_date=end_pt.report_date,
         qualifies=qualifies,
         values=window_values(points, start_i, end_i),
+        periods=window_periods(points, start_i, end_i),
     )
 
 
@@ -471,6 +536,7 @@ def consecutive_growth_run(
     max_bridged: int = MAX_BRIDGED_MISSING,
     selection: str = SELECT_LONGEST,
     backward_only: bool = False,
+    trailing_missing: int = 0,
 ) -> int:
     """Length of the qualifying run, as an int.
 
@@ -487,6 +553,7 @@ def consecutive_growth_run(
         max_bridged=max_bridged,
         selection=selection,
         backward_only=backward_only,
+        trailing_missing=trailing_missing,
     )
     return 0 if res is None else res.length
 
@@ -510,6 +577,8 @@ class AcceleratingSeries:
     quarter-over-quarter step the acceleration threshold tests - so Period Avg
     on an EPS-surprise series is the average surprise across it, consistent
     with what the `_vals` column already shows.
+
+    `periods` mirrors `RunSeries.periods` (v8.0.0).
     """
     length: int
     start_value: float
@@ -520,6 +589,7 @@ class AcceleratingSeries:
     end_report_date: Optional[pd.Timestamp]
     qualifies: bool
     values: tuple = ()
+    periods: tuple = ()
 
 
 def _link_ok(
@@ -579,6 +649,7 @@ def accelerating_series(
     selection: str = SELECT_LONGEST,
     backward_only: bool = False,
     max_bridged: int = MAX_BRIDGED_MISSING,
+    trailing_missing: int = 0,
 ) -> Optional[AcceleratingSeries]:
     """Resolve the accelerating series for one ticker, or None when the
     pool holds no quarter with data for the metric.
@@ -596,6 +667,12 @@ def accelerating_series(
     anchor's series is short, the stock fails; the anchor is never
     stepped back to hunt for a different series.
 
+    v8.0.0 amends the spec's anchor ("the most recent quarter ... that has
+    data") with `trailing_missing`: when more than `max_bridged` quarters in
+    the pool are newer than that anchor, no series can reach the newest
+    quarter and the stock fails, exactly as a two-quarter hole between points
+    breaks a chain. See `run_series` for the case that motivated it.
+
     When no candidate reaches `min_count`, the best sub-threshold
     candidate is returned with ``qualifies=False`` rather than None, so
     display-only mode can show the length the ticker did reach and the
@@ -605,6 +682,8 @@ def accelerating_series(
     if n == 0:
         return None
 
+    if backward_only and int(trailing_missing) > int(max_bridged):
+        return None
     terminals = [n - 1] if backward_only else list(range(n))
 
     candidates: list[tuple] = []
@@ -644,4 +723,5 @@ def accelerating_series(
         end_report_date=end_pt.report_date,
         qualifies=qualifies,
         values=window_values(points, start_i, end_i),
+        periods=window_periods(points, start_i, end_i),
     )

@@ -135,6 +135,12 @@ a = Analysis(
         'trade_scanner_fh.gui.workers', 'trade_scanner_fh.gui.widgets',
         'trade_scanner_fh.gui.dialogs', 'trade_scanner_fh.gui.theme',
         'trade_scanner_fh.gui.hotkey_dialog',
+        # v8.0.0. `coloring` and `color_rules_dialog` are imported only
+        # inside functions (populate, the export colouring, the Color
+        # Rules button), so name them like the other lazy imports above.
+        'trade_scanner_fh.gui.coloring',
+        'trade_scanner_fh.gui.color_rules_dialog',
+        'trade_scanner_fh.gui.hiding',
         # NOTE: Playwright was originally planned per TINYEARNINGS_FORK.md
         # §2 but live testing showed Zacks's Imperva front blocks every
         # browser fingerprint (headless and headful Chromium / Firefox /

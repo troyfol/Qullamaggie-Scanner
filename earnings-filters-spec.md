@@ -97,6 +97,8 @@ When on:
 
 This is a strict "accelerating right now" mode. The absence of a fallback is intentional.
 
+> **Amendment (v8.0.0, 2026-09-26).** "Has data for the metric" left a hole: when the newest reported quarters carry no value (e.g. a YoY whose year-ago base is under the floor), the anchor slid back to whatever quarter last had one, however old — ELOX passed on a 2023 series with a 2026 report. The quarters in the pool that are newer than the anchor are now held to the same bridging allowance as a gap inside a chain (spec 3.1; `SERIES_MAX_BRIDGED_*`, default 1): one valueless newest quarter may be stepped over, two or more fail the filter. Applies to the growth filters' Backward Only as well.
+
 ---
 
 ## Part 3 — Shared Rules (apply to all six filters)

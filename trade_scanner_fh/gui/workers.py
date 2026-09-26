@@ -637,13 +637,22 @@ class UpdateWorker(QThread):
             f"({health.pct:.1f}%) of tickers with a {session} bar have NULL "
             f"prices on it"
         )
-        if health.pct >= config.OHLCV_NAN_LAST_BAR_WARN_PCT:
+        if health.burst_start is not None:
+            detail += (
+                f"; worst run of {config.OHLCV_NAN_BURST_WINDOW} consecutive "
+                f"tickers {health.burst_pct:.0f}% null, starting at "
+                f"{health.burst_start}"
+            )
+        if health.is_suspect():
             warning = (
                 f"WARNING - SUSPECT OHLCV REFRESH: {detail}. "
-                f"Scans will return few or no results, because a null Close "
-                f"fails every price filter. The provider was most likely "
-                f"still consolidating that session. Re-run Deep OHLCV Refresh "
-                f"once it has settled to repair the affected bars."
+                f"Every one of those tickers fails the price filters and "
+                f"drops out of scans, and RS reads blank if a benchmark is "
+                f"among them. The provider was serving an unsettled bar — "
+                f"treat EVERY ticker's {session} bar as suspect, not only the "
+                f"null ones (their Volume is typically understated too). Once "
+                f"the session has settled, run Data > Deep OHLCV Refresh over "
+                f"the whole store to repair it."
             )
             self.log_msg.emit(warning)
             log.warning(warning)

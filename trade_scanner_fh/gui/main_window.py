@@ -54,11 +54,12 @@ from .dialogs import (
 )
 from .earnings_coordinator import EarningsRefreshCoordinator
 from .exports import ExportsController
+from .hiding import HideManager
 from .hotkey_dialog import HotkeySettingsDialog
 from .theme import build_stylesheet
 from .widgets import (
     _fmt_date, IndicatorPanel, LogPanel, QtLogHandler, RESULT_COLUMNS,
-    ResultsTable, restore_rows_at_positions,
+    ResultsTable,
 )
 from .workers import (
     BridgeWorker, EarningsFillWorker, FinvizSnapshotSweepWorker,
@@ -95,7 +96,13 @@ PRESETS_DIR = config.DATA_DIR / "presets"
 # regardless of preset; now they round-trip through save/load so a user
 # can capture their preferred session-filter posture per preset. Missing
 # keys load as False — pre-v6 presets behave like before.
-PRESET_SCHEMA_VERSION = 6
+#
+# v7 (v8.0.0, 2026-09): `hidden_fv_col_types` (the Hide FV Columns dropdown),
+# and the finviz rows' spinbox ranges changed. The version stamp is what
+# tells the loader a preset's finviz bounds were written against the OLD
+# ranges and need `finviz_snapshot.migrate_v7_bounds` so an open bound stays
+# open — the reason this bump is load-bearing, not cosmetic.
+PRESET_SCHEMA_VERSION = 7
 
 # ============================================================================
 # Main window
@@ -211,6 +218,14 @@ class MainWindow(QMainWindow):
         # Latest scan results, cached for the Excel export dialog so it can
         # auto-pre-select columns based on which have valid data right now.
         self._last_results_df: Optional[pd.DataFrame] = None
+        # Per-period scan results + their display order and the one on
+        # screen. Set by `_on_scan_done_impl`; initialised here (v8.0.0) so
+        # code that runs before the first scan — the hide menus, preset
+        # load, the ribbon indicators — reads "no results" rather than
+        # depending on every caller guarding an AttributeError.
+        self._period_results: dict = {}
+        self._period_order: list = []
+        self._active_period: Optional[str] = None
         # User-saved column order — list of column keys in their
         # preferred display order. Persists across timeframe switches
         # within a session; reset on app restart. Threaded into Excel
@@ -1305,7 +1320,7 @@ class MainWindow(QMainWindow):
 
         # ── Second row: hide whole earnings column TYPES ──────────────
         # Separate from the header right-click "Delete column" (which is
-        # per-column and resets every scan) and from the Columns ▾ popup.
+        # per-column) and from the Columns ▾ popup.
         # This one collapses the quarter dimension: one tick hides
         # "Q-X Reported EPS" across every rendered quarter at once.
         #
@@ -1347,6 +1362,81 @@ class MainWindow(QMainWindow):
         self.lbl_hidden_types.setStyleSheet("color: #888;")
         type_row.addWidget(self.lbl_hidden_types)
 
+        # ── Same row: hide whole FV column CATEGORIES (v8.0.0) ─────────
+        # The finviz counterpart of Hide Q Columns: one tick per panel
+        # heading (Options, Valuation, ..., Info) hides every FV column that
+        # heading produced. Shares the table's hidden-type mechanism, so it is
+        # applied when the layout is built and never touches the data.
+        type_row.addSpacing(16)
+        self.btn_hide_fv_types = QToolButton()
+        self.btn_hide_fv_types.setText("Hide FV Columns ▾")
+        self.btn_hide_fv_types.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+        )
+        self.btn_hide_fv_types.setToolTip(
+            "View-only: hide every finviz (FV) column in a category at once "
+            "— the categories are the headings of the Options / Finviz "
+            "Additional panel. Does not affect scan results or which rows "
+            "pass; hidden columns can still be re-selected in the Excel "
+            "export dialog. Saved with the preset."
+        )
+        self._hide_fv_types_menu = QMenu(self.btn_hide_fv_types)
+        self._hide_fv_types_menu.aboutToShow.connect(
+            self._rebuild_hide_fv_types_menu
+        )
+        self.btn_hide_fv_types.setMenu(self._hide_fv_types_menu)
+        type_row.addWidget(self.btn_hide_fv_types)
+
+        self.btn_show_all_fv_types = QPushButton("Show All")
+        self.btn_show_all_fv_types.setToolTip(
+            "Clear every hidden FV category and re-render."
+        )
+        self.btn_show_all_fv_types.clicked.connect(
+            self._on_show_all_fv_types
+        )
+        type_row.addWidget(self.btn_show_all_fv_types)
+
+        self.lbl_hidden_fv_types = QLabel("")
+        self.lbl_hidden_fv_types.setStyleSheet("color: #888;")
+        type_row.addWidget(self.lbl_hidden_fv_types)
+
+        # ── Same row: colour rules (v8.0.0) ───────────────────────────
+        type_row.addSpacing(16)
+        self.btn_color_rules = QPushButton("Color Rules…")
+        self.btn_color_rules.setToolTip(
+            "Choose what colours the results: rules that test values, "
+            "filter results or dates (per row or per quarter) and set text "
+            "colour, background and bold. Saved with the preset."
+        )
+        self.btn_color_rules.clicked.connect(self._open_color_rules_dialog)
+        type_row.addWidget(self.btn_color_rules)
+
+        # ── Same row: what is hidden, and a way back (v8.0.0) ─────────
+        # Rows and columns hidden with the right-click menus / Delete key.
+        # The caption keeps a persistent hide visible — a ticker hidden
+        # yesterday and saved into a preset must never simply vanish — and
+        # the menu is the unhide path that works even when the HOTKEY
+        # sender's right-click cue has taken over the table's own menu.
+        type_row.addSpacing(16)
+        self.btn_hidden_items = QToolButton()
+        self.btn_hidden_items.setText("Hidden: none ▾")
+        self.btn_hidden_items.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+        )
+        self.btn_hidden_items.setToolTip(
+            "Rows and columns you have hidden (right-click → Hide, or the "
+            "Delete key). Hidden rows are left out of every period, every "
+            "export and Send to Watchlist; hidden columns are left out of "
+            "the table and the default export. Both are saved with the "
+            "preset. Open to unhide."
+        )
+        self._hidden_items_menu = QMenu(self.btn_hidden_items)
+        self._hidden_items_menu.aboutToShow.connect(
+            self._rebuild_hidden_items_menu
+        )
+        self.btn_hidden_items.setMenu(self._hidden_items_menu)
+        type_row.addWidget(self.btn_hidden_items)
+
         type_row.addStretch()
         results_vbox.addLayout(type_row)
 
@@ -1358,40 +1448,69 @@ class MainWindow(QMainWindow):
         self.results_table.column_order_changed.connect(
             self._on_results_column_order_changed
         )
-        self.results_table.rows_deletion_requested.connect(
-            self._on_rows_deletion_requested
+        # Hide / unhide (v8.0.0 — replaced row and column delete). See
+        # gui/hiding.py for the model.
+        self.results_table.rows_hide_requested.connect(
+            self._on_rows_hide_requested
         )
-        self.results_table.undo_delete_requested.connect(
-            self._on_undo_delete_requested
+        self.results_table.rows_unhide_requested.connect(self._unhide_rows)
+        self.results_table.rows_unhide_all_requested.connect(
+            self._unhide_all_rows
+        )
+        self.results_table.hide_undo_requested.connect(
+            self._on_hide_undo_requested
         )
         self.results_table.rows_paste_requested.connect(
             self._on_rows_paste_requested
         )
-        self.results_table.columns_deletion_requested.connect(
-            self._on_columns_deletion_requested
+        self.results_table.columns_hide_requested.connect(
+            self._on_columns_hide_requested
+        )
+        self.results_table.columns_unhide_requested.connect(
+            self._unhide_columns
+        )
+        self.results_table.columns_unhide_all_requested.connect(
+            self._unhide_all_columns
         )
         self.results_table.columns_reset_requested.connect(
             self._reset_columns_to_default
         )
-        # Per-session set of column keys the user has hidden via the
-        # header right-click menu. Hidden columns are dropped from
-        # `_apply_view_filters` output → no impact on `_period_results`
-        # so the underlying scan data is preserved. Reset on every
-        # fresh scan (alongside the cut clipboard).
+        self.results_table.set_unhide_providers(
+            rows=self._row_unhide_items, columns=self._column_unhide_items,
+        )
+        # Column keys the user has hidden individually — header right-click
+        # "Hide column" or an unticked box in the Columns ▾ dialog.
+        # Applied to the table's column LAYOUT at render time
+        # (`_populate_results` → `ResultsTable.set_hidden_column_keys`),
+        # never by dropping data, so `_period_results` and every export
+        # keep the values. Survives fresh scans and round-trips through a
+        # preset as `column_hidden`; cleared by Unhide all columns, by Reset
+        # to Default, and by loading a preset (which replaces it with the
+        # preset's own set — empty if the preset has none).
         self._deleted_column_keys: set[str] = set()
+        # Tickers hidden from the results (v8.0.0). Applied in
+        # `_apply_view_filters`, so every period, every export and Send to
+        # Watchlist honour it; kept across scans; saved as `row_hidden`.
+        self._hidden_row_symbols: set[str] = set()
+        # Hide batches for Ctrl+Z, newest last (see gui/hiding.py).
+        self._hide_undo_stack: list = []
         # Earnings column TYPES hidden via the Hide Q Columns dropdown.
-        # Deliberately NOT `_deleted_column_keys`: that set is per-column and
-        # is cleared on every fresh scan, whereas these selections are meant
-        # to survive a scan and round-trip through a preset. Types absent
-        # from the current scan stay in the set so a preset saved against a
-        # wider scan still means what it said when a narrower one is run.
+        # Deliberately NOT `_deleted_column_keys`: that set is per-column,
+        # these are type-level view choices. Types absent from the current
+        # scan stay in the set so a preset saved against a wider scan still
+        # means what it said when a narrower one is run.
         self._hidden_earnings_col_types: set[str] = set()
-        # F2 undo-delete: single-level snapshot of the most recent row
-        # deletion — {"period": str, "rows": DataFrame, "positions":
-        # list[int]} or None. Overwritten by each delete, consumed by
-        # Ctrl+Z / context-menu "Undo delete", cleared on every fresh
-        # scan (alongside the cut clipboard).
-        self._undo_delete_snapshot: Optional[dict] = None
+        # FV column CATEGORIES hidden via the Hide FV Columns dropdown
+        # (v8.0.0). Kept apart from the earnings set so each dropdown's Show
+        # All clears only its own family; the table receives the union.
+        self._hidden_fv_col_types: set[str] = set()
+        self._hide_mgr.refresh_indicators()
+        # Colour rules (v8.0.0) — the session's working set, saved with a
+        # preset as `color_rules`. The table holds its own copy
+        # (`set_color_rules`); this one is what save / the editor read.
+        from . import coloring as _coloring
+        self._color_rules: list = _coloring.default_rules()
+        self._color_rules_dialog = None
         # Per-row HOTKEY: intercept the configured cue.
         #   - Mouse cues (right-click, shift+left, ctrl+left, middle):
         #     filter on the viewport — that's where Qt routes mouse
@@ -7164,14 +7283,10 @@ class MainWindow(QMainWindow):
             self.results_table.clear_cut_clipboard()
         except Exception as exc:
             log.debug("cut-clipboard clear after scan failed: %s", exc)
-        # ... and any pending undo-delete snapshot (F2): it refers to
-        # the PRIOR result set; restoring it into fresh results would
-        # resurrect rows the new scan never produced.
-        self._undo_delete_snapshot = None
-        try:
-            self.results_table.set_undo_available(False)
-        except Exception as exc:
-            log.debug("undo-state clear after scan failed: %s", exc)
+        # Hidden rows / columns and their undo history deliberately SURVIVE
+        # a new scan (v8.0.0): a hide is a standing view choice, not an
+        # edit to one result set. (The pre-v8 undo-delete snapshot was
+        # cleared here because it held rows OF the prior result set.)
 
         # F2 watchlist diffing: compare each period's ticker set with
         # the previous run of the same (preset-or-adhoc, period) key,
@@ -7269,11 +7384,17 @@ class MainWindow(QMainWindow):
         # Re-apply the user's saved column order BEFORE populate so
         # the table can move sections after rebuilding the model.
         self.results_table.set_saved_column_order(self._results_column_order)
-        self.results_table.populate(df)
+        self._populate_results(df)
         self._last_results_df = df
         # Sync the (possibly open) Columns dropdown so it reflects the
         # post-reconcile order + the surviving hidden set.
         self._sync_columns_dialog()
+        # Hidden rows outlive scans, so say so when some are in these
+        # results, and put the hidden counts on the timeframe labels.
+        try:
+            self._hide_mgr.after_scan()
+        except Exception as exc:
+            log.debug("hidden-rows post-scan report failed: %s", exc)
 
         n_pass = len(df) if df is not None else 0
         n_err = len(getattr(result, "errors", []))
@@ -7531,7 +7652,7 @@ class MainWindow(QMainWindow):
             self._last_results_df = df
             # Saved column order applies across all periods; reapply here.
             self.results_table.set_saved_column_order(self._results_column_order)
-            self.results_table.populate(df)
+            self._populate_results(df)
             n_pass = len(df) if df is not None else 0
             n_raw = len(raw) if raw is not None else 0
             self.btn_send.setEnabled(n_pass > 0)
@@ -7599,8 +7720,12 @@ class MainWindow(QMainWindow):
         live layout, so a menu built off `active_columns` would lose the
         entry as soon as it was ticked and leave no way to untick it.
 
-        Falls back to the active layout only when no frame is available (no
-        scan yet), where the menu is empty anyway.
+        No frame (no scan yet, or a preset load just wiped the results)
+        means no columns, so both dropdowns say so. Until v8.0.0 this fell
+        back to the table's `active_columns`, which before the first scan is
+        the WHOLE static RESULT_COLUMNS list — so the menus offered every
+        series type and all ten FV categories, with counts, for a scan that
+        had not happened. The docstring already claimed "empty"; now it is.
         """
         try:
             label = getattr(self, "_active_period", None)
@@ -7611,10 +7736,7 @@ class MainWindow(QMainWindow):
                 return self.results_table.unfiltered_columns_for(df)
         except Exception as exc:
             log.debug("hide-types source columns unavailable: %s", exc)
-        try:
-            return list(self.results_table.active_columns)
-        except (AttributeError, RuntimeError):
-            return []
+        return []
 
     def _rebuild_hide_types_menu(self):
         """Repopulate the dropdown from the types this scan produced."""
@@ -7649,35 +7771,95 @@ class MainWindow(QMainWindow):
         self._hidden_earnings_col_types.clear()
         self._apply_hidden_column_types()
 
-    def _apply_hidden_column_types(self, *, rerender: bool = True):
-        """Push the hidden-type set into the table and re-render.
+    # ── Hide FV Columns dropdown (v8.0.0) ────────────────────────────
+    #
+    # Mirrors the Hide Q Columns trio above. Built from the same UNFILTERED
+    # layout (`_hide_types_source_columns`) for the same reason: a category
+    # that is hidden is absent from the live layout, and a menu built from
+    # the live layout could never offer it back.
 
-        Also refreshes the button caption and the grey summary label so the
-        state is legible without opening the menu — the dropdown is the only
-        other place it shows.
+    #: Class default (read-only) so a bypass-init test shell, on which Qt
+    #: raises RuntimeError rather than AttributeError for a missing instance
+    #: attribute, still reads "nothing hidden". `__init__` replaces it with a
+    #: real set.
+    _hidden_fv_col_types = frozenset()
+
+    def _rebuild_hide_fv_types_menu(self):
+        """Repopulate the FV dropdown from the categories this scan produced."""
+        from .widgets import present_fv_column_types
+        menu = self._hide_fv_types_menu
+        menu.clear()
+        present = present_fv_column_types(self._hide_types_source_columns())
+        if not present:
+            act = menu.addAction("No FV columns in this scan")
+            act.setEnabled(False)
+            return
+        for type_id, label, n_cols in present:
+            act = menu.addAction(f"{label}  ({n_cols})")
+            act.setCheckable(True)
+            act.setChecked(type_id in self._hidden_fv_col_types)
+            act.triggered.connect(
+                lambda checked, t=type_id: self._on_hide_fv_type_toggled(
+                    t, checked)
+            )
+
+    def _on_hide_fv_type_toggled(self, type_id: str, hidden: bool):
+        if hidden:
+            self._hidden_fv_col_types.add(type_id)
+        else:
+            self._hidden_fv_col_types.discard(type_id)
+        self._apply_hidden_column_types()
+
+    def _on_show_all_fv_types(self):
+        if not self._hidden_fv_col_types:
+            return
+        self._hidden_fv_col_types.clear()
+        self._apply_hidden_column_types()
+
+    @staticmethod
+    def _hidden_types_caption(hidden: set, labels: dict, noun: str) -> str:
+        """Grey summary beside a dropdown: names while short, else a count."""
+        n = len(hidden)
+        if not n:
+            return ""
+        if n <= 3:
+            return "hidden: " + ", ".join(
+                sorted(labels.get(t, t) for t in hidden))
+        return f"{n} {noun} hidden"
+
+    def _apply_hidden_column_types(self, *, rerender: bool = True):
+        """Push BOTH hidden-type sets into the table and re-render.
+
+        The table holds one set; the two dropdowns keep theirs apart so each
+        Show All clears only its own family. Their ids cannot collide
+        (`q_` / `series_` vs `fv_`).
+
+        Also refreshes both button captions and grey summary labels so the
+        state is legible without opening a menu.
         """
-        hidden = set(self._hidden_earnings_col_types)
+        earnings = set(self._hidden_earnings_col_types)
+        fv = set(self._hidden_fv_col_types)
         try:
-            self.results_table.set_hidden_column_types(hidden)
+            self.results_table.set_hidden_column_types(earnings | fv)
         except (AttributeError, RuntimeError) as exc:
             log.debug("could not push hidden column types: %s", exc)
             return
         try:
-            from .widgets import EARNINGS_COLUMN_TYPE_LABELS
-            n = len(hidden)
+            from .widgets import (
+                EARNINGS_COLUMN_TYPE_LABELS, FV_COLUMN_TYPE_LABELS,
+            )
+            n = len(earnings)
             self.btn_hide_col_types.setText(
                 "Hide Q Columns ▾" if not n else f"Hide Q Columns ({n}) ▾"
             )
-            # Name them while the list is short; past that the count carries
-            # the message and the full list lives in the menu.
-            if not n:
-                self.lbl_hidden_types.setText("")
-            elif n <= 3:
-                self.lbl_hidden_types.setText("hidden: " + ", ".join(
-                    sorted(EARNINGS_COLUMN_TYPE_LABELS.get(t, t) for t in hidden)
-                ))
-            else:
-                self.lbl_hidden_types.setText(f"{n} column types hidden")
+            self.lbl_hidden_types.setText(self._hidden_types_caption(
+                earnings, EARNINGS_COLUMN_TYPE_LABELS, "column types"))
+            m = len(fv)
+            self.btn_hide_fv_types.setText(
+                "Hide FV Columns ▾" if not m else f"Hide FV Columns ({m}) ▾"
+            )
+            self.lbl_hidden_fv_types.setText(self._hidden_types_caption(
+                fv, FV_COLUMN_TYPE_LABELS, "FV categories"))
         except (AttributeError, RuntimeError) as exc:
             log.debug("could not refresh hidden-type caption: %s", exc)
         if rerender:
@@ -7713,102 +7895,209 @@ class MainWindow(QMainWindow):
     ) -> None:
         self._columns_mgr._reconcile_column_order_for_scan(canonical_keys)
 
-    @pyqtSlot(list)
-    def _on_rows_deletion_requested(self, symbols: list):
-        """User asked to delete the selected rows from the active
-        period's results. Hard-deletes from `_period_results` so the
-        change persists across view-filter toggles, sort changes, and
-        tab switches. Reset implicitly on the next scan (fresh
-        `_period_results` overwrites the dict). Re-renders the table
-        to reflect the deletion.
+    # ── Hide / unhide (v8.0.0) ─────────────────────────────────────
+    # Replaced hard row delete + single-level undo and column delete. The
+    # logic lives in HideManager (hiding.py); these are the signal-facing
+    # delegates, kept on MainWindow like every other extracted subsystem.
 
-        F2 undo: before mutating, snapshot the doomed rows + their
-        positional indices so a single-level Ctrl+Z / "Undo delete"
-        can restore the batch at its original spots. A new delete
-        overwrites the snapshot; a fresh scan clears it."""
-        if not symbols:
-            return
-        period = self._active_period or ""
-        if period not in self._period_results:
-            return
-        df = self._period_results[period]
-        if df is None or df.empty or "symbol" not in df.columns:
-            return
-        before = len(df)
-        keep = ~df["symbol"].astype(str).isin(set(symbols))
-        # Snapshot the deleted batch (rows + original positions) for
-        # single-level undo BEFORE the frame is rebuilt.
-        removed_mask = ~keep
-        if removed_mask.any():
-            self._undo_delete_snapshot = {
-                "period": period,
-                "rows": df.loc[removed_mask].copy(),
-                "positions": [
-                    i for i, flag in enumerate(removed_mask.tolist()) if flag
-                ],
-            }
-            try:
-                self.results_table.set_undo_available(True)
-            except Exception as exc:
-                log.debug("undo-state set after delete failed: %s", exc)
-        df = df.loc[keep].reset_index(drop=True)
-        self._period_results[period] = df
-        deleted = before - len(df)
-        log.info("Deleted %d row(s) from period '%s'", deleted, period)
-        # A deletion may have eliminated rows that were waiting on the
-        # cut clipboard. Clear it to avoid a paste targeting now-gone
-        # symbols.
-        try:
-            self.results_table.clear_cut_clipboard()
-        except Exception as exc:
-            log.debug("cut-clipboard clear after row delete failed: %s", exc)
-        # Re-render with view filters applied.
-        try:
-            shown = self._apply_view_filters(df)
-            self.results_table.populate(shown)
-        except Exception as exc:
-            log.debug("populate after delete failed: %s", exc)
+    @property
+    def _hide_mgr(self) -> HideManager:
+        """Lazily-created hide manager, looked up via ``__dict__`` for the
+        same bypass-init-shell reason as `_columns_mgr`."""
+        mgr = self.__dict__.get("_hide_mgr_obj")
+        if mgr is None:
+            mgr = HideManager(self)
+            self.__dict__["_hide_mgr_obj"] = mgr
+        return mgr
+
+    @pyqtSlot(list)
+    def _on_rows_hide_requested(self, symbols: list):
+        self._hide_mgr.hide_rows(symbols)
+
+    @pyqtSlot(list)
+    def _unhide_rows(self, symbols: list):
+        self._hide_mgr.unhide_rows(symbols)
 
     @pyqtSlot()
-    def _on_undo_delete_requested(self):
-        """F2 undo: restore the most recently deleted row batch at its
-        original positional indices. Single-level — the snapshot is
-        consumed here (double-undo is a no-op) and cleared on every
-        fresh scan. Restores into the snapshot's PERIOD even if the
-        user has since switched timeframes; the table only re-renders
-        when that period is the active one."""
-        snap = self._undo_delete_snapshot
-        if not snap:
-            return
-        self._undo_delete_snapshot = None
-        try:
-            self.results_table.set_undo_available(False)
-        except Exception as exc:
-            log.debug("undo-state clear after undo failed: %s", exc)
-        period = snap.get("period") or ""
-        if period not in self._period_results:
-            return
-        df = self._period_results[period]
-        rows = snap.get("rows")
-        restored = restore_rows_at_positions(
-            df, rows, snap.get("positions") or [],
-        )
-        self._period_results[period] = restored
-        n_rows = 0 if rows is None else len(rows)
-        log.info(
-            "Undo: restored %d deleted row(s) to period '%s'",
-            n_rows, period,
-        )
-        if period == (self._active_period or ""):
-            try:
-                shown = self._apply_view_filters(restored)
-                self.results_table.populate(shown)
-            except Exception as exc:
-                log.debug("populate after undo failed: %s", exc)
+    def _unhide_all_rows(self):
+        self._hide_mgr.unhide_all_rows()
 
     @pyqtSlot(list)
-    def _on_columns_deletion_requested(self, keys: list):
-        self._columns_mgr._on_columns_deletion_requested(keys)
+    def _on_columns_hide_requested(self, keys: list):
+        self._hide_mgr.hide_columns(keys)
+
+    @pyqtSlot(list)
+    def _unhide_columns(self, keys: list):
+        self._hide_mgr.unhide_columns(keys)
+
+    @pyqtSlot()
+    def _unhide_all_columns(self):
+        self._hide_mgr.unhide_all_columns()
+
+    @pyqtSlot()
+    def _on_hide_undo_requested(self):
+        self._hide_mgr.undo()
+
+    def _row_unhide_items(self) -> list:
+        return self._hide_mgr.row_unhide_items()
+
+    def _column_unhide_items(self) -> list:
+        return self._hide_mgr.column_unhide_items()
+
+    def _rebuild_hidden_items_menu(self):
+        """The ribbon Hidden ▾ menu: the same unhide actions as the two
+        right-click menus, reachable without right-clicking the table."""
+        menu = self._hidden_items_menu
+        menu.clear()
+        rows = self._row_unhide_items()
+        cols = self._column_unhide_items()
+        if not rows and not cols:
+            act = menu.addAction("Nothing is hidden")
+            act.setEnabled(False)
+        if rows:
+            sub = menu.addMenu(f"Unhide rows ({len(rows)})")
+            for label, sym, enabled in rows:
+                a = sub.addAction(label)
+                a.setEnabled(bool(enabled))
+                a.triggered.connect(
+                    lambda _c=False, s=sym: self._unhide_rows([s]))
+            a_all = menu.addAction(f"Unhide all rows ({len(rows)})")
+            a_all.triggered.connect(self._unhide_all_rows)
+        if cols:
+            if rows:
+                menu.addSeparator()
+            sub = menu.addMenu(f"Unhide columns ({len(cols)})")
+            for label, key, enabled in cols:
+                a = sub.addAction(label)
+                a.setEnabled(bool(enabled))
+                a.triggered.connect(
+                    lambda _c=False, k=key: self._unhide_columns([k]))
+            n_ok = sum(1 for _l, _k, e in cols if e)
+            a_all = menu.addAction(f"Unhide all columns ({n_ok})")
+            a_all.setEnabled(n_ok > 0)
+            a_all.triggered.connect(self._unhide_all_columns)
+        if self._hide_undo_stack:
+            menu.addSeparator()
+            a_undo = menu.addAction("Undo hide	Ctrl+Z")
+            a_undo.triggered.connect(self._on_hide_undo_requested)
+
+    # ── Colour rules (v8.0.0) ─────────────────────────────────────
+    # The engine is gui/coloring.py, the editor gui/color_rules_dialog.py.
+    # The session's rules live in `_color_rules`; the table paints from its
+    # own copy, pushed here whenever they change.
+
+    def _color_rule_column_choices(self) -> list:
+        """[(label, key, kind)] for the editor's column pickers.
+
+        Every column this scan produced (hidden ones included — a rule can
+        read a column the user has hidden), then every other known column
+        (so a rule can be written before the row it needs is switched on),
+        then the Q-X quarter templates for quarter-scope rules. `kind` is
+        "date", "text" or "num" and only steers the operator choices."""
+        from .widgets import (
+            _fmt_date, DATE_COLUMN_KEYS, EARNINGS_COLUMN_TYPES,
+        )
+        from .. import finviz_snapshot as _fvs
+        seen: set = set()
+        out: list = []
+
+        def kind_of(key, fmt):
+            if (fmt is _fmt_date or key in DATE_COLUMN_KEYS
+                    or key.endswith("_date")
+                    or key in ("dividend_ex_date", "ipo_date")):
+                return "date"
+            if fmt is str or key in _fvs.TEXT_FIELDS or key == "chg":
+                return "text"
+            return "num"
+
+        layout = []
+        try:
+            label = self._active_period
+            df = self._period_results.get(label) if label else None
+            if df is not None:
+                layout = self.results_table.unfiltered_columns_for(df)
+        except Exception as exc:
+            log.debug("colour rules: current layout unavailable: %s", exc)
+        for header, key, fmt in list(layout) + list(RESULT_COLUMNS):
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((header, key, kind_of(key, fmt)))
+        for type_id, type_label in EARNINGS_COLUMN_TYPES:
+            if not type_id.startswith("q_"):
+                continue
+            suffix = type_id[2:]
+            key = "q{k}_" + suffix
+            out.append((type_label, key,
+                        "date" if suffix.startswith("report_date") else "num"))
+        return out
+
+    def _color_rule_target_choices(self) -> list:
+        """[(label, key)] for "Chosen columns": the Q-X types (one tick =
+        that type at every quarter), then every ordinary column."""
+        from .widgets import EARNINGS_COLUMN_TYPES, _Q_COL_RE
+        out = [(label, tid) for tid, label in EARNINGS_COLUMN_TYPES
+               if tid.startswith("q_")]
+        for label, key, _kind in self._color_rule_column_choices():
+            if "{k}" in key or _Q_COL_RE.match(key):
+                continue
+            out.append((label, key))
+        return out
+
+    def _preview_color_rules(self, rules) -> dict:
+        """Evaluate `rules` against the period on screen, for the editor's
+        per-rule status ("34 rows", "needs RVOL")."""
+        from . import coloring
+        report: dict = {}
+        label = self._active_period
+        raw = self._period_results.get(label) if label else None
+        if raw is None or raw.empty:
+            return {r.id: {"rows": 0, "missing": []} for r in rules}
+        df = self._apply_view_filters(raw)
+        keys = [k for _h, k, _f in self.results_table.active_columns]
+        coloring.evaluate(df, rules, keys, report=report)
+        return report
+
+    def _open_color_rules_dialog(self):
+        from .color_rules_dialog import ColorRulesDialog
+        dlg = self._color_rules_dialog
+        if dlg is None:
+            dlg = ColorRulesDialog(
+                self._color_rules, self._color_rule_column_choices(),
+                self._color_rule_target_choices(),
+                preview_fn=self._preview_color_rules, parent=self,
+            )
+            dlg.rules_applied.connect(self._apply_color_rules)
+            dlg.finished.connect(self._color_rules_dialog_closed)
+            self._color_rules_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _color_rules_dialog_closed(self, *_):
+        # Rebuilt on next open, so its column lists reflect the scan then.
+        dlg = self._color_rules_dialog
+        self._color_rules_dialog = None
+        if dlg is not None:
+            dlg.deleteLater()
+
+    def _color_rules_json(self) -> dict:
+        from . import coloring
+        return coloring.rules_to_json(self._color_rules)
+
+    def _apply_color_rules(self, rules, *, rerender: bool = True):
+        """Make `rules` the session's colour rules and repaint."""
+        self._color_rules = [r.copy() for r in rules]
+        try:
+            self.results_table.set_color_rules(self._color_rules)
+        except (AttributeError, RuntimeError) as exc:
+            log.debug("could not push colour rules: %s", exc)
+            return
+        if rerender:
+            self._reapply_view_filters_for_active_period()
+        n_on = sum(1 for r in self._color_rules if r.enabled)
+        log.info("Colour rules applied: %d rule(s), %d enabled",
+                 len(self._color_rules), n_on)
 
     @pyqtSlot(list, str)
     def _on_rows_paste_requested(self, cut_symbols: list, target_symbol: str):
@@ -7874,7 +8163,7 @@ class MainWindow(QMainWindow):
         self.results_table.clear_cut_clipboard()
         try:
             shown = self._apply_view_filters(new_df)
-            self.results_table.populate(shown)
+            self._populate_results(shown)
         except Exception as exc:
             log.debug("populate after paste failed: %s", exc)
 
@@ -7925,11 +8214,17 @@ class MainWindow(QMainWindow):
             for i in range(1, 21) for side in ("eps", "rev")
         )
 
-    def _apply_view_filters(self, df):
+    def _apply_view_filters(self, df, *, include_hidden: bool = True):
         """Apply the Earnings Dates / Earnings Data / Color Match Only
-        view filters to `df` and return a filtered copy. When no toggle
-        is on, returns `df` unchanged. Always returns a NEW DataFrame
-        so callers can mutate without affecting the source.
+        view filters — and the user's hidden rows (v8.0.0) — to `df` and
+        return a filtered copy. When nothing applies, returns `df`
+        unchanged. Always returns a NEW DataFrame so callers can mutate
+        without affecting the source.
+
+        Hidden rows ride here because this is the one path every render
+        and every export already takes. `include_hidden=False` skips them —
+        the unhide menu uses it to ask whether a hidden ticker would
+        actually appear if unhidden.
 
         Invariant: the dates filter is broader than the data filter —
         any row passing the data filter also passes the dates filter
@@ -8003,24 +8298,43 @@ class MainWindow(QMainWindow):
                 )
                 mask &= has_match
 
-        out = df.loc[mask].reset_index(drop=True)
+        if include_hidden:
+            try:
+                hidden_rows = self._hidden_row_symbols
+            except (AttributeError, RuntimeError):
+                hidden_rows = set()
+            if hidden_rows and "symbol" in df.columns:
+                mask &= ~df["symbol"].astype(str).isin(hidden_rows)
 
-        # Drop user-hidden columns (header right-click → Delete column).
-        # Done AFTER row filtering so the row mask doesn't depend on
-        # column presence — a deleted column shouldn't change which
-        # rows pass other view filters. The try/except tolerates
-        # bypass-init shells used by some unit tests (Qt's attribute
-        # lookup raises RuntimeError on uninitialized QObject
-        # subclasses, even via getattr with a default).
+        # Rows only. User-hidden COLUMNS are not dropped here any more
+        # (v8.0.0): dropping them from the frame is what left a deleted
+        # `Q-2 Date` on screen as an empty column, because the per-quarter
+        # blocks are laid out by quarter index rather than by presence in
+        # the frame. Hidden columns are now removed from the table's column
+        # LAYOUT instead — `_populate_results` hands the set to the table —
+        # the same way Hide Q Columns has always worked. Exports are
+        # unaffected: they take their column keys from the live layout.
+        return df.loc[mask].reset_index(drop=True)
+
+    def _populate_results(self, df) -> None:
+        """Render `df` into the results table with the current hidden-column
+        state applied.
+
+        Every render path goes through here so the individually hidden
+        column keys can never be stale on the table: they are pushed
+        immediately before each populate rather than at each of the several
+        places that mutate `_deleted_column_keys` (header delete, Columns
+        dialog, Reset, preset load, tests that assign it directly).
+        """
         try:
-            deleted = self._deleted_column_keys
+            hidden = set(self._deleted_column_keys)
         except (AttributeError, RuntimeError):
-            deleted = set()
-        if deleted:
-            cols_to_drop = [c for c in deleted if c in out.columns]
-            if cols_to_drop:
-                out = out.drop(columns=cols_to_drop)
-        return out
+            hidden = set()
+        try:
+            self.results_table.set_hidden_column_keys(hidden)
+        except (AttributeError, RuntimeError) as exc:
+            log.debug("could not push hidden column keys: %s", exc)
+        self.results_table.populate(df)
 
     def _reapply_view_filters_for_active_period(self):
         """Slot wired to view-filter toggles. Re-renders the table
@@ -8082,16 +8396,15 @@ class MainWindow(QMainWindow):
             path, periods, keys, wants_news, apply_colors=apply_colors,
         )
 
-    def _apply_xlsx_cell_colors(self, ws, keys: list[str], wants_news: bool):
-        self._exports._apply_xlsx_cell_colors(ws, keys, wants_news)
+    def _apply_xlsx_cell_colors(self, ws, keys: list[str], wants_news: bool,
+                                df=None):
+        self._exports._apply_xlsx_cell_colors(ws, keys, wants_news, df=df)
 
     def _ordered_export_columns_with_news(
         self, keys: list[str], wants_news: bool,
     ) -> list[tuple[str, "str | None", bool]]:
         return self._exports._ordered_export_columns_with_news(keys, wants_news)
 
-    def _is_export_color(self, rgb: tuple[int, int, int]) -> bool:
-        return self._exports._is_export_color(rgb)
 
     def _write_csv_export(
         self, path: str, periods: list[str], keys: list[str], wants_news: bool,
@@ -8460,6 +8773,11 @@ class MainWindow(QMainWindow):
             # for the current scan settings."
             "column_order": list(self._results_column_order),
             "column_hidden": sorted(self._deleted_column_keys),
+            # v7 (v8.0.0): hidden rows (tickers). Loading a preset REPLACES
+            # the session's hidden rows with these — see `_load_preset`.
+            "row_hidden": sorted(self._hidden_row_symbols),
+            # v7 (v8.0.0): the colour rules, saved per preset.
+            "color_rules": self._color_rules_json(),
             # v6: earnings column TYPES hidden via Hide Q Columns. Kept
             # apart from `column_hidden` — that is a per-column set the
             # scan resets, this is a type-level view choice that persists.
@@ -8468,6 +8786,9 @@ class MainWindow(QMainWindow):
             "hidden_earnings_col_types": sorted(
                 self._hidden_earnings_col_types
             ),
+            # v7 (v8.0.0): FV column categories hidden via Hide FV Columns.
+            # Same semantics as the earnings types above.
+            "hidden_fv_col_types": sorted(self._hidden_fv_col_types),
             # v6: session-bar omission toggles. Round-trip the user's
             # preferred posture per preset. Loading a preset with
             # `omit_previously_scanned=True` does NOT replay the
@@ -8524,7 +8845,13 @@ class MainWindow(QMainWindow):
             )
 
         if "indicators" in data:
-            self.indicator_panel.from_dict(data["indicators"])
+            # An unstamped preset predates schema versioning entirely (and
+            # therefore finviz rows); 0 routes it through the same legacy
+            # path as any other pre-v7 preset.
+            self.indicator_panel.from_dict(
+                data["indicators"],
+                preset_version=stamped if stamped is not None else 0,
+            )
 
         # Date range handling differs by preset kind (Issue 2):
         #   * Sequenced-run presets "remember" their exact saved window —
@@ -8643,7 +8970,6 @@ class MainWindow(QMainWindow):
             self.btn_export.setEnabled(False)
             self.btn_excel.setEnabled(False)
             self._results_column_order = list(col_order) if col_order else []
-            self._deleted_column_keys = set(col_hidden or [])
             try:
                 self.results_table.set_saved_column_order(
                     self._results_column_order
@@ -8653,20 +8979,34 @@ class MainWindow(QMainWindow):
                     "preset load: set_saved_column_order(%d keys) "
                     "failed: %s", len(self._results_column_order), exc,
                 )
-            self._sync_columns_dialog()
 
-        # v6: hidden earnings column types. Read OUTSIDE the column-layout
-        # block above so a preset can carry hidden types without also
-        # carrying an explicit column order. A missing key means a pre-v6
-        # preset, which must not silently clear a selection the user made
-        # in this session — hence `is not None` rather than `or []`.
-        hidden_types = data.get("hidden_earnings_col_types")
-        if hidden_types is not None:
-            self._hidden_earnings_col_types = set(hidden_types)
-            # No re-render: the branch above has already blanked the table,
-            # and a fresh scan re-renders anyway. Pushing the set into the
-            # table now means the next populate honours it.
-            self._apply_hidden_column_types(rerender=False)
+        # Every hide set — rows, columns, Hide Q types, Hide FV categories —
+        # is REPLACED by the preset's (v8.0.0, the user's rule: "changing
+        # presets should always unhide/hide to match the incoming preset").
+        # A key the preset lacks therefore means nothing hidden. Before
+        # v8.0.0 a missing key kept the session's choice, so hides made
+        # under one preset leaked into the next. The undo stack refers to
+        # the outgoing preset's hides and goes with them.
+        self._hide_mgr.apply_preset(data)
+        # No re-render here: a v5+ preset has just blanked the table, and
+        # the final `_reapply_view_filters_for_active_period` below covers a
+        # scan still on screen. Pushing the sets now means the next populate
+        # honours them.
+        self._apply_hidden_column_types(rerender=False)
+        self._sync_columns_dialog()
+        self._hide_mgr.refresh_indicators()
+
+        # Colour rules (v8.0.0) follow the same "match the incoming preset"
+        # rule. A preset saved before rules existed gets the DEFAULT rules —
+        # which are exactly the three schemes every older preset was shown
+        # with, so it looks the same as it always did.
+        from . import coloring as _coloring
+        incoming = data.get("color_rules")
+        rules = (_coloring.rules_from_json(incoming) if incoming is not None
+                 else _coloring.default_rules())
+        self._apply_color_rules(rules, rerender=False)
+        if self._color_rules_dialog is not None:
+            self._color_rules_dialog.set_rules(self._color_rules)
 
         # v6: session-bar omission toggles. No signal connections live
         # on these checkboxes (they're polled in `_run_scan` /

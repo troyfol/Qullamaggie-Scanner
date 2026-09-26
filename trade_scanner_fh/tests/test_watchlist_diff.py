@@ -415,85 +415,91 @@ def test_chg_column_renders_in_dynamic_columns(_qapp):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Part C — undo for deleted rows
+# Part C — hide / undo for rows (v8.0.0; replaced delete + single-level undo)
 # ──────────────────────────────────────────────────────────────────────
 
-def test_restore_rows_at_positions_pure():
-    from trade_scanner_fh.gui.widgets import restore_rows_at_positions
-    orig = pd.DataFrame([_row(s) for s in ["A", "B", "C", "D", "E"]])
-    # Delete B (pos 1) and D (pos 3)
-    rows = orig.iloc[[1, 3]].copy()
-    kept = orig.iloc[[0, 2, 4]].reset_index(drop=True)
-    out = restore_rows_at_positions(kept, rows, [1, 3])
-    assert list(out["symbol"]) == ["A", "B", "C", "D", "E"]
-    # Position past the end clamps to append
-    out2 = restore_rows_at_positions(
-        kept.copy(), orig.iloc[[1]].copy(), [99])
-    assert list(out2["symbol"]) == ["A", "C", "E", "B"]
-    # Empty snapshot is a passthrough
-    assert restore_rows_at_positions(kept, kept.iloc[0:0], []) is kept
-
-
-def _undo_shell(df, period="P1"):
-    """Bare MainWindow shell for the delete→undo path: real logic, stub
-    table + identity view filter."""
+def _hide_shell(df, period="P1"):
+    """Bare MainWindow shell for the hide -> undo path: real logic, stub
+    table, the real `_apply_view_filters`."""
     from trade_scanner_fh.gui.main_window import MainWindow
     win = MainWindow.__new__(MainWindow)
     win._active_period = period
     win._period_results = {period: df}
-    win._undo_delete_snapshot = None
+    win._hidden_row_symbols = set()
+    win._deleted_column_keys = set()
+    win._hide_undo_stack = []
     win.results_table = MagicMock()
-    win._apply_view_filters = lambda d: d
+    # A bypass-init shell cannot answer `hasattr` for Qt widgets (Qt raises
+    # RuntimeError, not AttributeError), so give the three view toggles
+    # the one method `_apply_view_filters` calls.
+    off = SimpleNamespace(isChecked=lambda: False)
+    win.chk_view_earnings_data_only = off
+    win.chk_view_earnings_dates_only = off
+    win.chk_view_color_match_only = off
     return win
 
 
-def test_delete_then_undo_restores_rows_and_order(_qapp):
+def _visible(win):
+    return list(win._apply_view_filters(
+        win._period_results[win._active_period])["symbol"])
+
+
+def test_hide_then_undo_restores_rows_and_order(_qapp):
     df = pd.DataFrame([_row(s) for s in ["A", "B", "C", "D", "E"]])
-    win = _undo_shell(df)
+    win = _hide_shell(df)
 
-    win._on_rows_deletion_requested(["B", "D"])
-    assert list(win._period_results["P1"]["symbol"]) == ["A", "C", "E"]
-    assert win._undo_delete_snapshot is not None
-    win.results_table.set_undo_available.assert_called_with(True)
+    win._on_rows_hide_requested(["B", "D"])
+    assert _visible(win) == ["A", "C", "E"]
+    # Hiding never touches the results themselves.
+    pd.testing.assert_frame_equal(win._period_results["P1"], df)
+    win.results_table.set_hide_undo_available.assert_called_with(True)
 
-    win._on_undo_delete_requested()
-    restored = win._period_results["P1"]
-    assert list(restored["symbol"]) == ["A", "B", "C", "D", "E"]
-    # Full row content survives the round trip
-    pd.testing.assert_frame_equal(
-        restored.reset_index(drop=True), df.reset_index(drop=True))
-    # Snapshot consumed + table flag dropped
-    assert win._undo_delete_snapshot is None
-    win.results_table.set_undo_available.assert_called_with(False)
+    win._on_hide_undo_requested()
+    assert _visible(win) == ["A", "B", "C", "D", "E"]
+    assert win._hidden_row_symbols == set()
+    win.results_table.set_hide_undo_available.assert_called_with(False)
 
 
-def test_second_delete_overwrites_snapshot_single_level(_qapp):
+def test_undo_is_multi_level_newest_first(_qapp):
+    """Unlike the old single-level delete undo, each Ctrl+Z unhides the
+    next most recent batch."""
     df = pd.DataFrame([_row(s) for s in ["A", "B", "C"]])
-    win = _undo_shell(df)
-    win._on_rows_deletion_requested(["A"])
-    win._on_rows_deletion_requested(["C"])
-    win._on_undo_delete_requested()
-    # Only the LAST delete (C) is restored — A stays gone.
-    assert list(win._period_results["P1"]["symbol"]) == ["B", "C"]
+    win = _hide_shell(df)
+    win._on_rows_hide_requested(["A"])
+    win._on_rows_hide_requested(["C"])
+    win._on_hide_undo_requested()
+    assert _visible(win) == ["B", "C"]
+    win._on_hide_undo_requested()
+    assert _visible(win) == ["A", "B", "C"]
 
 
-def test_double_undo_is_noop(_qapp):
+def test_undo_skips_a_batch_already_unhidden_by_hand(_qapp):
     df = pd.DataFrame([_row(s) for s in ["A", "B", "C"]])
-    win = _undo_shell(df)
-    win._on_rows_deletion_requested(["B"])
-    win._on_undo_delete_requested()
-    after_first = list(win._period_results["P1"]["symbol"])
-    assert after_first == ["A", "B", "C"]
-    # Second undo: snapshot already consumed → no mutation.
-    win._on_undo_delete_requested()
-    assert list(win._period_results["P1"]["symbol"]) == after_first
+    win = _hide_shell(df)
+    win._on_rows_hide_requested(["A"])
+    win._on_rows_hide_requested(["B"])
+    win._unhide_rows(["B"])
+    win._on_hide_undo_requested()          # skips the B batch, undoes A
+    assert _visible(win) == ["A", "B", "C"]
 
 
-def test_undo_with_no_snapshot_is_noop(_qapp):
+def test_undo_with_nothing_to_undo_is_noop(_qapp):
     df = pd.DataFrame([_row("A")])
-    win = _undo_shell(df)
-    win._on_undo_delete_requested()
-    assert list(win._period_results["P1"]["symbol"]) == ["A"]
+    win = _hide_shell(df)
+    win._on_hide_undo_requested()
+    assert _visible(win) == ["A"]
+
+
+def test_hidden_rows_apply_to_every_period(_qapp):
+    """One hidden set for the whole run — switching timeframe or exporting
+    another period must not bring a hidden ticker back."""
+    df = pd.DataFrame([_row(s) for s in ["A", "B"]])
+    win = _hide_shell(df)
+    win._period_results["P2"] = df.copy()
+    win._on_rows_hide_requested(["A"])
+    for label in ("P1", "P2"):
+        out = win._apply_view_filters(win._period_results[label])
+        assert list(out["symbol"]) == ["B"], label
 
 
 class _FakeScanResult:
@@ -514,10 +520,10 @@ class _FakeScanResult:
         return syms
 
 
-def test_undo_cleared_by_new_scan(_qapp, tmp_path, monkeypatch):
-    """End-to-end through the real scan-done path: delete → undo is
-    armed; a fresh scan clears the snapshot AND the table-side flag, so
-    a subsequent undo restores nothing."""
+def test_hides_survive_a_new_scan(_qapp, tmp_path, monkeypatch):
+    """End-to-end through the real scan-done path (v8.0.0): a hidden
+    ticker stays hidden in the next scan's results, the undo history
+    survives with it, and the scan says so in the log."""
     from trade_scanner_fh.gui.main_window import MainWindow
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
 
@@ -527,22 +533,26 @@ def test_undo_cleared_by_new_scan(_qapp, tmp_path, monkeypatch):
         mw._on_scan_done_impl(_FakeScanResult({"P1": df1}, ["P1"]))
         assert mw._active_period == "P1"
 
-        mw._on_rows_deletion_requested(["BBB"])
-        assert mw._undo_delete_snapshot is not None
-        assert mw.results_table.undo_available() is True
+        mw._on_rows_hide_requested(["BBB"])
+        assert mw.results_table.hide_undo_available() is True
 
-        df2 = pd.DataFrame([_row(s) for s in ["AAA", "CCC"]])
+        lines = []
+        mw.log_panel.write_line = lines.append
+        df2 = pd.DataFrame([_row(s) for s in ["AAA", "BBB", "CCC"]])
         mw._on_scan_done_impl(_FakeScanResult({"P1": df2}, ["P1"]))
-        assert mw._undo_delete_snapshot is None
-        assert mw.results_table.undo_available() is False
+        assert "BBB" in set(mw._period_results["P1"]["symbol"])
+        shown = mw.results_table.get_symbols()
+        assert "BBB" not in shown and len(shown) == 2
+        assert mw.results_table.hide_undo_available() is True
+        assert any("Hidden rows" in ln and "BBB" in ln for ln in lines)
+        assert "(1 hidden)" in mw.combo_timeframe.itemText(0)
 
-        mw._on_undo_delete_requested()  # must be a no-op now
-        assert "BBB" not in set(mw._period_results["P1"]["symbol"])
+        mw._on_hide_undo_requested()
+        assert "BBB" in mw.results_table.get_symbols()
 
-        # Bonus end-to-end check: the scan-done path also ran the
-        # watchlist diff — second run must flag nothing NEW (both
-        # symbols carried over) and the store must exist on disk.
-        assert list(mw._period_results["P1"]["chg"]) == ["", ""]
+        # The scan-done path also ran the watchlist diff — a hidden ticker
+        # is hidden, not absent, so nothing is flagged NEW on its return.
+        assert list(mw._period_results["P1"]["chg"]) == ["", "", ""]
         assert (tmp_path / "scan_history.json").exists()
     finally:
         mw.close()
@@ -637,7 +647,7 @@ def test_crashed_scan_preserves_diff_baseline(_qapp, tmp_path, monkeypatch):
         mw.deleteLater()
 
 
-def test_ctrl_z_emits_undo_request_only_when_available(_qapp):
+def test_ctrl_z_emits_hide_undo_only_when_available(_qapp):
     from PyQt6.QtCore import QEvent, Qt as _Qt
     from PyQt6.QtGui import QKeyEvent
     from trade_scanner_fh.gui.widgets import ResultsTable
@@ -645,15 +655,15 @@ def test_ctrl_z_emits_undo_request_only_when_available(_qapp):
     table = ResultsTable()
     table.populate(pd.DataFrame([_row("A")]))
     hits = []
-    table.undo_delete_requested.connect(lambda: hits.append(1))
+    table.hide_undo_requested.connect(lambda: hits.append(1))
 
     evt = QKeyEvent(QEvent.Type.KeyPress, _Qt.Key.Key_Z,
                     _Qt.KeyboardModifier.ControlModifier)
     table.keyPressEvent(evt)
     assert hits == [], "Ctrl+Z with no pending undo must not emit"
 
-    table.set_undo_available(True)
-    assert table.undo_available() is True
+    table.set_hide_undo_available(True)
+    assert table.hide_undo_available() is True
     evt2 = QKeyEvent(QEvent.Type.KeyPress, _Qt.Key.Key_Z,
                      _Qt.KeyboardModifier.ControlModifier)
     table.keyPressEvent(evt2)

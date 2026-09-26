@@ -20,6 +20,56 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_main_window(monkeypatch, tmp_path_factory):
+    """Every test: a real `MainWindow()` must not reach the network or the
+    user's registry.
+
+    * `MainWindow.__init__` calls `_startup()`, which starts a real
+      universe download on a worker thread; its completion chains into
+      `_load_universe_and_update` and a full OHLCV refresh from Yahoo into
+      the import-time PARQUET_DIR (the package's dev store) — whenever any
+      later test happens to process Qt events. Two test files guarded
+      against this locally; three v8.0.0 files did not, and on 2026-09-26
+      a suite run refreshed ~1,400 dev-store files and drew a Yahoo rate
+      limit. Guarded here once, for every file, present and future.
+    * `closeEvent` persists window geometry through `_qsettings()`, i.e.
+      into HKCU\\Software\\trade_scanner_fh — every closed test window
+      overwrote the real app's saved size and position. Settings now go to
+      a throwaway INI file (the real QSettings API, so tests that save and
+      read back still work). A test that installs its own fake on an
+      instance still wins, as instance attributes shadow the class.
+
+    * The post-update path (`_on_update_done`, driven directly by
+      test_nasdaq_weekly_auto.py) launches `rebuild_split_artifacts()` on a
+      background thread against the import-time split / anomaly paths, i.e.
+      the dev store: every suite run rewrote its split_seam_skip.txt,
+      split_anchors.parquet and ohlcv_anomalies.csv (found 2026-09-26). The
+      split tests call `rebuild_split_artifacts` DIRECTLY with redirected
+      paths, so only the background launcher is stubbed.
+
+    Tests that exercise `_startup` itself would opt out by re-patching;
+    none do today.
+    """
+    try:
+        from trade_scanner_fh.gui import main_window as _mw
+        from trade_scanner_fh.gui import earnings_coordinator as _ec
+        from PyQt6.QtCore import QSettings
+    except Exception:
+        return
+    ini = tmp_path_factory.mktemp("qsettings") / "settings.ini"
+    monkeypatch.setattr(_mw.MainWindow, "_startup", lambda self: None)
+    monkeypatch.setattr(_mw.MainWindow, "_load_universe_and_update",
+                        lambda self, force=False: None)
+    monkeypatch.setattr(_ec.EarningsRefreshCoordinator,
+                        "_kick_off_split_artifacts_rebuild",
+                        lambda self: None)
+    monkeypatch.setattr(
+        _mw.MainWindow, "_qsettings",
+        lambda self: QSettings(str(ini), QSettings.Format.IniFormat),
+    )
+
+
 @pytest.fixture(scope="module")
 def _qapp():
     """Module-level QApplication so widget tests can instantiate without

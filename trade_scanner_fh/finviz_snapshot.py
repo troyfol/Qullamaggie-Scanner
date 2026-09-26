@@ -488,7 +488,11 @@ def missing_symbols(
 # directly, and burying Beta three levels down would be unhelpful.
 
 OPTIONS_FIELDS: tuple = (
-    ("finviz_beta",          "Beta (finviz)"),
+    # finviz publishes a 5-year MONTHLY beta vs the S&P 500 — measured
+    # 2026-09-26: recomputed from our own closes it matches within 0.05 on
+    # 96% of tickers. Said in the label because the computed Beta row beside
+    # it defaults to one year of DAILY returns and reads very differently.
+    ("finviz_beta",          "Beta (finviz, 5Y monthly)"),
     ("volatility_week_pct",  "Volatility W %"),
     ("volatility_month_pct", "Volatility M %"),
     ("optionable",           "Optionable"),
@@ -581,6 +585,30 @@ FINVIZ_GROUPS: tuple = (
     )),
 )
 
+# Parsed and stored, shown as columns, never filtered: the seven withheld
+# numerics above plus the four free-text fields. Each gets a DISPLAY-ONLY row
+# in the panel (v8.0.0).
+#
+# Before v8.0.0 these had no panel row and were joined onto every scan
+# unconditionally, together with every other snapshot field, so the table
+# always carried ~90 FV columns whether or not a single finviz row was
+# switched on. Joining only what a row asks for fixed that — and would have
+# left these eleven unreachable, since nothing could ask for them. The
+# display-only rows are how they are asked for now.
+INFO_FIELDS: tuple = (
+    ("finviz_price",      "Price (latest)"),
+    ("finviz_prev_close", "Prev Close (latest)"),
+    ("finviz_change_pct", "Change % (latest)"),
+    ("finviz_volume",     "Volume (latest)"),
+    ("finviz_avg_volume", "Avg Volume (fv)"),
+    ("finviz_rel_volume", "Rel Volume (fv)"),
+    ("finviz_atr14",      "ATR 14 (fv)"),
+    ("index_membership",  "Index"),
+    ("earnings_timing",   "Earnings Date (fv)"),
+    ("dividend_ex_date",  "Dividend Ex-Date"),
+    ("ipo_date",          "IPO Date"),
+)
+
 # Every field that gets a filter row, in panel order: the Options header's
 # numeric pair first, then each group.
 FILTERABLE_FIELDS: tuple = tuple(
@@ -590,14 +618,44 @@ FILTERABLE_FIELDS: tuple = tuple(
 FIELD_LABELS: dict = dict(
     list(OPTIONS_FIELDS)
     + [(k, l) for _g, items in FINVIZ_GROUPS for k, l in items]
+    + list(INFO_FIELDS)
 )
 
 # Fields carried as columns but never filterable: the withheld seven plus the
-# four free-text ones.
+# four free-text ones. Derived rather than restated so a field added to the
+# page map lands here automatically — a test pins it equal to INFO_FIELDS so
+# such a field cannot also go without a panel row.
 COLUMN_ONLY_FIELDS: tuple = tuple(
     f for f in SNAPSHOT_FIELDS
     if f not in FILTERABLE_FIELDS and f not in BOOL_FIELDS
 )
+
+
+def _slug(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+
+
+# The results-column categories behind the Hide FV Columns dropdown (v8.0.0).
+# Same partition the panel is drawn in — Options header, the eight Finviz
+# Additional sub-sections, then Info — so a category in the dropdown always
+# means exactly the rows under one heading in the panel.
+#
+# `beta_calc` sits under the Options HEADER in the panel but is deliberately
+# absent: it is computed per period from our own OHLCV, not scraped, and its
+# column is not an FV column.
+COLUMN_GROUPS: tuple = (
+    ("options", "Options", tuple(k for k, _l in OPTIONS_FIELDS)),
+    *(
+        (_slug(title), title, tuple(k for k, _l in items))
+        for title, items in FINVIZ_GROUPS
+    ),
+    ("info", "Info", tuple(k for k, _l in INFO_FIELDS)),
+)
+
+# field -> group id. Built once at import.
+GROUP_OF: dict = {
+    key: gid for gid, _title, keys in COLUMN_GROUPS for key in keys
+}
 
 
 # ----------------------------------------------------------------------
@@ -658,96 +716,158 @@ def pending_count() -> int:
 # Per-field spinbox ranges
 # ----------------------------------------------------------------------
 #
-# Every filter row needs bounds, defaults, a step and a decimal count that
-# match what the field actually measures. A shared +/-1e12 sentinel made the
-# panel unreadable: "Market Cap min -1000000000000" tells you nothing about
-# the scale you are screening on, and a 0.01 step on a figure in the billions
-# is unusable.
+# Every filter row needs bounds, a step and a decimal count that match what
+# the field actually measures. A bound left sitting AT its spinbox limit is
+# read as OPEN by `_finviz_scan_params` ("no limit on this side"), which is
+# what lets a row be switched on without filtering anything until a bound is
+# moved. The defaults therefore ARE the limits.
 #
-# `RANGE_KINDS` maps a kind to (spin_min, spin_max, default_min, default_max,
-# step, decimals). A bound left sitting AT its spinbox limit is treated as
-# OPEN by `_finviz_scan_params`, so "Short Float >= 20" with the maximum at
-# 100 does not silently also assert "<= 100" - dragging a bound to the end of
-# its range is the natural way to say "no limit on this side".
-RANGE_KINDS: dict = {
-    #                  spin_lo   spin_hi   def_lo   def_hi   step  dp
-    "pct_0_100":     (      0.0,    100.0,     0.0,   100.0,   1.0, 2),
-    "pct_signed":    (   -100.0,   1000.0,  -100.0,  1000.0,   5.0, 2),
-    "pct_growth":    (   -100.0,  10000.0,  -100.0, 10000.0,  10.0, 2),
-    "pct_margin":    (   -500.0,    500.0,  -500.0,   500.0,   5.0, 2),
-    "ratio":         (      0.0,   1000.0,     0.0,  1000.0,   0.5, 2),
-    "ratio_signed":  (   -100.0,    100.0,  -100.0,   100.0,   0.1, 2),
-    "money_large":   (      0.0,   5.0e12,     0.0,  5.0e12, 1.0e8, 0),
-    "shares":        (      0.0,   5.0e11,     0.0,  5.0e11, 1.0e6, 0),
-    "price":         (      0.0,  100000.0,    0.0, 100000.0,  1.0, 2),
-    "eps":           (  -1000.0,   1000.0, -1000.0,  1000.0,   0.1, 2),
-    "count":         (      0.0,  5.0e6,       0.0,   5.0e6, 1000.0, 0),
-    "recom":         (      1.0,      5.0,     1.0,     5.0,   0.1, 2),
-    "rsi":           (      0.0,    100.0,     0.0,   100.0,   1.0, 2),
-    "beta":          (     -5.0,     10.0,    -5.0,    10.0,   0.1, 2),
-    "volatility":    (      0.0,    100.0,     0.0,   100.0,   0.5, 2),
+# v8.0.0 replaced v7.0.1's fifteen shared "kinds" with one entry per field,
+# because the shared kinds were wrong in two different ways:
+#
+# 1. **Too wide to use.** PEG ran 0 to 1000 when 99.5% of real values are
+#    under 46; P/S, P/B, P/C and EV/Sales the same. A range fifty times wider
+#    than the data gives no sense of scale and makes the arrows useless.
+# 2. **Too narrow to express natural thresholds.** Because a bound AT its
+#    limit means "open", a limit that coincides with a natural threshold makes
+#    that threshold impossible to ask for. `money_large` started at 0, so
+#    "Income >= 0" — profitable companies only, the most natural screen on
+#    that field — silently meant "no limit", while 44% of tickers carry a
+#    negative income. Enterprise Value, EV/EBITDA and EV/Sales had the same
+#    hole.
+#
+# Method: profiled against the live store on 2026-09-24 (11,594 tickers).
+# Each range covers roughly the 0.5th to 99.5th percentile, rounded OUTWARD
+# to a clean number, and then widened where needed so every threshold a user
+# would naturally type (0 for anything that can go negative, 100 for a
+# percentage that can exceed it, like institutional ownership or payout)
+# sits strictly INSIDE the range. Values beyond a limit are not excluded:
+# the limit only caps which threshold can be typed, and a bound left at it
+# is open, so the far tails still pass.
+#
+# Options is unchanged from v7.0.1 — those three were already right and are
+# the reference the rest were brought in line with.
+#
+# (spin_lo, spin_hi, step, decimals)
+FIELD_RANGES: dict = {
+    # --- Options header ---
+    "finviz_beta":          (-5.0,     10.0,     0.1,   2),
+    "volatility_week_pct":  (0.0,      100.0,    0.5,   2),
+    "volatility_month_pct": (0.0,      100.0,    0.5,   2),
+    # --- Valuation ---
+    "market_cap":           (0.0,      5.0e12,   1.0e8, 0),
+    "enterprise_value":     (-50.0e9,  5.0e12,   1.0e8, 0),
+    "pe":                   (0.0,      500.0,    1.0,   1),
+    "forward_pe":           (0.0,      500.0,    1.0,   1),
+    "peg":                  (0.0,      50.0,     0.1,   2),
+    "ps":                   (0.0,      200.0,    0.5,   2),
+    "pb":                   (0.0,      200.0,    0.5,   2),
+    "pc":                   (0.0,      1000.0,   1.0,   1),
+    "pfcf":                 (0.0,      500.0,    1.0,   1),
+    "ev_ebitda":            (-100.0,   500.0,    1.0,   1),
+    "ev_sales":             (-50.0,    500.0,    0.5,   2),
+    "target_price":         (0.0,      5000.0,   1.0,   2),
+    "recom":                (1.0,      5.0,      0.1,   2),
+    # --- Financials ---
+    "income":               (-100.0e9, 500.0e9,  1.0e7, 0),
+    "sales":                (0.0,      1.0e12,   1.0e7, 0),
+    "book_per_sh":          (-100.0,   1000.0,   0.5,   2),
+    "cash_per_sh":          (0.0,      500.0,    0.5,   2),
+    "quick_ratio":          (0.0,      100.0,    0.1,   2),
+    "current_ratio":        (0.0,      100.0,    0.1,   2),
+    "debt_eq":              (0.0,      50.0,     0.05,  2),
+    "lt_debt_eq":           (0.0,      50.0,     0.05,  2),
+    "employees":            (0.0,      3.0e6,    100.0, 0),
+    # --- Dividends ---
+    "dividend_est":         (0.0,      50.0,     0.05,  2),
+    "dividend_est_pct":     (0.0,      50.0,     0.1,   2),
+    "dividend_ttm":         (0.0,      50.0,     0.05,  2),
+    "dividend_ttm_pct":     (0.0,      50.0,     0.1,   2),
+    "dividend_gr_3y":       (-100.0,   500.0,    1.0,   1),
+    "dividend_gr_5y":       (-100.0,   500.0,    1.0,   1),
+    "payout_pct":           (0.0,      500.0,    1.0,   1),
+    # --- Growth & Estimates ---
+    "eps_ttm":              (-100.0,   200.0,    0.1,   2),
+    "eps_next_y":           (-50.0,    200.0,    0.1,   2),
+    "eps_next_q":           (-20.0,    50.0,     0.05,  2),
+    "eps_this_y_pct":       (-500.0,   1000.0,   5.0,   1),
+    "eps_next_y_pct":       (-500.0,   1000.0,   5.0,   1),
+    "eps_next_5y_pct":      (-50.0,    200.0,    1.0,   1),
+    "eps_past_3y_pct":      (-500.0,   500.0,    5.0,   1),
+    "eps_past_5y_pct":      (-500.0,   500.0,    5.0,   1),
+    "sales_past_3y_pct":    (-100.0,   500.0,    1.0,   1),
+    "sales_past_5y_pct":    (-100.0,   500.0,    1.0,   1),
+    "eps_yoy_ttm_pct":      (-1000.0,  1000.0,   5.0,   1),
+    "sales_yoy_ttm_pct":    (-100.0,   1000.0,   5.0,   1),
+    "eps_qoq_pct":          (-1000.0,  1000.0,   5.0,   1),
+    "sales_qoq_pct":        (-100.0,   1000.0,   5.0,   1),
+    "eps_surprise_pct":     (-500.0,   500.0,    1.0,   1),
+    "sales_surprise_pct":   (-100.0,   300.0,    1.0,   1),
+    # --- Ownership & Short ---
+    "insider_own_pct":      (0.0,      100.0,    1.0,   2),
+    "insider_trans_pct":    (-100.0,   500.0,    1.0,   2),
+    "inst_own_pct":         (0.0,      150.0,    1.0,   2),
+    "inst_trans_pct":       (-100.0,   500.0,    1.0,   2),
+    "shs_outstanding":      (0.0,      50.0e9,   1.0e6, 0),
+    "shs_float":            (0.0,      50.0e9,   1.0e6, 0),
+    "short_float_pct":      (0.0,      100.0,    1.0,   2),
+    "short_ratio":          (0.0,      50.0,     0.1,   2),
+    "short_interest":       (0.0,      1.0e9,    1.0e5, 0),
+    # --- Margins & Returns ---
+    "roa_pct":              (-500.0,   100.0,    1.0,   1),
+    "roe_pct":              (-500.0,   500.0,    1.0,   1),
+    "roic_pct":             (-500.0,   200.0,    1.0,   1),
+    "gross_margin_pct":     (-200.0,   100.0,    1.0,   1),
+    "oper_margin_pct":      (-500.0,   200.0,    1.0,   1),
+    "profit_margin_pct":    (-500.0,   200.0,    1.0,   1),
+    # --- Technicals ---
+    "sma20_pct":            (-100.0,   200.0,    0.5,   2),
+    "sma50_pct":            (-100.0,   200.0,    0.5,   2),
+    "sma200_pct":           (-100.0,   400.0,    1.0,   2),
+    "high_52w":             (0.0,      5000.0,   1.0,   2),
+    "high_52w_pct":         (-100.0,   25.0,     0.5,   2),
+    "low_52w":              (0.0,      5000.0,   1.0,   2),
+    "low_52w_pct":          (-100.0,   1000.0,   1.0,   2),
+    "finviz_rsi14":         (0.0,      100.0,    1.0,   2),
+    # --- Performance ---
+    "perf_week_pct":        (-100.0,   200.0,    0.5,   2),
+    "perf_month_pct":       (-100.0,   300.0,    1.0,   2),
+    "perf_quarter_pct":     (-100.0,   500.0,    1.0,   2),
+    "perf_half_y_pct":      (-100.0,   1000.0,   1.0,   2),
+    "perf_ytd_pct":         (-100.0,   1000.0,   1.0,   2),
+    "perf_year_pct":        (-100.0,   1000.0,   1.0,   2),
+    "perf_3y_pct":          (-100.0,   2000.0,   5.0,   1),
+    "perf_5y_pct":          (-100.0,   2000.0,   5.0,   1),
+    "perf_10y_pct":         (-100.0,   5000.0,   5.0,   1),
 }
 
-# field -> kind. Anything unlisted falls back to "ratio", which is the least
-# surprising general-purpose numeric shape.
-FIELD_KINDS: dict = {
-    # Valuation
-    "market_cap": "money_large", "enterprise_value": "money_large",
-    "pe": "ratio", "forward_pe": "ratio", "peg": "ratio", "ps": "ratio",
-    "pb": "ratio", "pc": "ratio", "pfcf": "ratio",
-    "ev_ebitda": "ratio", "ev_sales": "ratio",
-    "target_price": "price", "recom": "recom",
-    # Financials
-    "income": "money_large", "sales": "money_large",
-    "book_per_sh": "eps", "cash_per_sh": "eps",
-    "quick_ratio": "ratio", "current_ratio": "ratio",
-    "debt_eq": "ratio", "lt_debt_eq": "ratio",
-    "employees": "count",
-    # Dividends
-    "dividend_est": "eps", "dividend_est_pct": "pct_0_100",
-    "dividend_ttm": "eps", "dividend_ttm_pct": "pct_0_100",
-    "dividend_gr_3y": "pct_signed", "dividend_gr_5y": "pct_signed",
-    "payout_pct": "pct_0_100",
-    # Growth & estimates
-    "eps_ttm": "eps", "eps_next_y": "eps", "eps_next_q": "eps",
-    "eps_this_y_pct": "pct_growth", "eps_next_y_pct": "pct_growth",
-    "eps_next_5y_pct": "pct_growth",
-    "eps_past_3y_pct": "pct_growth", "eps_past_5y_pct": "pct_growth",
-    "sales_past_3y_pct": "pct_growth", "sales_past_5y_pct": "pct_growth",
-    "eps_yoy_ttm_pct": "pct_growth", "sales_yoy_ttm_pct": "pct_growth",
-    "eps_qoq_pct": "pct_growth", "sales_qoq_pct": "pct_growth",
-    "eps_surprise_pct": "pct_signed", "sales_surprise_pct": "pct_signed",
-    # Ownership & short
-    "insider_own_pct": "pct_0_100", "insider_trans_pct": "pct_signed",
-    "inst_own_pct": "pct_0_100", "inst_trans_pct": "pct_signed",
-    "shs_outstanding": "shares", "shs_float": "shares",
-    "short_float_pct": "pct_0_100", "short_ratio": "ratio",
-    "short_interest": "shares",
-    # Margins & returns
-    "roa_pct": "pct_margin", "roe_pct": "pct_margin", "roic_pct": "pct_margin",
-    "gross_margin_pct": "pct_margin", "oper_margin_pct": "pct_margin",
-    "profit_margin_pct": "pct_margin",
-    # Technicals
-    "sma20_pct": "pct_signed", "sma50_pct": "pct_signed",
-    "sma200_pct": "pct_signed",
-    "high_52w": "price", "high_52w_pct": "pct_signed",
-    "low_52w": "price", "low_52w_pct": "pct_signed",
-    "finviz_rsi14": "rsi",
-    # Options header
-    "finviz_beta": "beta",
-    "volatility_week_pct": "volatility", "volatility_month_pct": "volatility",
-    # Performance
-    "perf_week_pct": "pct_signed", "perf_month_pct": "pct_signed",
-    "perf_quarter_pct": "pct_signed", "perf_half_y_pct": "pct_signed",
-    "perf_ytd_pct": "pct_signed", "perf_year_pct": "pct_signed",
-    "perf_3y_pct": "pct_growth", "perf_5y_pct": "pct_growth",
-    "perf_10y_pct": "pct_growth",
-}
+# Fields in the billions (or millions of shares / heads). Their spinboxes
+# display and accept K / M / B / T suffixes — "2.5B" rather than
+# 2500000000 — and step relative to the current value's magnitude. The
+# results columns already render these with suffixes (`_fmt_fv_num`).
+BIG_NUMBER_FIELDS: frozenset = frozenset({
+    "market_cap", "enterprise_value", "income", "sales", "employees",
+    "shs_outstanding", "shs_float", "short_interest",
+})
+
+# Anything unlisted gets this — the least surprising general numeric shape.
+# A test asserts every filterable field IS listed, so this is a guard rail.
+_FALLBACK_RANGE: tuple = (0.0, 1000.0, 0.5, 2)
 
 
 def field_range(name: str) -> tuple:
-    """(spin_lo, spin_hi, default_lo, default_hi, step, decimals) for a field."""
-    return RANGE_KINDS[FIELD_KINDS.get(name, "ratio")]
+    """(spin_lo, spin_hi, default_lo, default_hi, step, decimals) for a field.
+
+    The defaults are the limits themselves (see the block comment above), so
+    the tuple keeps the six-slot shape v7.0.1 callers read.
+    """
+    lo, hi, step, dp = FIELD_RANGES.get(name, _FALLBACK_RANGE)
+    return (lo, hi, lo, hi, step, dp)
+
+
+def is_big_number(name: str) -> bool:
+    """Does this field's spinbox read and write K / M / B / T suffixes?"""
+    return name in BIG_NUMBER_FIELDS
 
 
 def is_open_bound(name: str, value, *, upper: bool) -> bool:
@@ -756,3 +876,114 @@ def is_open_bound(name: str, value, *, upper: bool) -> bool:
         return True
     lo, hi = field_range(name)[0], field_range(name)[1]
     return value >= hi if upper else value <= lo
+
+
+# ----------------------------------------------------------------------
+# Preset migration from the v7 ranges
+# ----------------------------------------------------------------------
+#
+# A preset stores each bound as a plain number, and "open" is not stored at
+# all — it is inferred from the number sitting at the limit. Change a limit
+# and an old preset's open bound can land strictly INSIDE the new range,
+# where it silently becomes a real filter. Concretely: a v7.0.1 preset with
+# the Income row on and its minimum untouched stored 0.0, which meant "no
+# lower limit"; under the v8 range (-100B .. 500B) a restored 0.0 would mean
+# "Income >= 0" and quietly drop every loss-making name.
+#
+# Two v7 encodings existed and both are recognised:
+#   * v7.0.0 used a shared +/-1e12 sentinel on every row;
+#   * v7.0.1 used the per-kind limits below.
+# A stored bound equal to either is mapped to the v8 limit on the same side,
+# i.e. it stays open. A v7.0.1 bound that was a REAL threshold never equals
+# its kind's limit (being at the limit is exactly what made it open), so the
+# mapping cannot capture a genuine filter.
+#
+# One residual ambiguity, accepted: under v7.0.0 the whole +/-1e12 range was
+# available, so a 7.0.0 preset may hold a GENUINE bound that happens to equal
+# a later v7.0.1 kind limit (e.g. "Income >= 0"). A row holding a sentinel on
+# its other side is recognisably 7.0.0 and is migrated on the sentinel rule
+# alone; a 7.0.0 row with two genuine bounds cannot be told apart from 7.0.1.
+# 7.0.0 was superseded the same day it shipped.
+_V7_SENTINEL: float = 1.0e12
+
+_V7_KIND_LIMITS: dict = {
+    "pct_0_100": (0.0, 100.0), "pct_signed": (-100.0, 1000.0),
+    "pct_growth": (-100.0, 10000.0), "pct_margin": (-500.0, 500.0),
+    "ratio": (0.0, 1000.0), "ratio_signed": (-100.0, 100.0),
+    "money_large": (0.0, 5.0e12), "shares": (0.0, 5.0e11),
+    "price": (0.0, 100000.0), "eps": (-1000.0, 1000.0),
+    "count": (0.0, 5.0e6), "recom": (1.0, 5.0), "rsi": (0.0, 100.0),
+    "beta": (-5.0, 10.0), "volatility": (0.0, 100.0),
+}
+
+# The v7.0.1 field -> kind map, verbatim. Kept only to read old presets.
+_V7_FIELD_KINDS: dict = {
+    "market_cap": "money_large", "enterprise_value": "money_large",
+    "pe": "ratio", "forward_pe": "ratio", "peg": "ratio", "ps": "ratio",
+    "pb": "ratio", "pc": "ratio", "pfcf": "ratio",
+    "ev_ebitda": "ratio", "ev_sales": "ratio",
+    "target_price": "price", "recom": "recom",
+    "income": "money_large", "sales": "money_large",
+    "book_per_sh": "eps", "cash_per_sh": "eps",
+    "quick_ratio": "ratio", "current_ratio": "ratio",
+    "debt_eq": "ratio", "lt_debt_eq": "ratio",
+    "employees": "count",
+    "dividend_est": "eps", "dividend_est_pct": "pct_0_100",
+    "dividend_ttm": "eps", "dividend_ttm_pct": "pct_0_100",
+    "dividend_gr_3y": "pct_signed", "dividend_gr_5y": "pct_signed",
+    "payout_pct": "pct_0_100",
+    "eps_ttm": "eps", "eps_next_y": "eps", "eps_next_q": "eps",
+    "eps_this_y_pct": "pct_growth", "eps_next_y_pct": "pct_growth",
+    "eps_next_5y_pct": "pct_growth",
+    "eps_past_3y_pct": "pct_growth", "eps_past_5y_pct": "pct_growth",
+    "sales_past_3y_pct": "pct_growth", "sales_past_5y_pct": "pct_growth",
+    "eps_yoy_ttm_pct": "pct_growth", "sales_yoy_ttm_pct": "pct_growth",
+    "eps_qoq_pct": "pct_growth", "sales_qoq_pct": "pct_growth",
+    "eps_surprise_pct": "pct_signed", "sales_surprise_pct": "pct_signed",
+    "insider_own_pct": "pct_0_100", "insider_trans_pct": "pct_signed",
+    "inst_own_pct": "pct_0_100", "inst_trans_pct": "pct_signed",
+    "shs_outstanding": "shares", "shs_float": "shares",
+    "short_float_pct": "pct_0_100", "short_ratio": "ratio",
+    "short_interest": "shares",
+    "roa_pct": "pct_margin", "roe_pct": "pct_margin", "roic_pct": "pct_margin",
+    "gross_margin_pct": "pct_margin", "oper_margin_pct": "pct_margin",
+    "profit_margin_pct": "pct_margin",
+    "sma20_pct": "pct_signed", "sma50_pct": "pct_signed",
+    "sma200_pct": "pct_signed",
+    "high_52w": "price", "high_52w_pct": "pct_signed",
+    "low_52w": "price", "low_52w_pct": "pct_signed",
+    "finviz_rsi14": "rsi",
+    "finviz_beta": "beta",
+    "volatility_week_pct": "volatility", "volatility_month_pct": "volatility",
+    "perf_week_pct": "pct_signed", "perf_month_pct": "pct_signed",
+    "perf_quarter_pct": "pct_signed", "perf_half_y_pct": "pct_signed",
+    "perf_ytd_pct": "pct_signed", "perf_year_pct": "pct_signed",
+    "perf_3y_pct": "pct_growth", "perf_5y_pct": "pct_growth",
+    "perf_10y_pct": "pct_growth",
+}
+
+
+def _same(a, b) -> bool:
+    try:
+        return abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(b)))
+    except (TypeError, ValueError):
+        return False
+
+
+def migrate_v7_bounds(name: str, lo, hi) -> tuple:
+    """Map a pre-v8 preset's (min, max) so an OPEN side stays open.
+
+    Returns the pair unchanged for anything that was a genuine bound, and
+    for fields v7 never had.
+    """
+    new_lo, new_hi = field_range(name)[0], field_range(name)[1]
+    if _same(lo, -_V7_SENTINEL) or _same(hi, _V7_SENTINEL):
+        # v7.0.0 row: only the sentinel encoding applies.
+        return (new_lo if _same(lo, -_V7_SENTINEL) else lo,
+                new_hi if _same(hi, _V7_SENTINEL) else hi)
+    kind = _V7_FIELD_KINDS.get(name)
+    if kind is None:
+        return lo, hi
+    old_lo, old_hi = _V7_KIND_LIMITS[kind]
+    return (new_lo if _same(lo, old_lo) else lo,
+            new_hi if _same(hi, old_hi) else hi)

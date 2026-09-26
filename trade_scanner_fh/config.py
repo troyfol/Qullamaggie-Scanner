@@ -799,10 +799,32 @@ OHLCV_VOLUME_REGRESSION_PCT = 10.0
 # even by Force OHLCV Refresh. Every scan returned zero results, because
 # `NaN >= min_price` is False and the funnel drops the ticker at stage one.
 #
-# 50% is far above any legitimate rate (a normal session leaves a handful of
-# halted names null) and far below the ~100% a systemic source failure
-# produces, so it fires on the failure and stays silent otherwise.
-OHLCV_NAN_LAST_BAR_WARN_PCT = 50.0
+# v8.0.0 lowered this from 50% and added the BURST rule below, after the
+# 2026-09-24 evening refresh (18:49-20:52 ET, a Thursday, hours after the
+# close) came back 21.5% null — 2,677 of 12,437 tickers, including SPY and
+# every sector ETF — and the 50% line kept it at INFO. It was not a block:
+# 0 errors, no backoff, a steady 200 tickers per 99.7 s throughout. The
+# nulls began at a point in TIME (about 20:10 ET, 00:10 UTC) and then ran at
+# 65-84% to the end of the alphabetical sweep, so the run-wide rate diluted a
+# near-total failure of its last third. Yahoo served complete bars two days
+# later, and even the tickers whose prices were fine had Volume 0.3-2.9% SHORT
+# of the settled figure — the same unsettled-bar signature as 2026-08-28.
+#
+# A normal session leaves 0.1-0.25% of names null (halts, dead OTC stubs), so
+# 5% is still far above noise.
+OHLCV_NAN_LAST_BAR_WARN_PCT = 5.0
+
+# Below this many tickers on the session, the overall rate is not judged — a
+# three-ticker rebuild with one halted name is 33% null and means nothing.
+OHLCV_NAN_MIN_SAMPLE = 100
+
+# BURST rule: the worst run of this many consecutive on-session tickers, in
+# the order the refresh processed them, may not exceed this null rate. Catches
+# a source that goes bad PART WAY through a sweep, which the overall rate
+# averages away (2026-09-24: 21.5% overall, 65-84% in every window after the
+# onset). A run shorter than the window is judged on the overall rate alone.
+OHLCV_NAN_BURST_WINDOW = 400
+OHLCV_NAN_BURST_WARN_PCT = 25.0
 
 # -- Deep refresh (2026-08-29) ---------------------------------------------
 # `Deep OHLCV Refresh` re-pulls the last N MARKET days for every cached ticker,
