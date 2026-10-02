@@ -41,6 +41,10 @@ features at a live order-entry platform.
   qualifying window.
 - **Watchlist diffing**, an in-app scan scheduler, Quick Export, and a
   TradeStation bridge plus a per-row HOTKEY sender.
+- **Lookup mode** (v8.0.1): run the current filters, timeframes and
+  Sequenced Run over a typed list of tickers — exactly as set (only passers
+  shown) or with every filter display-only (all shown, failures coloured) —
+  with a per-ticker report of why anything is missing.
 - **Store integrity as a first-class concern** (v6.0.0): responses can only
   supersede the range they cover, reported values merge across sources with
   per-column provenance, interior OHLCV gaps are detected and repaired, and
@@ -54,10 +58,17 @@ features at a live order-entry platform.
   deleted.
 - **A refresh that returns garbage says so** (v6.1.1): a provider can serve a
   session with null prices, and the download still "succeeds". Every refresh
-  now reports what fraction of the newest session came back null and warns past
-  50%, and `Data → Deep OHLCV Refresh…` can re-pull the last N **market** days
-  for the whole store — the only action that can replace a bar which is present
-  but wrong, since staleness is judged by a file's date alone.
+  now reports what fraction of the newest session came back null and warns
+  (5% of the session, or 25% of any 400-ticker stretch, since v8.0.0), and
+  `Data → Deep OHLCV Refresh…` can re-pull the last N **market** days for the
+  whole store — the only action that can replace a bar which is present but
+  wrong, since staleness is judged by a file's date alone.
+- **A flagged session is followed until it is fixed** (v8.0.1): the session a
+  null-bar warning flags is written down with the tickers whose bar was null;
+  every later refresh re-reads exactly those bars and says "repaired" or "still
+  null" — a partial run can never clear it — and a reminder shows at launch and
+  on the status bar until it is. A null re-send can no longer overwrite a
+  cached bar that has prices.
 - **A quarantine that costs only what it must** (v6.1.2): the split-seam
   exclusion is now scoped to seams a scan can actually *read* — a
   discontinuity older than the window plus the longest indicator lookback is
@@ -294,6 +305,73 @@ into presets); right-click rows or headers to delete, cut, or paste;
 colouring; **Save Preset** stores the full filter + window + column layout to
 `scanner_data/presets/{name}.json`.
 
+### Lookup mode (v8.0.1)
+
+**Scans → Lookup…** runs the current filter panel over tickers you type
+instead of the whole cached universe. Everything else is a regular scan: the
+same OHLCV / earnings / finviz stores, the same timeframes, custom range or
+Sequenced Run, the same earnings toolbar toggles. Results land in the table
+exactly like a scan's (period dropdown, colour rules, exports, Send to
+Watchlist) and replace what was on screen.
+
+The dialog has the Manual Input STW form factor. Tickers are comma-separated
+(newlines, spaces and semicolons work too; `$` prefixes and case are
+ignored; `BRK.B` / `BRK/B` match the store's `BRK-B`). The last list and
+mode are remembered for the session. Two modes:
+
+- **Apply filters as set** — a ticker failing any filter is not shown. On
+  the same preset a lookup shows exactly the scan's passers from the list,
+  with identical values.
+- **All filters display-only** — every switched-on filter (finviz rows and
+  Period Avg / Max included) becomes display-only, so every ticker with data
+  is shown and failing values are coloured by the *Display-only value fails*
+  rule. **Min Price** has no display-only form and is not applied in this
+  mode (Close is always shown); **Omit intra-run** is ignored, or the first
+  period would claim every ticker.
+
+**Refresh earnings first (optional).** Two boxes in the dialog — one or
+neither may be ticked:
+
+- **Refresh earnings from finviz first**
+- **Refresh earnings from all sources first** — finviz + zacks + finnhub, the
+  same set as Data → Run Earnings Smart Refresh Now (the Nasdaq calendar, a
+  whole-market date sweep that already runs daily, and Yahoo dates, a gap
+  filler, are not part of it).
+
+The refresh runs for the listed tickers that have cached OHLCV (finviz is
+paced at about 4 s per ticker; the other two run alongside), with each
+source's own skip list applied and the usual earnings progress bars. Each fill
+saves and reconciles into the earnings store before it reports done, so the
+lookup starts the moment the last source finishes and reads the fresh data.
+If an earnings fill is already running, the lookup refuses and says so rather
+than queueing behind it. **Stop** during the refresh cancels the whole lookup;
+the progress panel's **Stop Earnings Refresh** stops only the refresh, and the
+lookup then runs on the data as it stood (the report says so).
+
+In both modes:
+
+- **Top X Percentile is never applied** — it ranks a ticker's gain against
+  the whole scan, and a lookup does not run the whole scan. The report says so.
+- Universe pre-filters (Include ETF / ADR, IPO mode, greylist, blacklist,
+  omit-previously-scanned) do not apply — the typed list is the universe —
+  and benchmark tickers (SPY, sector ETFs) can be looked up.
+- Tickers with no cached OHLCV are reported and skipped (Data → Rebuild
+  Tickers can fetch one); nothing is downloaded.
+- Row hides and the view toggles apply as for any scan.
+- **A per-ticker report** goes to the log after every lookup, per period:
+  how many are shown, then each other ticker with its reason — `failed —
+  TSLA (Min Price ($10))`, `no data in the window`, `split-seam quarantine`,
+  `error`, `passed but hidden by you`, `passed but hidden by a view toggle`,
+  `already shown in an earlier period (Omit intra-run)`.
+- Lookups never write the watchlist-diff baseline (`scan_history.json`),
+  never count toward the session counter, and are invisible to the scheduler.
+
+Implementation: `gui/lookup.py` (parsing, cache matching, the dialog, the
+report), `scanner.lookup_params` (the parameter changes — display-only is
+verified complete by building zero funnel stages with every filter on),
+`run_scan(lookup=True)` (per-ticker outcomes), `MainWindow._run_lookup`, which
+shares `_scan_timeframes` / `_scan_params_list` with `_run_scan`.
+
 ---
 
 ## Troubleshooting
@@ -301,7 +379,10 @@ colouring; **Save Preset** stores the full filter + window + column layout to
 | Symptom | Fix |
 |---------|-----|
 | Scan returns few or no rows | First check the funnel log for `Min Price` cutting almost everything — that means null cached prices, not a filter problem; run `Data → Deep OHLCV Refresh…`. Otherwise the OHLCV download is unfinished: wait for the toolbar status to go green, or `Data → Download Missing Tickers Only`. |
-| `WARNING - SUSPECT OHLCV REFRESH` after a refresh | The provider served the newest session with null prices — ≥ 5% of it overall, or ≥ 25% in some run of 400 consecutive tickers (v8.0.0; it was 50% overall, which missed a refresh that went bad part-way through). Treat every ticker's newest bar as suspect (volumes are understated too), wait for the session to settle, then `Data → Deep OHLCV Refresh…` over the whole store. |
+| `WARNING - SUSPECT OHLCV REFRESH` after a refresh | The provider served the newest session with null prices — ≥ 5% of it overall, or ≥ 25% in some run of 400 consecutive tickers (v8.0.0; it was 50% overall, which missed a refresh that went bad part-way through). Treat every ticker's newest bar as suspect (volumes are understated too), wait for the session to settle, then `Data → Deep OHLCV Refresh…` over the whole store. Since v8.0.1 the session is also **watched**: the first update after the next close usually repairs it through its refetch overlap, and every update reports `OHLCV health: <date> re-checked — … now have prices, … still null` until it is resolved. |
+| `⚠ 09-24 suspect` on the OHLCV status label, or an `OHLCV health reminder` line at launch | A flagged session has not yet been confirmed repaired (v8.0.1). The tooltip gives the counts. `Data → Deep OHLCV Refresh…` repairs it now; if the provider never supplies the missing prices (a handful of dead OTC names can stay null forever), `Data → Dismiss OHLCV Health Warnings…` clears the reminder — the bars themselves are not changed. A session clears on its own once fewer than 1% of its tickers **and** at most 10% of the bars flagged are still null. |
+| Window jumps or gets stuck when dragged to another (narrower or differently scaled) monitor | Fixed in v8.0.1. The window could not be narrower than 2,116 px — every toolbar and filter row was a single line — so it could not fit a 1,080 / 1,440 / 1,536 px-wide monitor, and Windows' resize on a scale change was refused. Rows now wrap (minimum ≈ 880 px with the dark theme), and when a move settles on a different monitor a window bigger than that monitor is shrunk and pulled fully onto it. It never resizes mid-drag (a held mouse button means you are still dragging). The window does not grow back when you return to a bigger monitor — maximize or resize it. |
+| `null re-sent bar(s) refused … (cached prices kept)` in the update summary | The provider re-sent a date you already hold with null prices, and the cached bar was kept (v8.0.1). Before v8.0.1 the null replaced it. Nothing to do; a large count means the provider is serving nulls — expect the suspect-refresh warning too. |
 | A ticker you expect is missing | It may be hidden — check **Hidden ▾** on the ribbon and the scan's "Hidden rows" log line. Hides persist across scans and presets. |
 | Cached bar is present but wrong (null price, stale volume) | `Data → Deep OHLCV Refresh…`. `Force OHLCV Refresh` will **not** fix it — it re-checks staleness, which passes on any file whose last date is current however bad its values. |
 | Universe missing SEC tickers | No SEC contact email — see [Credentials](#credentials). |
@@ -1770,8 +1851,37 @@ position, then painted one cell over. Clashing headers now carry their side —
 `Q-1 Date (EPS)` / `Q-1 Date (Rev)` — in Excel and CSV alike; every other
 header is unchanged.
 
+### Favorites (v8.0.1)
+
+A **favorite** is one rule saved by name and shared by **every preset** (rules
+themselves stay per preset). In **Color Rules…**:
+
+- **Save:** right-click a rule → **Save as favorite…** (or ★ Favorites ▾ →
+  *Save selected rule as favorite…*). The name defaults to the rule's; reusing
+  a name asks before replacing it. A favorite is a **copy** — editing the rule
+  afterwards does not change it; save again under the same name to update it.
+- **Use:** ★ Favorites ▾ lists them. Picking one **adds a copy to the rule
+  list** above the selected rule, named after the favorite — it paints nothing
+  until **Apply** / **OK**, like any other edit. If an identical rule is
+  already in the list it is selected instead of duplicated.
+- **Greyed out** when the scan on screen cannot feed it, with the reason in
+  the entry: a column its conditions read is missing ("needs Beta (calc)"), a
+  series-run test whose filter did not run ("needs the YoY EPS growth run
+  filter"), a per-quarter rule with no Q-X columns, or a "Chosen columns" rule
+  none of whose columns exist. Before any scan every favorite is greyed ("run a
+  scan first"). The earnings-date match and "any display-only filter" tests
+  read the scan's own per-row data and are never greyed. Checked against the
+  **period on screen** — hidden columns count — each time the menu opens, so a
+  scan finishing while the editor is open is picked up.
+- **Manage favorites…** renames and deletes. Rules already added from a
+  favorite are copies and are not touched.
+
+Stored in `scanner_data/color_rule_favorites.json`, so exe rebuilds keep it.
+
 Implementation: `gui/coloring.py` (pure evaluation — no Qt objects — shared
-by the table and the exporter), `gui/color_rules_dialog.py` (editor),
+by the table and the exporter; `unmet_requirements` is the favorites'
+availability check), `gui/color_rules_dialog.py` (editor, favorites menu,
+`ManageFavoritesDialog`), `gui/color_favorites.py` (the favorites store),
 `ResultsTable.set_color_rules`, `MainWindow._apply_color_rules`.
 
 ---
@@ -2519,6 +2629,7 @@ grouping reflects the five-source architecture plus diagnostics:
     Force Universe Refresh
     Force OHLCV Refresh
     Deep OHLCV Refresh...
+    Dismiss OHLCV Health Warnings...     (v8.0.1)
     Download Missing Tickers Only
     Stop OHLCV Refresh
     Reset yfinance Session
@@ -2622,11 +2733,14 @@ Advanced…
 ```text
 Quick Export
 Schedule…
+Lookup…            (v8.0.1)
 ```
 
 - **Quick Export** — one-click timestamped XLSX snapshot to
   `scanner_data/exports/` (see [Quick Export + scan scheduler](#quick-export--scan-scheduler-f3)).
 - **Schedule…** — manage scheduled scans (same section).
+- **Lookup…** — run the current filters over a typed list of tickers (see
+  [Lookup mode](#lookup-mode-v801)).
 
 Each fill writes to its dedicated parquet (`earnings_history` for Finviz/Zacks/Finnhub; `earnings_dates` for Nasdaq/Yahoo) and triggers an auto-reconcile against affected tickers. Internal identifiers, slot method names (e.g. `_on_zacks_fill_done`, `_on_finnhub_fill_done`), and parquet `source` column values use bare source names (`"finviz"`, `"zacks"`, `"finnhub"`, `"nasdaq"`, `"yahoo"`).
 
@@ -3208,7 +3322,7 @@ data directory.
 
 ## Testing
 
-Test suite at `trade_scanner_fh/tests/` — **2,339 tests, all passing** as of 2026-09-26 (v8.0.0 added 236 across the eight fixes, hide / unhide, the colour-rule engine and its editor, and the round-2 fixes from user testing; v6.3.3 added 18, v6.3.2 added 40, v6.3.1 added 16, v6.3.0 added 93 across the disagreement merge, the failure taxonomy, the trim scoping, both new features and the unified series engine; v6.2.0 brought it to 1,759; v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
+Test suite at `trade_scanner_fh/tests/` — **2,443 tests, all passing** as of 2026-10-01 (v8.0.1 added 104 across the null re-send guard, the flagged-session re-check, the colour-rule favorites, Lookup mode with its earnings refresh, and the layout / monitor-move fixes; v8.0.0 added 236 across the eight fixes, hide / unhide, the colour-rule engine and its editor, and the round-2 fixes from user testing; v6.3.3 added 18, v6.3.2 added 40, v6.3.1 added 16, v6.3.0 added 93 across the disagreement merge, the failure taxonomy, the trim scoping, both new features and the unified series engine; v6.2.0 brought it to 1,759; v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
 
 ```bash
 cd c:/python/EDA_Project/Trade_Scanner_FH
@@ -3230,7 +3344,9 @@ rebuild, and backs `_qsettings()` with a throwaway INI file. Without it a
 real `MainWindow()` in a test could start the launch universe / OHLCV
 pipeline (network, writes into the package dev store) and a closed test
 window wrote its geometry into the user's registry. A suite run now writes
-nothing outside its temp directories.
+nothing outside its temp directories. v8.0.1 added the flagged-session list
+(`ohlcv_suspect_sessions.json`, written by every OHLCV run's `_finish`) and the
+favorites file to the same fixture: both point at a per-test temp file.
 
 **Canonical fixtures** live in
 [`tests/conftest.py`](trade_scanner_fh/tests/conftest.py) (centralized
@@ -3323,6 +3439,10 @@ client's rate limiter).
 | `test_v8_hide_unhide.py` | **v8.0.0.** Hide / unhide rows and columns through the real menus, Delete key and Ctrl+Z, every export path, Send to Watchlist, presets replacing every hide set, the ribbon indicator and timeframe labels, order preservation through a drag |
 | `test_v8_coloring.py` | **v8.0.0.** The colour-rule engine — including a verbatim copy of the 7.0.2 renderer as an oracle that the default rules must match cell for cell (hand-built edge cases + a 400-row random corpus) — plus every condition kind, operator, scope, target, per-channel precedence and the JSON round trip |
 | `test_v8_color_rules_ui.py` | **v8.0.0.** The Color Rules editor (lossless round trip of any rule, building rules through the widgets, list operations, palette editor, live status), and its wiring into the table, presets and multi-sheet Excel colouring, including unique export headers |
+| `test_v801_ohlcv_health.py` | **v8.0.1.** A null re-send never replaces real cached prices (normal and overwrite mode) while a null cached bar is still repaired and a null bar on a new date is still written; the flagged-session list — flag, per-ticker re-check, the alphabet-clustered partial-run trap, the burst-only share rule, resolution boundaries, file tolerance; the watch reaching `download_one` on the batch and the rate-limit probe; the launch reminder, status-label suffix and Dismiss |
+| `test_v801_layout.py` | **v8.0.1.** Monitor moves: FlowLayout wrapping / minimum / gaps / hidden items, filter rows fitting a narrow panel with every label kept beside its input, the panel's content-derived minimum (no sideways scrollbar), the window fitting a 1,080 px monitor measured with the dark theme, every full-width row being a wrapping layout, the top bar holding every control, fit-to-monitor (shrink + pull on-screen, maximized left alone), fitting only after the move settles on a new monitor and never with the mouse button held, and a guard against any `nativeEvent` override (it crashes PyQt 6.7.1 on show) |
+| `test_v801_lookup.py` | **v8.0.1.** Lookup mode: parsing and share-class matching, `lookup_params` (Top X% off; display-only builds zero funnel stages with every filter on; caller's params untouched), `run_scan(lookup=True)` outcomes (passed / failed at a stage / no data / quarantine / error, benchmarks kept, Top X% guard), the worker's per-period outcomes, the report, the dialog's STW form factor, the window using the scan's own periods and params, and completion leaving scan history and the session counter alone |
+| `test_v801_color_favorites.py` | **v8.0.1.** The favorites store (copy semantics, case-insensitive names, rename / delete, unreadable files), `unmet_requirements` for every condition kind and target, and the dialog: right-click save, overwrite confirmation, greyed entries with reasons, picking adds without painting, duplicates select, Manage dialog, end to end across presets |
 | `test_v8_series_display.py` | **v8.0.0 round 2.** Built from ATRO / ELOX / a late filing: the Backward Only tail limit (growth + accelerating), counted-quarter membership in fiscal order, growth Q-X blocks / Span / V, the phantom beats column, `in_run` + skip-N/A colouring, the rules v1 → v2 upgrade, the dialog round trip, preset settings falling back to defaults, and Beta at weekly / monthly (exact slopes, the fast period picker against pandas resample, the scan path) |
 | `test_finviz_snapshot.py` | **v7.0.0 - 7.0.2.** Snapshot parsing (duplicate `EPS next Y`, the seven two-value cells, short ETF grids, the `Change %` label), the not-found gate that decides permanent skip-listing, the store's merge-never-replace rule, the sweep's block/abort behaviour, the launch cadence prompt, per-field spinbox ranges, sweep log visibility, the attributes skip list's reason codes end to end, its editor, and the gap fill's target selection and clock handling |
 
@@ -3527,7 +3647,10 @@ directories, and the previous `_internal/`.
 | Module | Role |
 |---|---|
 | `gui/coloring.py` | Colour rule engine: model, JSON, `default_rules()`, vectorised evaluation, per-channel precedence |
-| `gui/color_rules_dialog.py` | The Color Rules editor (non-modal; Apply repaints live) |
+| `gui/color_rules_dialog.py` | The Color Rules editor (non-modal; Apply repaints live), the ★ Favorites menu and `ManageFavoritesDialog` |
+| `gui/color_favorites.py` | **v8.0.1.** Colour-rule favorites store — named single-rule copies shared by every preset, in `scanner_data/color_rule_favorites.json` |
+| `gui/flow_layout.py` | **v8.0.1.** `FlowLayout` (a row that wraps instead of forcing its parent's width; minimum = widest single item, height-for-width) and `WrappingBar` (the top control bar, search row and ribbon: wrapping, with groups so a label stays with its control) |
+| `gui/lookup.py` | **v8.0.1.** Lookup mode — ticker-list parsing, matching to cached symbols, the Lookup dialog, the per-ticker report (parameter changes live in `scanner.lookup_params`) |
 | `gui/hiding.py` | `HideManager` — hide / unhide rows and columns, undo stack, preset replace, indicators |
 
 ## v7 module map
@@ -3549,6 +3672,95 @@ therefore refreshes that ticker's attributes at no extra cost, independently
 of whether the sweep ever runs.
 
 ## Changelog
+
+### v8.0.1 — Lookup mode, follow a flagged session, refuse null re-sends, colour-rule favorites (2026-10-01)
+
+**A null re-send could overwrite good prices.** `_reject_conflicting_bars`
+measures a disagreement as a percentage of the cached Close; a null on either
+side makes that null, which reads as "no conflict", and the keep-last merge
+adopted the incoming bar. One direction is wanted — a null *cached* bar losing
+to a real re-send is how the next update's refetch overlap repairs a null
+session — but the other was a hole: a date already held with real prices, re-sent
+null, was nulled, for every date in the 5-day overlap, with overwrite off **and**
+on (proved on a scratch file: a cached Close of 100.0 came back NaN). Now
+`_keep_priced_cached_bars` refuses exactly that case in both modes and keeps the
+cached bar whole; a null bar on a new date is still written so the health check
+sees it. Refusals are counted in the update summary. Not covered: paths that
+rewrite a whole file on purpose (split / dividend re-anchor, Rebuild Tickers,
+the interior-gap rebuild) — their old prices are on a different adjustment basis.
+
+**Nothing confirmed a flagged session was ever repaired.** The null-bar
+warning judged only the newest session of each run, once, in one log line.
+Measured on the code path: the first update after the next close usually does
+repair it — its overlap re-requests the date and the null cached bar loses —
+but silently, and if the provider was still serving nulls nothing noticed. A
+flagged session is now written to `scanner_data/ohlcv_suspect_sessions.json`
+with the tickers whose bar was null; every later run (launch, Force, Missing,
+Deep) reports the state of **exactly those bars** and logs "re-checked — N now
+have prices, M still null", resolving the session once fewer than 1% of its
+tickers **and** at most 10% of the flagged bars are still null. Tracked per
+ticker because the 2026-09-24 nulls were clustered by sweep order: a run
+stopped after the clean first letters would otherwise have measured 0% and
+cleared a session that was still 21.5% null. Until resolved, a reminder is
+logged at every launch and the OHLCV status label carries `⚠ <date> suspect`
+(orange, details in the tooltip); `Data → Dismiss OHLCV Health Warnings…` clears
+it when the provider will never supply the prices. Nothing is repaired or
+scheduled automatically — repair stays with the ordinary overlap or a manual
+Deep OHLCV Refresh.
+
+**Colour-rule favorites.** Save any rule by name from the Color Rules editor
+(right-click) and add it back into any preset from the new ★ Favorites
+dropdown; picking adds it to the list and Apply paints it. Favorites the scan
+on screen cannot feed are greyed out with the reason. See
+[Favorites](#favorites-v801).
+
+Smoke-tested without network on scratch copies of the live store: the real
+`UpdateWorker` over 1,611 real tickers through a replayed clustered null
+session (flag → stopped A–D run learns nothing → partial re-check stays
+suspect → full re-check resolves with the store's 3 real straggler tickers
+left) plus null re-sends in normal and overwrite mode — 33/33; the real
+MainWindow + ScanWorker with the user's presets (save from `eps test`,
+greyed / picked / applied under `gap scan` and `EPS YoY`) — 29/29.
+
+**Lookup mode.** Scans → Lookup… runs the current filter panel, timeframes
+and Sequenced Run over a typed list of tickers, either with the filters as set
+or with every filter display-only, and writes a per-ticker report of where
+each one ended up. See [Lookup mode](#lookup-mode-v801). To make it, the
+timeframe / parameter building in `_run_scan` was extracted into
+`_scan_timeframes` and `_scan_params_list`, shared by both paths, so a lookup
+cannot drift from the periods a scan would run. Smoke-tested on a scratch copy
+of the live store with the user's presets (real MainWindow + ScanWorker):
+on `EPS YoY` a lookup of 12 scan passers + 12 non-passers + an uncached
+ticker showed exactly the scan's passers in every period with identical row
+values; display-only showed all 24 with failures flagged and painted red;
+`breakout 1d-6m` (Top X%) reported the percentile as not applied; a Sequenced
+Run lookup ran every chunk; a hidden passer was reported; scan history and the
+session counter were untouched — 44/44. Later the same day the dialog
+gained the two optional pre-lookup earnings refreshes (finviz, or finviz +
+zacks + finnhub), which reuse the existing fill workers and start the lookup
+when the last source finishes.
+
+**Moving between monitors.** Measured on the user's machine: the window could
+not be narrower than 2,116 logical px — the bottom button row alone was
+1,846, the search / view row 1,520 plus the filter panel's hard 580 — while
+the monitors are 2,560 (150 %), 1,536 (125 %), 1,440 and 1,080 (100 %, both
+portrait). Dragged onto any of the narrower three, Windows' resize was refused
+as below the minimum: the window jumped or hung across two screens. The filter
+panel's rows needed 1,963 px, so the panel always scrolled sideways. Now every
+toolbar row wraps (`gui/flow_layout.py`; the top bar is no longer a QToolBar,
+which hid Preset / Load / Save / Universe / IPO / Columns behind its overflow
+arrow on a narrow window), each filter row wraps its settings beside its name,
+the panel's minimum comes from its content, and the window minimum dropped to
+900 × 600 — the layout settles at ≈ 880 px with the dark theme. When a move
+settles on a different monitor, a window bigger than it is shrunk and pulled
+fully onto it, never mid-drag. A first attempt watched Windows'
+end-of-move message through a `nativeEvent` override; the live test on the
+real monitors showed that ANY Python `nativeEvent` calling the base class
+crashes PyQt 6.7.1 / Qt 6.7.3 with an access violation the moment the window
+is shown, so the move is detected with a settle timer plus a check of the
+physical mouse button instead (a test guards against the override returning).
+Verified live on all four monitors: a 2,400 × 1,300 window dropped onto each
+was fitted inside it, with no sideways scroll in the filter panel — 17/17.
 
 ### v8.0.0 — hide / unhide, colour rules, and eight fixes (2026-09-26)
 

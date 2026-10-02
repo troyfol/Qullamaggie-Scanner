@@ -826,6 +826,38 @@ OHLCV_NAN_MIN_SAMPLE = 100
 OHLCV_NAN_BURST_WINDOW = 400
 OHLCV_NAN_BURST_WARN_PCT = 25.0
 
+# -- Suspect-session watch (v8.0.1) ----------------------------------------
+# A session the warning above flags is written here, with the list of tickers
+# whose bar on it was null, and every later OHLCV run re-checks exactly those
+# tickers. Before this the warning judged only the NEWEST session of each run,
+# so nothing ever confirmed a flagged session was repaired (the next day's
+# refetch overlap usually does repair it, silently) or noticed when it was not.
+#
+# Tracked PER TICKER, not as a re-measured rate: the 2026-09-24 nulls were
+# clustered by processing order (A-O clean, Q-Z 64-80% null), so a run stopped
+# after the first few letters would have measured ~0% and "cleared" a session
+# that was still 21.5% null.
+OHLCV_SUSPECT_SESSIONS_FILE = "ohlcv_suspect_sessions.json"
+
+# A flagged session is RESOLVED once BOTH hold for the tickers still null on it:
+#   * fewer than this % of the tickers that had a bar on the session — a
+#     normal session carries 0.1-0.4% null (halts, dead OTC stubs: 13/14,506 on
+#     2026-09-25, 24 unrepairable stragglers after the 2026-08-28 repair); and
+#   * at most this % of the null count recorded when it was flagged. Without
+#     it a burst-only flag (the burst rule can fire on 100 nulls in a 400-ticker
+#     window, under 1% of a 12k session) would count as resolved at the first
+#     re-check with nothing repaired.
+# The warning fires at 5% and a session clears under 1%, so a borderline
+# session cannot flicker between the two.
+OHLCV_SUSPECT_RESOLVED_PCT = 1.0
+OHLCV_SUSPECT_RESOLVED_SHARE_PCT = 10.0
+
+# -- Colour-rule favorites (v8.0.1) ----------------------------------------
+# Single colour rules saved by name from the Color Rules dialog and shared by
+# every preset (rules themselves are saved per preset). Lives in DATA_DIR so
+# exe rebuilds keep it.
+COLOR_RULE_FAVORITES_FILE = "color_rule_favorites.json"
+
 # -- Deep refresh (2026-08-29) ---------------------------------------------
 # `Deep OHLCV Refresh` re-pulls the last N MARKET days for every cached ticker,
 # ignoring the per-ticker staleness check that made the incident above

@@ -257,7 +257,9 @@ class IndicatorRow(QWidget):
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
-        layout.addWidget(self.toggle)
+        # Head widgets top-aligned: a row whose settings wrap onto a second
+        # line keeps its checkboxes and name on the first (v8.0.1).
+        layout.addWidget(self.toggle, 0, Qt.AlignmentFlag.AlignTop)
         # Display Only sits immediately to the right of the Filter
         # toggle so the two are visually grouped at the head of the
         # row. The two-checkbox cluster lets the user see "is this row
@@ -274,7 +276,7 @@ class IndicatorRow(QWidget):
                 "on automatically turns Filter off."
             )
             self.display_only.setFixedWidth(20)
-            layout.addWidget(self.display_only)
+            layout.addWidget(self.display_only, 0, Qt.AlignmentFlag.AlignTop)
             # Mutex wiring. Both connections only fire on transitions
             # to checked, so the converse setChecked(False) doesn't
             # ping-pong (the False branch short-circuits the `on and
@@ -283,7 +285,25 @@ class IndicatorRow(QWidget):
             # new state.
             self.toggle.toggled.connect(self._on_filter_toggled)
             self.display_only.toggled.connect(self._on_display_only_toggled)
-        layout.addWidget(lbl)
+        layout.addWidget(lbl, 0, Qt.AlignmentFlag.AlignTop)
+
+        # v8.0.1: the settings flow and wrap beside the row's head instead
+        # of forcing one line. The series rows were up to 1,941 px wide, so
+        # the panel always carried a horizontal scrollbar and could never be
+        # narrower than its widest row. Each "Label: [input]" pair is ONE
+        # flow item, so a wrap never separates a label from its input.
+        from .flow_layout import FlowLayout
+        self._params_box = QWidget()
+        flow = FlowLayout(self._params_box, h_spacing=8, v_spacing=3)
+
+        def _pair(label_widget, input_widget):
+            box = QWidget()
+            h = QHBoxLayout(box)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            h.addWidget(label_widget)
+            h.addWidget(input_widget)
+            flow.addWidget(box)
 
         for p in params:
             if p["type"] == "checkbox":
@@ -291,7 +311,7 @@ class IndicatorRow(QWidget):
                 cb.setChecked(p.get("default", True))
                 cb.setStyleSheet("color: #ccc;")
                 self.spinboxes[p["name"]] = cb
-                layout.addWidget(cb)
+                flow.addWidget(cb)
                 continue
 
             if p["type"] == "combo":
@@ -299,7 +319,6 @@ class IndicatorRow(QWidget):
                 # value side is what set_value / value() round-trips.
                 plbl = QLabel(p["label"] + ":")
                 plbl.setStyleSheet("color: #888;")
-                layout.addWidget(plbl)
                 cb = QComboBox()
                 choices = p.get("choices", [])
                 for val, label in choices:
@@ -312,12 +331,11 @@ class IndicatorRow(QWidget):
                             break
                 cb.setFixedWidth(p.get("width", 160))
                 self.spinboxes[p["name"]] = cb
-                layout.addWidget(cb)
+                _pair(plbl, cb)
                 continue
 
             plbl = QLabel(p["label"] + ":")
             plbl.setStyleSheet("color: #888;")
-            layout.addWidget(plbl)
 
             if p["type"] == "int":
                 sb = QSpinBox()
@@ -341,9 +359,9 @@ class IndicatorRow(QWidget):
 
             sb.setFixedWidth(100)
             self.spinboxes[p["name"]] = sb
-            layout.addWidget(sb)
+            _pair(plbl, sb)
 
-        layout.addStretch()
+        layout.addWidget(self._params_box, 1)
 
     def is_enabled(self) -> bool:
         return self.toggle.isChecked()
@@ -632,6 +650,19 @@ class IndicatorPanel(QScrollArea):
     # connects this to disable / re-enable the Sequenced Run controls.
     beats_filter_toggled = pyqtSignal(bool)
 
+    def minimumSizeHint(self):
+        """As wide as the content's own minimum plus the vertical scrollbar
+        and frame, so the panel can never be squeezed into a sideways
+        scrollbar (v8.0.1). Read live: expanding a section re-evaluates it."""
+        hint = super().minimumSizeHint()
+        inner = self.widget()
+        if inner is None:
+            return hint
+        width = (inner.minimumSizeHint().width()
+                 + self.verticalScrollBar().sizeHint().width()
+                 + 2 * self.frameWidth())
+        return hint.expandedTo(type(hint)(width, hint.height()))
+
     def __init__(self, parent=None):
         super().__init__(parent)
         # Import here to avoid a circular import via scanner → indicators →
@@ -640,7 +671,11 @@ class IndicatorPanel(QScrollArea):
         self._ScanParams = ScanParams
 
         self.setWidgetResizable(True)
-        self.setMinimumWidth(580)
+        # Minimum width comes from the content (`minimumSizeHint`), not a
+        # fixed number (v8.0.1): rows now wrap their settings, so the panel
+        # needs only its widest row's head + widest single setting. The old
+        # hard 580 sat under a 1,963 px row stack — a permanent sideways
+        # scrollbar — and still added 580 to the window's minimum width.
         # No maximum-width cap — the user drags the top splitter to
         # resize the filter pane to whatever width is comfortable on
         # their monitor. The earlier 720px ceiling truncated long

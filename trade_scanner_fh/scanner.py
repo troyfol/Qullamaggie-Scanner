@@ -829,12 +829,81 @@ class ScanResult:
     # the chosen comparison period. Rendered under the funnel in the log
     # panel, once per period.
     notes: list[str] = field(default_factory=list)
+    # Lookup mode (v8.0.1) only: what happened to each requested ticker —
+    # OUTCOME_PASSED, "failed: <stage>", OUTCOME_NO_DATA, ... — so the
+    # per-ticker report can say why a ticker is missing instead of leaving a
+    # silent gap. Empty for ordinary scans.
+    outcomes: dict = field(default_factory=dict)
 
     def funnel_summary(self) -> str:
         parts = []
         for stage in self.funnel:
             parts.append(f"{stage.name}: {stage.passed}")
         return " -> ".join(parts)
+
+
+# ============================================================================
+# Lookup mode (v8.0.1)
+# ============================================================================
+#
+# A lookup is an ordinary scan over a typed list of tickers instead of the
+# cached universe: same stores, same panel, same timeframes. Two things differ
+# and both are decided here, in one place, so the GUI cannot drift from them:
+#   * the parameters (`lookup_params`) — Top X% never applies, and the
+#     display-only mode turns every switched-on filter into display-only;
+#   * `run_scan(lookup=True)` records an outcome per requested ticker and
+#     keeps benchmark tickers the user asked for.
+
+OUTCOME_PASSED = "passed"
+OUTCOME_NO_DATA = "no data in the window"
+OUTCOME_QUARANTINED = "split-seam quarantine"
+OUTCOME_STOPPED = "not evaluated (stopped)"
+FAILED_PREFIX = "failed: "
+ERROR_PREFIX = "error: "
+
+
+def lookup_params(params: ScanParams, *, display_only: bool):
+    """A copy of `params` adjusted for a lookup, plus notes for the report.
+
+    * Top X Percentile is switched off in both modes (user decision
+      2026-10-01): it ranks a ticker's gain against the whole scan's
+      distribution, and a lookup does not compute the whole scan — over three
+      tickers it would only rank them against each other.
+    * `display_only=True` makes every switched-on filter display-only, so
+      nothing is filtered out and failing values are coloured instead. Every
+      stage in `_build_filter_stages` is gated on `enabled and not
+      display_only`, Period Avg / Max included (they only run while their
+      parent filter gates), so flipping the pairs is complete. Min Price has
+      no display-only form and is switched off instead; Close is always shown.
+      Finviz rows carry their own enabled / display_only flags.
+    """
+    import dataclasses
+    p = dataclasses.replace(params)
+    p.finviz_filters = {k: dict(v) for k, v in (params.finviz_filters or {}).items()
+                        if isinstance(v, dict)}
+    notes: list = []
+    if p.top_pct_enabled:
+        p.top_pct_enabled = False
+        notes.append(
+            f"Top {p.top_pct_cutoff:g}% Gain not applied — it ranks a ticker "
+            f"against the whole scan, which a lookup does not run.")
+    if not display_only:
+        return p, notes
+    if p.min_price_enabled:
+        p.min_price_enabled = False
+        notes.append(
+            f"Min Price (${p.min_price_floor:g}) not applied — it has no "
+            f"display-only form; Close is always shown.")
+    for f in dataclasses.fields(p):
+        if not f.name.endswith("_display_only"):
+            continue
+        base = f.name[:-len("_display_only")]
+        if getattr(p, f"{base}_enabled", False):
+            setattr(p, f.name, True)
+    for spec in p.finviz_filters.values():
+        if spec.get("enabled"):
+            spec["display_only"] = True
+    return p, notes
 
 
 # ============================================================================
@@ -2919,12 +2988,18 @@ def run_scan(
     progress_cb: Optional[Callable[[int, int, str], None]] = None,
     cancel_token: Optional[Callable[[], bool]] = None,
     context: Optional[ScanContext] = None,
+    lookup: bool = False,
 ) -> ScanResult:
     """
     Run the full scan pipeline:
       1. Compute all indicator values for every symbol
       2. Apply funnel filters stage by stage
       3. Return ScanResult with results table, funnel log, errors
+
+    ``lookup`` (v8.0.1): `symbols` is a list the user typed. Every symbol gets
+    an entry in ``result.outcomes`` saying where it ended up, benchmark
+    tickers the user asked for are kept rather than excluded, and Top X% is
+    never applied (see `lookup_params`).
 
     progress_cb(done, total, symbol) is called after each ticker computation.
     cancel_token() is polled in the per-ticker compute loop; returning True
@@ -2993,6 +3068,10 @@ def run_scan(
             # Undated entry: no date to compare, so it stays unconditional.
             return when is None or cutoff is None or when >= cutoff
 
+        if lookup:
+            for s in symbols:
+                if _quarantined(s):
+                    result.outcomes[s] = OUTCOME_QUARANTINED
         symbols = [s for s in symbols if not _quarantined(s)]
         dropped = before - len(symbols)
         if dropped:
@@ -3068,15 +3147,35 @@ def run_scan(
                 if progress_cb and (i % 200 == 0 or i == total):
                     progress_cb(i, total, symbols[i - 1])
 
+    if lookup:
+        # A ticker with no row either raised (recorded in `errors`), was cut
+        # off by Stop, or had nothing to compute in this window (no bars, too
+        # few bars, a dead stub) — `_compute_ticker` returns None for those.
+        got = {r.get("symbol") for r in rows}
+        errs = {e.get("symbol"): e.get("error", "") for e in result.errors
+                if isinstance(e, dict)}
+        stopped = cancelled_at is not None or bool(cancel_token and cancel_token())
+        for s in symbols:
+            if s in got:
+                continue
+            if s in errs:
+                result.outcomes[s] = f"{ERROR_PREFIX}{errs[s]}"
+            elif stopped:
+                result.outcomes[s] = OUTCOME_STOPPED
+            else:
+                result.outcomes[s] = OUTCOME_NO_DATA
+
     if not rows:
         log.warning("No tickers produced computable results.")
         result.elapsed_sec = time.time() - t0
         return result
 
     computed = pd.DataFrame(rows)
-    # Exclude reference/benchmark tickers from results
-    ref_set = set(config.REFERENCE_TICKERS)
-    computed = computed[~computed["symbol"].isin(ref_set)].reset_index(drop=True)
+    # Exclude reference/benchmark tickers from results — unless this is a
+    # lookup, where every symbol is one the user typed on purpose.
+    if not lookup:
+        ref_set = set(config.REFERENCE_TICKERS)
+        computed = computed[~computed["symbol"].isin(ref_set)].reset_index(drop=True)
     total_computed = len(computed)
     log.info("Computed indicators for %d tickers (%d errors, %d no data)",
              total_computed, len(result.errors),
@@ -3148,7 +3247,11 @@ def run_scan(
             # Audit 2026-08-12 (EFF-10): no `.copy()` — boolean-mask indexing
             # already returns a new frame, so the extra copy duplicated the
             # whole result set once per stage (~15 stages on a full scan).
-            current = current[mask]
+            kept = current[mask]
+            if lookup:
+                for s in set(current["symbol"]) - set(kept["symbol"]):
+                    result.outcomes[s] = f"{FAILED_PREFIX}{stage_name}"
+            current = kept
         except Exception as exc:
             log.warning("Filter '%s' raised error: %s — skipping", stage_name, exc)
             continue
@@ -3156,7 +3259,11 @@ def run_scan(
         log.info("  %s: %d -> %d", stage_name, before, len(current))
 
     # ── #5 Top percentile (universe-wide, applied after other filters) ──
-    if params.top_pct_enabled and "pct_gain" in current.columns and len(current) > 0:
+    # Never in a lookup: `computed` is then the typed list, not the universe,
+    # so the cutoff would rank the tickers against each other. `lookup_params`
+    # switches it off and says so; this guard keeps any other caller honest.
+    if (params.top_pct_enabled and not lookup
+            and "pct_gain" in current.columns and len(current) > 0):
         before = len(current)
         cleaned = computed["pct_gain"].dropna().values  # FULL universe distribution
         if cleaned.size == 0:
@@ -3198,6 +3305,9 @@ def run_scan(
             )
 
     # ── Final ──
+    if lookup:
+        for s in current["symbol"]:
+            result.outcomes[s] = OUTCOME_PASSED
     result.funnel.append(FunnelStage("Final", len(current), len(current)))
     result.results_df = current.reset_index(drop=True)
     result.elapsed_sec = time.time() - t0

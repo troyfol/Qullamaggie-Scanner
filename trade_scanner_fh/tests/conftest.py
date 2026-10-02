@@ -50,7 +50,23 @@ def _isolate_main_window(monkeypatch, tmp_path_factory):
 
     Tests that exercise `_startup` itself would opt out by re-patching;
     none do today.
+
+    * v8.0.1: every OHLCV run's `_finish` reads and writes the flagged-
+      session list (`ohlcv_suspect_sessions.json`) and the Color Rules
+      dialog reads and writes the favorites file. Both resolve under the
+      import-time DATA_DIR, i.e. the dev store, so both are pointed at a
+      per-test temp file here. Tests of those files re-patch as needed.
     """
+    from trade_scanner_fh import data_engine as _de
+    state_dir = tmp_path_factory.mktemp("v801_state")
+    monkeypatch.setattr(_de, "_suspect_sessions_path",
+                        lambda: state_dir / "ohlcv_suspect_sessions.json")
+    try:
+        from trade_scanner_fh.gui import color_favorites as _cf
+        monkeypatch.setattr(_cf, "_favorites_path",
+                            lambda: state_dir / "color_rule_favorites.json")
+    except ImportError:
+        pass
     try:
         from trade_scanner_fh.gui import main_window as _mw
         from trade_scanner_fh.gui import earnings_coordinator as _ec

@@ -121,8 +121,10 @@ def test_download_many_calls_download_one_for_each_symbol():
     returns one ScrapeResult per symbol."""
     forwarded = []
 
-    def fake_download(sym, *, force_start=None, overwrite=False):
+    def fake_download(sym, *, force_start=None, overwrite=False,
+                      watch_dates=()):
         forwarded.append((force_start, overwrite))
+        assert watch_dates == (), "nothing is watched unless a caller asks"
         return ScrapeResult(symbol=sym, status="ok", rows_received=1)
 
     with patch("trade_scanner_fh.data_engine.download_one", side_effect=fake_download):

@@ -33,17 +33,20 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
     QProgressBar, QPushButton, QSpinBox, QSplitter, QStatusBar,
-    QTextEdit, QToolBar, QToolButton, QVBoxLayout, QWidget,
+    QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .. import __version__, config, finnhub_client, scan_history
 from .. import hotkey as hotkey_mod
 from ..data_engine import (
-    cached_symbols, check_schema_version, load_ohlcv, rebuild_ticker,
-    reference_sessions, trading_days_back,
+    cached_symbols, check_schema_version, describe_suspect_session,
+    load_ohlcv, load_suspect_sessions, rebuild_ticker, reference_sessions,
+    save_suspect_sessions, trading_days_back,
 )
 from ..hotkey import HotkeyConfig
-from ..scanner import ScanResult, chunk_periods
+from ..scanner import (
+    OUTCOME_PASSED, ScanResult, chunk_periods, lookup_params,
+)
 from ..ticker_universe import load_universe
 from ..tradestation import BridgeConfig
 from .blacklists import BlacklistManager, normalize_ticker
@@ -55,6 +58,11 @@ from .dialogs import (
 from .earnings_coordinator import EarningsRefreshCoordinator
 from .exports import ExportsController
 from .hiding import HideManager
+from .flow_layout import FlowLayout, WrappingBar
+from .lookup import (
+    REFRESH_FINVIZ, REFRESH_SOURCES, LookupDialog, report_lines,
+    resolve_tickers,
+)
 from .hotkey_dialog import HotkeySettingsDialog
 from .theme import build_stylesheet
 from .widgets import (
@@ -68,6 +76,23 @@ from .workers import (
 )
 
 log = logging.getLogger("scanner.gui")
+
+def _primary_mouse_button_down() -> bool:
+    """Is the PHYSICAL primary mouse button held right now? (v8.0.1)
+
+    Lets the window tell a paused drag from a finished move without a
+    native-event hook. Honours a swapped (left-handed) button setup.
+    False on any platform or failure, which reads as "the move has ended"."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        vk = 0x02 if user32.GetSystemMetrics(23) else 0x01  # SM_SWAPBUTTON
+        return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+    except Exception:
+        return False
+
 
 PRESETS_DIR = config.DATA_DIR / "presets"
 # Note: directory is created lazily in main() via config.ensure_dirs() +
@@ -112,7 +137,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Trading Scanner v{__version__}")
-        self.setMinimumSize(1280, 800)
+        # v8.0.1: was 1280 x 800, which alone could not fit the user's
+        # 1,080-wide portrait monitor. The layout raises the real minimum to
+        # what its widest wrapping item needs (~940 px measured).
+        self.setMinimumSize(900, 600)
         self.resize(1500, 900)
 
         self._worker: Optional[ScanWorker] = None
@@ -272,9 +300,9 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         # --- Toolbar ---
-        toolbar = QToolBar("Main")
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
+        toolbar = WrappingBar()
+        # Placed at the top of the central layout once it exists, below.
+        self._top_bar = toolbar
 
         # Global earnings filter mode toggles — placed at the LEFT
         # edge of the toolbar so they sit ahead of every other control.
@@ -313,6 +341,7 @@ class MainWindow(QMainWindow):
         # Date pickers with custom range checkbox
         self.chk_custom_range = QCheckBox()
         self.chk_custom_range.setToolTip("Include custom date range in multi-timeframe scan")
+        toolbar.group()
         toolbar.addWidget(self.chk_custom_range)
         toolbar.addWidget(QLabel("Start: "))
         self.date_start = QDateEdit()
@@ -321,6 +350,7 @@ class MainWindow(QMainWindow):
         self.date_start.setDisplayFormat("yyyy-MM-dd")
         toolbar.addWidget(self.date_start)
 
+        toolbar.group()
         toolbar.addWidget(QLabel("  End: "))
         self.date_end = QDateEdit()
         self.date_end.setCalendarPopup(True)
@@ -337,6 +367,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.date_end)
 
         # Quick date range buttons with multi-timeframe checkboxes
+        toolbar.group()
         toolbar.addWidget(QLabel("  "))
         self.tf_checks: dict[int, QCheckBox] = {}
         _qdr_style = (
@@ -358,6 +389,7 @@ class MainWindow(QMainWindow):
         # Sequenced Run — exclusive batch mode. When ticked, all other
         # timeframe checkboxes are unchecked + disabled and a config
         # dialog opens to configure the date range and chunk size.
+        toolbar.end_group()
         toolbar.addWidget(QLabel("  "))
         self.chk_sequenced_run = QCheckBox("Sequenced Run")
         self.chk_sequenced_run.setToolTip(
@@ -371,6 +403,7 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         # Preset controls
+        toolbar.group()
         toolbar.addWidget(QLabel("  Preset: "))
         self.preset_combo = QComboBox()
         self.preset_combo.setMinimumWidth(160)
@@ -392,6 +425,7 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         # Universe filters
+        toolbar.group()
         toolbar.addWidget(QLabel("  Universe: "))
 
         self.chk_include_etf = QCheckBox("Include ETFs")
@@ -407,6 +441,7 @@ class MainWindow(QMainWindow):
         self.chk_ipo_mode = QCheckBox("IPO Mode")
         self.chk_ipo_mode.setChecked(False)
         self.chk_ipo_mode.stateChanged.connect(self._on_ipo_toggle)
+        toolbar.group()
         toolbar.addWidget(self.chk_ipo_mode)
 
         toolbar.addWidget(QLabel(" Max Days: "))
@@ -466,6 +501,18 @@ class MainWindow(QMainWindow):
         )
         act_deep_refresh.triggered.connect(self._deep_ohlcv_refresh_dialog)
         data_menu.addAction(act_deep_refresh)
+
+        # v8.0.1: clears the flagged-session reminders for data the provider
+        # will never supply (the only way off the list besides a repair).
+        act_dismiss_health = QAction("Dismiss OHLCV Health Warnings...", self)
+        act_dismiss_health.setToolTip(
+            "Stop reminding about sessions a null-bar warning flagged. Use "
+            "when the provider never supplies the missing prices; the bars "
+            "themselves are not changed."
+        )
+        act_dismiss_health.triggered.connect(
+            self._dismiss_ohlcv_health_warnings)
+        data_menu.addAction(act_dismiss_health)
 
         act_missing_only = QAction("Download Missing Tickers Only", self)
         act_missing_only.setToolTip(
@@ -1195,11 +1242,25 @@ class MainWindow(QMainWindow):
         self.act_schedule_scans.triggered.connect(self._open_schedule_dialog)
         scans_menu.addAction(self.act_schedule_scans)
 
+        # v8.0.1: the current filters over a typed list of tickers.
+        self.act_lookup = QAction("Lookup…", self)
+        self.act_lookup.setToolTip(
+            "Run the current filter panel, timeframes and Sequenced Run over "
+            "tickers you type — either with the filters exactly as set (only "
+            "passers shown) or with every filter display-only (all shown). "
+            "Results land in the table like a scan; a per-ticker report goes "
+            "to the log."
+        )
+        self.act_lookup.triggered.connect(
+            lambda _checked=False: self._open_lookup_dialog())
+        scans_menu.addAction(self.act_lookup)
+
         # --- Central layout ---
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(6, 6, 6, 6)
+        main_layout.addWidget(self._top_bar)
 
         # Top splitter: indicators | (results + log)
         top_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1226,12 +1287,17 @@ class MainWindow(QMainWindow):
         results_vbox.setContentsMargins(0, 0, 0, 0)
         results_vbox.setSpacing(2)
 
-        search_row = QHBoxLayout()
+        # Rows here and below wrap (FlowLayout, v8.0.1): as single-line
+        # QHBoxLayouts they made the window at least 2,116 px wide, wider
+        # than three of the user's four monitors.
+        search_row = WrappingBar(toolbar_look=False)
+        search_row.group()
         search_row.addWidget(QLabel("Search:"))
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Type to filter results by ticker...")
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setMaximumWidth(300)
+        self.search_input.setMinimumWidth(200)
         self.search_input.textChanged.connect(self._on_search_changed)
         search_row.addWidget(self.search_input)
 
@@ -1239,12 +1305,14 @@ class MainWindow(QMainWindow):
         # scan produced multiple period DataFrames. Switching it re-paints
         # the results table and re-targets Send-to-Watchlist + Export +
         # Excel to the selected period.
+        search_row.group()
         search_row.addWidget(QLabel("    Timeframe:"))
         self.combo_timeframe = QComboBox()
         self.combo_timeframe.setMinimumWidth(220)
         self.combo_timeframe.setEnabled(False)
         self.combo_timeframe.currentIndexChanged.connect(self._on_timeframe_changed)
         search_row.addWidget(self.combo_timeframe)
+        search_row.end_group()
 
         # View-only filters that hide rows in the displayed table
         # without affecting the underlying scan results. Applied
@@ -1316,7 +1384,7 @@ class MainWindow(QMainWindow):
         search_row.addWidget(self.chk_view_interleave_quarters)
 
         search_row.addStretch()
-        results_vbox.addLayout(search_row)
+        results_vbox.addWidget(search_row)
 
         # ── Second row: hide whole earnings column TYPES ──────────────
         # Separate from the header right-click "Delete column" (which is
@@ -1328,7 +1396,8 @@ class MainWindow(QMainWindow):
         # dropping data — see the comment at the foot of
         # `_build_dynamic_columns`. The frame keeps every value, so the
         # Excel dialog can still offer hidden columns for re-selection.
-        type_row = QHBoxLayout()
+        type_row = WrappingBar(toolbar_look=False)
+        type_row.group()
         self.btn_hide_col_types = QToolButton()
         self.btn_hide_col_types.setText("Hide Q Columns ▾")
         self.btn_hide_col_types.setPopupMode(
@@ -1368,6 +1437,7 @@ class MainWindow(QMainWindow):
         # heading produced. Shares the table's hidden-type mechanism, so it is
         # applied when the layout is built and never touches the data.
         type_row.addSpacing(16)
+        type_row.group()
         self.btn_hide_fv_types = QToolButton()
         self.btn_hide_fv_types.setText("Hide FV Columns ▾")
         self.btn_hide_fv_types.setPopupMode(
@@ -1438,7 +1508,7 @@ class MainWindow(QMainWindow):
         type_row.addWidget(self.btn_hidden_items)
 
         type_row.addStretch()
-        results_vbox.addLayout(type_row)
+        results_vbox.addWidget(type_row)
 
         self.results_table = ResultsTable()
         # Persist user-defined column order across timeframe switches
@@ -1548,7 +1618,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.summary_label)
 
         # --- Bottom button bar ---
-        btn_bar = QHBoxLayout()
+        btn_bar = FlowLayout()
 
         self.btn_scan = QPushButton("  Run Scan  ")
         self.btn_scan.setStyleSheet(
@@ -1612,7 +1682,9 @@ class MainWindow(QMainWindow):
         self.btn_hotkey.clicked.connect(self._toggle_hotkey)
         btn_bar.addWidget(self.btn_hotkey)
 
-        btn_bar.addStretch()
+        # A flow cannot pin the send group to the right edge; a gap keeps
+        # the two groups visibly apart, and a wrap happens between them.
+        btn_bar.addSpacing(24)
 
         self.btn_send = QPushButton("  Send to Watchlist  ")
         self.btn_send.setEnabled(False)
@@ -1650,7 +1722,7 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(btn_bar)
 
         # --- Session controls ---
-        session_bar = QHBoxLayout()
+        session_bar = FlowLayout()
         self.chk_omit_seen = QCheckBox("Omit previously scanned tickers")
         self.chk_omit_seen.setStyleSheet("color: #e0e0e0; font-size: 12px;")
         session_bar.addWidget(self.chk_omit_seen)
@@ -1980,6 +2052,10 @@ class MainWindow(QMainWindow):
             f"Universe: {len(universe)} total, {len(self._symbols)} with OHLCV data"
         )
 
+        # v8.0.1: sessions an earlier null-bar warning flagged and no run has
+        # confirmed repaired yet — repeated every launch until they are.
+        self._report_suspect_sessions()
+
         # Launch-time freshness gate: if a completed OHLCV update already
         # ran since the most recent market close, there's no new bar to
         # fetch — skip the update (and therefore the earnings refresh that
@@ -1991,6 +2067,7 @@ class MainWindow(QMainWindow):
             self._update_label.setStyleSheet(
                 "color: #4caf50; font-size: 11px; padding: 0 8px;"
             )
+            self._mark_update_label_suspects()
             self.status.showMessage(
                 f"Ready: {len(self._symbols)} tickers with OHLCV data "
                 f"(cache current — no update needed)"
@@ -2040,6 +2117,8 @@ class MainWindow(QMainWindow):
                 backoff_threshold=self._backoff_threshold,
                 backoff_wait=self._backoff_wait,
                 max_retries=self._max_retries,
+                run_label=("Force OHLCV Refresh" if force
+                           else "launch update"),
             ),
             progress=self._on_update_progress,
             error_tickers=self._on_ohlcv_error_tickers,
@@ -2107,6 +2186,8 @@ class MainWindow(QMainWindow):
         self._update_label.setStyleSheet(
             f"color: {color}; font-size: 11px; padding: 0 8px;"
         )
+        # The run has just re-checked (and possibly cleared) flagged sessions.
+        self._mark_update_label_suspects()
         self.status.showMessage(f"Ready: {len(self._symbols)} tickers with OHLCV data")
 
         # Record this as the last completed OHLCV update so the next launch
@@ -2724,11 +2805,112 @@ class MainWindow(QMainWindow):
                 max_retries=self._max_retries,
                 force_days_back=days,
                 overwrite=overwrite,
+                run_label="Deep OHLCV Refresh",
             ),
             progress=self._on_update_progress,
             error_tickers=self._on_ohlcv_error_tickers,
             finished=self._on_update_done,
         )
+
+    # ── Flagged-session reminders (v8.0.1) ─────────────────────────
+    # data_engine keeps the list; UpdateWorker adds to it and re-checks it at
+    # the end of every run. The window only reminds and offers to dismiss.
+
+    def _report_suspect_sessions(self) -> dict:
+        """Log a reminder line per still-flagged session. Returns the list."""
+        try:
+            sessions = load_suspect_sessions()
+        except Exception as exc:
+            log.debug("suspect-session list unavailable: %s", exc)
+            return {}
+        for key in sorted(sessions):
+            self.log_panel.write_line(
+                "OHLCV health reminder — "
+                + describe_suspect_session(key, sessions[key])
+                + ". The next update that re-requests it re-checks it; "
+                "Data > Deep OHLCV Refresh repairs it now; Data > Dismiss "
+                "OHLCV Health Warnings clears this reminder."
+            )
+        return sessions
+
+    def _mark_update_label_suspects(self) -> None:
+        """Append "· ⚠ 09-24 suspect" (orange) to the OHLCV status label
+        while any session is flagged; the tooltip carries the detail. Called
+        right after the label is written, so it decorates the current text."""
+        try:
+            sessions = load_suspect_sessions()
+        except Exception as exc:
+            log.debug("suspect-session list unavailable: %s", exc)
+            sessions = {}
+        label = self._update_label
+        decorated = self._SUSPECT_LABEL_SEP in label.text()
+        base = label.text().split(self._SUSPECT_LABEL_SEP)[0]
+        if not sessions:
+            if decorated:
+                label.setText(base)
+                if self._label_style_before_suspects is not None:
+                    label.setStyleSheet(self._label_style_before_suspects)
+            label.setToolTip("")
+            return
+        if not decorated:
+            self._label_style_before_suspects = label.styleSheet()
+        keys = sorted(sessions)
+        what = (f"{keys[0][5:]} suspect" if len(keys) == 1
+                else f"{len(keys)} sessions suspect")
+        label.setText(f"{base}{self._SUSPECT_LABEL_SEP}⚠ {what}")
+        label.setStyleSheet("color: #ff9800; font-size: 11px; padding: 0 8px;")
+        label.setToolTip(
+            "Sessions flagged by a null-bar warning and not yet confirmed "
+            "repaired:\n"
+            + "\n".join(describe_suspect_session(k, sessions[k]) for k in keys)
+            + "\n\nData > Deep OHLCV Refresh repairs them; Data > Dismiss "
+            "OHLCV Health Warnings clears the reminder."
+        )
+
+    _SUSPECT_LABEL_SEP = "  ·  "
+    # Class default so bypass-init test shells have it (Qt raises RuntimeError,
+    # not AttributeError, on half-built windows).
+    _label_style_before_suspects = None
+
+    def _confirm_dismiss_health(self, text: str) -> bool:
+        """Separate so tests can answer without a modal box."""
+        return QMessageBox.question(
+            self, "Dismiss OHLCV Health Warnings", text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes
+
+    def _dismiss_ohlcv_health_warnings(self):
+        """Menu action: stop watching every flagged session. Changes no bar."""
+        if self._update_worker and self._update_worker.isRunning():
+            QMessageBox.information(
+                self, "In Progress",
+                "An OHLCV update is running and will re-check the flagged "
+                "sessions when it finishes. Try again after it completes.")
+            return
+        sessions = load_suspect_sessions()
+        if not sessions:
+            QMessageBox.information(
+                self, "Nothing Flagged",
+                "No sessions are flagged — every null-bar warning so far has "
+                "been confirmed repaired.")
+            return
+        text = (
+            "These sessions were flagged by a null-bar warning and have not "
+            "been confirmed repaired:\n\n"
+            + "\n\n".join(describe_suspect_session(k, sessions[k])
+                          for k in sorted(sessions))
+            + "\n\nStop reminding about them? The cached bars are not "
+            "changed; a later warning starts a new reminder."
+        )
+        if not self._confirm_dismiss_health(text):
+            return
+        if save_suspect_sessions({}):
+            self.log_panel.write_line(
+                "OHLCV health: dismissed the reminder for "
+                + ", ".join(sorted(sessions))
+                + " (cached bars unchanged).")
+        self._mark_update_label_suspects()
 
     def _stop_ohlcv_refresh(self):
         """Menu action: stop the running OHLCV update."""
@@ -2947,6 +3129,7 @@ class MainWindow(QMainWindow):
                 backoff_threshold=self._backoff_threshold,
                 backoff_wait=self._backoff_wait,
                 max_retries=self._max_retries,
+                run_label="Download Missing Tickers",
             ),
             progress=self._on_update_progress,
             error_tickers=self._on_ohlcv_error_tickers,
@@ -7091,6 +7274,44 @@ class MainWindow(QMainWindow):
                     icon="info")
                 return
 
+        tfs = self._scan_timeframes()
+        if tfs is None:
+            return
+        labeled_tfs, sequenced = tfs
+        params_list = self._scan_params_list(labeled_tfs)
+
+        tf_desc = ", ".join(label for label, _s, _e in labeled_tfs)
+        prefix = "Sequenced Run: " if sequenced else ""
+        self.log_panel.write_line(
+            f"{prefix}Scanning {len(filtered)} tickers across "
+            f"{len(labeled_tfs)} timeframe(s): {tf_desc} "
+            f"(filtered from {len(self._symbols)} cached)"
+        )
+
+        self.btn_scan.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.btn_send.setEnabled(False)
+        self.btn_export.setEnabled(False)
+        self.btn_excel.setEnabled(False)
+        self.summary_label.setText("")
+        self.status.showMessage("Scanning...")
+
+        self._worker = self._start_worker(
+            ScanWorker(
+                filtered, params_list,
+                sequenced=sequenced,
+                omit_intra_run=self.chk_omit_intra_run.isChecked(),
+            ),
+            progress=self._on_scan_progress,
+            finished=self._on_scan_done,
+        )
+
+    def _scan_timeframes(self):
+        """``(labeled_tfs, sequenced)`` from the timeframe controls, or None
+        when they cannot produce a run (the user has been told why).
+
+        Shared by Scan and Lookup (v8.0.1) so a lookup always reads exactly
+        the periods — or the Sequenced Run chunks — a scan would."""
         # Build labeled timeframe list — Sequenced Run takes priority and
         # produces backward-walking chunks; otherwise normal multi-timeframe
         # checkbox behavior applies. Each entry is (label, start, end).
@@ -7107,7 +7328,7 @@ class MainWindow(QMainWindow):
                     "Sequenced Run",
                     "Sequenced Run produced no chunks. Check the date "
                     "range and chunk size, then try again.")
-                return
+                return None
             for s, e in chunks:
                 labeled_tfs.append((f"{s.isoformat()} → {e.isoformat()}", s, e))
         else:
@@ -7160,12 +7381,16 @@ class MainWindow(QMainWindow):
                 s = date(qd_start.year(), qd_start.month(), qd_start.day())
                 labeled_tfs.append((f"{s} → {end}", s, end))
 
+        return labeled_tfs, sequenced
+
+    def _scan_params_list(self, labeled_tfs) -> list:
+        """``[(label, ScanParams)]`` for each timeframe, from the panel."""
         # Pass the two global earnings toolbar toggles into every
         # period's ScanParams. Replaces the prior per-filter
         # include_no_data flags. Dates / data are independent.
         earnings_dates_only = self.chk_earnings_dates_only.isChecked()
         earnings_data_only = self.chk_earnings_data_only.isChecked()
-        params_list = [
+        return [
             (label, self.indicator_panel.build_scan_params(
                 s, e,
                 earnings_dates_only=earnings_dates_only,
@@ -7175,36 +7400,277 @@ class MainWindow(QMainWindow):
             for label, s, e in labeled_tfs
         ]
 
-        tf_desc = ", ".join(label for label, _s, _e in labeled_tfs)
-        prefix = "Sequenced Run: " if sequenced else ""
-        self.log_panel.write_line(
-            f"{prefix}Scanning {len(filtered)} tickers across "
-            f"{len(labeled_tfs)} timeframe(s): {tf_desc} "
-            f"(filtered from {len(self._symbols)} cached)"
-        )
+    # ── Lookup mode (v8.0.1) ─────────────────────────────────────────
+    # The scan engine over a typed list instead of the cached universe —
+    # same stores, panel, timeframes and Sequenced Run. Universe pre-filters
+    # (ETF / ADR / IPO / greylist / blacklist / omit-previously-scanned) do
+    # not apply: the list IS the universe. Results land in the table like a
+    # scan; scan history, the session counter and the scheduler never see a
+    # lookup. See gui/lookup.py and scanner.lookup_params.
 
+    # Class defaults: the last entry is remembered for the session only, and
+    # bypass-init test shells need the attributes.
+    _lookup_last_text = ""
+    _lookup_last_display_only = False
+    _lookup_last_refresh = None
+    _lookup_context = None
+    # While a pre-lookup earnings refresh runs: {"tickers", "display_only",
+    # "refresh", "pending": {src: worker}, "stopped": bool, "cancelled": bool}.
+    _lookup_refresh = None
+
+    def _open_lookup_dialog(self):
+        dlg = LookupDialog(self, text=self._lookup_last_text,
+                           display_only=self._lookup_last_display_only,
+                           refresh=self._lookup_last_refresh)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._lookup_last_text = dlg.text()
+        self._lookup_last_display_only = dlg.display_only()
+        self._lookup_last_refresh = dlg.refresh()
+        self._start_lookup(dlg.tickers(), display_only=dlg.display_only(),
+                           refresh=dlg.refresh())
+
+    def _start_lookup(self, tickers: list, *, display_only: bool,
+                      refresh=None) -> bool:
+        """Lookup entry point: run it now, or refresh earnings for the
+        looked-up tickers first and run it when every started source has
+        finished (v8.0.1). Returns True when something was started."""
+        if refresh is None:
+            return self._run_lookup(tickers, display_only=display_only)
+        if self._worker is not None or self._lookup_refresh is not None:
+            self._notify_scan_blocked(
+                "Scan Running",
+                "A scan or lookup is already running. Wait for it to finish "
+                "or stop it, then try again.")
+            return False
+        if self._earn_threads_active():
+            # User decision 2026-10-01: refuse rather than queue behind a
+            # fill that could be a multi-hour bulk run.
+            self._notify_scan_blocked(
+                "Earnings Refresh Running",
+                "An earnings fill is already running. Wait for it to finish "
+                "(or use Stop Earnings Refresh on the progress panel), then "
+                "start the lookup again.")
+            return False
+        symbols = [c for _t, c in resolve_tickers(tickers, cached_symbols())
+                   if c]
+        if not symbols:
+            # Nothing the lookup could evaluate — let it report and stop.
+            return self._run_lookup(tickers, display_only=display_only)
+
+        sources = REFRESH_SOURCES[refresh]
+        attrs = {"finviz": "_finviz_worker", "zacks": "_zacks_worker",
+                 "finnhub": "_finnhub_worker"}
+        before = {s: getattr(self, attrs[s], None) for s in sources}
+        self.log_panel.write_line(
+            f"Lookup: refreshing earnings from {' + '.join(sources)} for "
+            f"{len(symbols)} ticker(s) before the lookup runs…")
+        if refresh == REFRESH_FINVIZ:
+            self._start_finviz_worker(
+                symbols, self._combined_finviz_skip_set(),
+                mode="targeted", label="Lookup refresh (finviz)")
+        else:
+            self._launch_smart_refresh_workers(
+                symbols, due=False, include_finnhub=True)
+        pending = {}
+        for s in sources:
+            worker = getattr(self, attrs[s], None)
+            if worker is not None and worker is not before[s]:
+                pending[s] = worker
+        if not pending:
+            self.log_panel.write_line(
+                "Lookup: no earnings source started — running the lookup "
+                "on the data as it stands.")
+            return self._run_lookup(tickers, display_only=display_only)
+
+        self._lookup_refresh = {
+            "tickers": list(tickers), "display_only": display_only,
+            "refresh": refresh, "pending": dict(pending),
+            "stopped": False, "cancelled": False, "n": len(symbols),
+        }
+        for s, worker in pending.items():
+            # Connected AFTER the source's own done-handler, so the skip
+            # lists and log lines it writes land before the lookup starts.
+            worker.finished.connect(
+                lambda *_a, _s=s, _w=worker: self._on_lookup_refresh_done(_s, _w))
+        self.btn_scan.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.summary_label.setText(
+            f"  Lookup: refreshing earnings ({' + '.join(sources)}) for "
+            f"{len(symbols)} ticker(s)…  ")
+        self.status.showMessage("Refreshing earnings for lookup...")
+        return True
+
+    def _on_lookup_refresh_done(self, source: str, worker) -> None:
+        ctx = self._lookup_refresh
+        if ctx is None or ctx["pending"].get(source) is not worker:
+            return
+        stop = getattr(worker, "_stop", None)
+        if isinstance(stop, list) and stop and stop[0]:
+            ctx["stopped"] = True
+        del ctx["pending"][source]
+        if ctx["pending"]:
+            return
+        self._lookup_refresh = None
+        if ctx["cancelled"]:
+            self.btn_scan.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+            self.summary_label.setText("  Lookup cancelled  ")
+            self.status.showMessage("Lookup cancelled")
+            self.log_panel.write_line(
+                "Lookup cancelled — the earnings refresh was stopped and no "
+                "lookup was run.")
+            return
+        sources = " + ".join(REFRESH_SOURCES[ctx["refresh"]])
+        note = (f"Earnings were refreshed from {sources} for {ctx['n']} "
+                f"ticker(s) before this lookup.")
+        if ctx["stopped"]:
+            note = (f"The earnings refresh ({sources}) was stopped part-way — "
+                    f"this lookup ran on the earnings data as it stood.")
+        self.btn_scan.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        if not self._run_lookup(ctx["tickers"],
+                                display_only=ctx["display_only"],
+                                extra_notes=[note]):
+            self.summary_label.setText("")
+
+    def _run_lookup(self, tickers: list, *, display_only: bool,
+                    extra_notes=()) -> bool:
+        """Start a lookup. Returns True when a run was started."""
+        if self._worker is not None:
+            self._notify_scan_blocked(
+                "Scan Running",
+                "A scan or lookup is already running. Wait for it to finish "
+                "or stop it, then try again.")
+            return False
+        if not tickers:
+            self._notify_scan_blocked("Lookup", "Enter at least one ticker.")
+            return False
+        requested = resolve_tickers(tickers, cached_symbols())
+        symbols = [c for _t, c in requested if c]
+        if not symbols:
+            for line in report_lines(
+                    display_only=display_only, requested=requested,
+                    period_order=[], period_outcomes={}, view_split={}):
+                self.log_panel.write_line(line)
+            self._notify_scan_blocked(
+                "Lookup",
+                "None of these tickers have cached OHLCV data:\n"
+                + ", ".join(t for t, _c in requested))
+            return False
+
+        tfs = self._scan_timeframes()
+        if tfs is None:
+            return False
+        labeled_tfs, sequenced = tfs
+        params_list, notes = [], list(extra_notes)
+        for label, params in self._scan_params_list(labeled_tfs):
+            adjusted, why = lookup_params(params, display_only=display_only)
+            params_list.append((label, adjusted))
+            notes.extend(n for n in why if n not in notes)
+        # Display-only shows every ticker in every period, so Omit intra-run
+        # would hand all of them to the first period and leave the rest empty.
+        omit_intra = bool(self.chk_omit_intra_run.isChecked()) and not display_only
+
+        self._lookup_context = {
+            "requested": requested, "display_only": display_only,
+            "notes": notes, "intra_run_omit": omit_intra,
+        }
+        mode = "all filters display-only" if display_only else "filters as set"
+        tf_desc = ", ".join(label for label, _s, _e in labeled_tfs)
+        self.log_panel.write_line(
+            f"{'Sequenced Run: ' if sequenced else ''}Lookup ({mode}): "
+            f"{len(symbols)} ticker(s) across {len(labeled_tfs)} "
+            f"timeframe(s): {tf_desc}"
+        )
         self.btn_scan.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.btn_send.setEnabled(False)
         self.btn_export.setEnabled(False)
         self.btn_excel.setEnabled(False)
         self.summary_label.setText("")
-        self.status.showMessage("Scanning...")
-
+        self.status.showMessage("Looking up...")
         self._worker = self._start_worker(
-            ScanWorker(
-                filtered, params_list,
-                sequenced=sequenced,
-                omit_intra_run=self.chk_omit_intra_run.isChecked(),
-            ),
+            ScanWorker(symbols, params_list, sequenced=sequenced,
+                       omit_intra_run=omit_intra, lookup=True),
             progress=self._on_scan_progress,
             finished=self._on_scan_done,
         )
+        return True
+
+    def _lookup_view_split(self) -> dict:
+        """Per period: (shown, hidden_by_you, hidden_by_view) among the
+        tickers that PASSED — the hides and view toggles apply to lookups as
+        to any scan (user decision 2026-10-01), so the report names what they
+        took out of the table."""
+        out = {}
+        for label in self._period_order:
+            df = self._period_results.get(label)
+            if df is None or df.empty or "symbol" not in df.columns:
+                out[label] = (set(), set(), set())
+                continue
+            passed = set(df["symbol"].astype(str))
+            views_only = self._apply_view_filters(df, include_hidden=False)
+            full = self._apply_view_filters(df)
+            after_views = set(views_only["symbol"].astype(str))
+            shown = set(full["symbol"].astype(str))
+            out[label] = (shown, after_views - shown, passed - after_views)
+        return out
+
+    def _finish_lookup(self, result) -> None:
+        """Lookup half of scan completion: summary label + per-ticker report."""
+        ctx = self._lookup_context or {}
+        self._lookup_context = None
+        split = self._lookup_view_split()
+        try:
+            for line in report_lines(
+                    display_only=bool(ctx.get("display_only")),
+                    requested=ctx.get("requested", []),
+                    period_order=self._period_order,
+                    period_outcomes=getattr(result, "period_outcomes", {}),
+                    view_split=split, notes=ctx.get("notes", ()),
+                    intra_run_omit=bool(ctx.get("intra_run_omit"))):
+                self.log_panel.write_line(line)
+        except Exception as exc:     # the report must never cost the results
+            log.warning("lookup report failed: %s", exc, exc_info=True)
+        wanted = [c for _t, c in ctx.get("requested", []) if c]
+        missing = sum(1 for _t, c in ctx.get("requested", []) if not c)
+        shown = split.get(self._active_period, (set(), set(), set()))[0]
+        mode = "display-only" if ctx.get("display_only") else "as set"
+        text = (f"Lookup ({mode}): {len(shown)} of {len(wanted)} shown"
+                + (f" in {self._active_period}" if len(self._period_order) > 1
+                   else "")
+                + (f" | {missing} not cached" if missing else ""))
+        n_err = len(getattr(result, "errors", []) or [])
+        if n_err:
+            text += f" | {n_err} error(s) — see log"
+        self.summary_label.setText(f"  {text}  ")
+        self.summary_label.setStyleSheet(
+            "font-size: 13px; padding: 6px; background: "
+            f"{'#ff9800' if n_err else '#1565c0'}; color: white; "
+            "border-radius: 4px; font-weight: bold;"
+        )
+        self.status.showMessage(
+            f"Lookup complete in {getattr(result, 'elapsed_sec', 0):.1f}s")
 
     def _stop_scan(self):
         if self._worker:
             self._worker.request_stop()
             self.log_panel.write_line("Stop requested...")
+        ctx = self._lookup_refresh
+        if ctx is not None and not ctx["cancelled"]:
+            # Stop during a pre-lookup refresh cancels the whole lookup; the
+            # earnings panel's own Stop only stops the refresh (the lookup
+            # then runs on the data as it stood).
+            ctx["cancelled"] = True
+            for worker in list(ctx["pending"].values()):
+                try:
+                    worker.request_stop()
+                except Exception as exc:
+                    log.debug("lookup refresh stop failed: %s", exc)
+            self.log_panel.write_line(
+                "Stop requested — cancelling the lookup and its earnings "
+                "refresh...")
 
     def _reset_session(self):
         self._session_seen.clear()
@@ -7236,6 +7702,7 @@ class MainWindow(QMainWindow):
             self.btn_scan.setEnabled(True)
             self.btn_stop.setEnabled(False)
             self._worker = None
+            self._lookup_context = None
             # F3: a crashed scheduled scan must not leave the scheduler
             # waiting on a completion that will never arrive (that
             # would block every future scheduled fire).
@@ -7315,7 +7782,13 @@ class MainWindow(QMainWindow):
             (err.get("symbol") if isinstance(err, dict) else None) == "<scan>"
             for err in (getattr(result, "errors", None) or [])
         )
-        if scan_stopped or scan_crashed:
+        is_lookup = bool(getattr(result, "lookup", False))
+        if is_lookup:
+            # A lookup's ticker set is whatever was typed: recording it would
+            # overwrite this preset's diff baseline with a handful of names
+            # and flag the whole next real scan as NEW (v8.0.1).
+            pass
+        elif scan_stopped or scan_crashed:
             try:
                 reason = "stopped" if scan_stopped else "crashed"
                 self.log_panel.write_line(
@@ -7406,6 +7879,12 @@ class MainWindow(QMainWindow):
         self.btn_send.setEnabled(n_pass > 0)
         self.btn_export.setEnabled(n_pass > 0)
         self.btn_excel.setEnabled(n_pass > 0)
+
+        if is_lookup:
+            # Lookups leave the session counter and the scheduler alone.
+            self._worker = None
+            self._finish_lookup(result)
+            return
 
         # Pre-transfer summary
         if n_err == 0:
@@ -8058,6 +8537,14 @@ class MainWindow(QMainWindow):
         coloring.evaluate(df, rules, keys, report=report)
         return report
 
+    def _color_rule_available_columns(self):
+        """Column keys of the period on screen — hidden ones included, since
+        a rule can read a hidden column — or None when no scan is on screen.
+        What the Color Rules favorites are checked against (v8.0.1)."""
+        label = self._active_period
+        df = self._period_results.get(label) if label else None
+        return None if df is None else set(df.columns)
+
     def _open_color_rules_dialog(self):
         from .color_rules_dialog import ColorRulesDialog
         dlg = self._color_rules_dialog
@@ -8066,6 +8553,7 @@ class MainWindow(QMainWindow):
                 self._color_rules, self._color_rule_column_choices(),
                 self._color_rule_target_choices(),
                 preview_fn=self._preview_color_rules, parent=self,
+                available_columns_fn=self._color_rule_available_columns,
             )
             dlg.rules_applied.connect(self._apply_color_rules)
             dlg.finished.connect(self._color_rules_dialog_closed)
@@ -9088,6 +9576,87 @@ class MainWindow(QMainWindow):
             self.log_panel.write_line(f"Preset deleted: {name}")
             self._refresh_preset_list()
 
+    # ── Moving between monitors (v8.0.1) ────────────────────────────────
+    # The window used to need 2,116 px of width (now ~760-920, see
+    # FlowLayout), wider than three of the user's four monitors (2,560 /
+    # 1,536 / 1,440 / 1,080 logical px, scaled 150 / 125 / 100 / 100 %).
+    # Dragged onto a narrower one, Windows proposed a size Qt refused as below
+    # the minimum: the window jumped, or hung across two screens.
+    #
+    # Now, when a move SETTLES on a different monitor, a window larger than
+    # that monitor's usable area is shrunk to fit and pulled fully onto it.
+    # Never mid-drag — resizing under the cursor is exactly the jump being
+    # fixed. Each move restarts a short timer; when it fires, a still-held
+    # primary mouse button means the drag is still going (the user paused),
+    # so it waits again. Keyboard moves (Win+Shift+Arrow) take the same path.
+    #
+    # NOT done with a nativeEvent override watching WM_EXITSIZEMOVE: on this
+    # PyQt (6.7.1 / Qt 6.7.3) any Python nativeEvent that calls the base
+    # class crashes the process with an access violation the moment the
+    # window is shown — found by the 2026-10-01 live test on the real
+    # monitors; offscreen tests cannot see it.
+
+    _MOVE_SETTLE_MS = 250
+    _move_timer = None
+    _last_settled_screen = None
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._last_settled_screen is None:
+            self._last_settled_screen = self.screen()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        try:
+            if self._move_timer is None:
+                from PyQt6.QtCore import QTimer
+                self._move_timer = QTimer(self)
+                self._move_timer.setSingleShot(True)
+                self._move_timer.setInterval(self._MOVE_SETTLE_MS)
+                self._move_timer.timeout.connect(self._on_move_settled)
+            self._move_timer.start()
+        except RuntimeError as exc:       # half-built test shells
+            log.debug("move tracking unavailable: %s", exc)
+
+    def _on_move_settled(self) -> None:
+        if _primary_mouse_button_down():
+            self._move_timer.start()      # still dragging — check again
+            return
+        screen = self.screen()
+        if screen is not self._last_settled_screen:
+            self._last_settled_screen = screen
+            self._fit_to_screen()
+
+    def _fit_to_screen(self) -> bool:
+        """Shrink and/or move the window so it lies within its monitor's
+        available area. Returns True when anything changed. Maximized,
+        minimized and full-screen windows are already the OS's to place."""
+        if self.isMaximized() or self.isMinimized() or self.isFullScreen():
+            return False
+        screen = self.screen()
+        if screen is None:
+            return False
+        avail = screen.availableGeometry()
+        geo, frame = self.geometry(), self.frameGeometry()
+        extra_w = frame.width() - geo.width()
+        extra_h = frame.height() - geo.height()
+        w = min(geo.width(), avail.width() - extra_w)
+        h = min(geo.height(), avail.height() - extra_h)
+        changed = False
+        if (w, h) != (geo.width(), geo.height()):
+            self.resize(w, h)          # clamped to the layout's minimum by Qt
+            changed = True
+        frame = self.frameGeometry()
+        x = max(avail.x(), min(frame.x(), avail.x() + avail.width() - frame.width()))
+        y = max(avail.y(), min(frame.y(), avail.y() + avail.height() - frame.height()))
+        if (x, y) != (frame.x(), frame.y()):
+            self.move(x, y)            # positions the frame's top-left corner
+            changed = True
+        if changed:
+            log.info("Window fitted to %s: %dx%d at (%d,%d)", screen.name(),
+                     self.width(), self.height(), x, y)
+        return changed
+
     # ── Cleanup ────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
@@ -9554,6 +10123,12 @@ def main():
             x = geo.x() + (geo.width() - w) // 2
             y = geo.y() + (geo.height() - h) // 2
             window.setGeometry(x, y, w, h)
+    # v8.0.1: a size saved on a big monitor, restored onto a smaller one (or
+    # after the monitors were rearranged), is pulled within that monitor.
+    try:
+        window._fit_to_screen()
+    except Exception as exc:
+        log.debug("launch fit-to-screen skipped: %s", exc)
 
     sys.exit(app.exec())
 

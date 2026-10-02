@@ -54,6 +54,13 @@ class ScrapeResult:
     # Bars whose cached value was replaced because the caller asked for an
     # explicit overwrite (deep refresh). 0 on every normal incremental update.
     bars_overwritten: int = 0
+    # Re-sent bars with a null Close that were NOT allowed to replace a cached
+    # bar carrying real prices (v8.0.1, see `_keep_priced_cached_bars`).
+    null_bars_refused: int = 0
+    # State of each date the caller asked to watch, read from the frame as it
+    # was written: True = null Close, False = priced, None = no bar that day
+    # (v8.0.1 suspect-session re-check). Empty unless `watch_dates` was given.
+    watched_bars: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -375,6 +382,259 @@ def summarize_last_bar_health(results, session=None) -> LastBarHealth:
     return LastBarHealth(
         sess, nulls, len(on_session), nulls / len(on_session) * 100.0,
         burst_pct, burst_start,
+    )
+
+
+# ── Suspect-session watch (v8.0.1) ─────────────────────────────────────
+#
+# The newest-session warning above says a run came back null-heavy, once, in
+# one log line. Nothing afterwards said whether the flagged bars were ever
+# repaired — the next update's refetch overlap usually does repair them, but
+# silently — nor noticed when they were not. A flagged session is now written
+# down with the tickers whose bar was null, every later run reports the state
+# of exactly those bars, and the session stays on the list (and on screen at
+# launch) until they carry prices or the user dismisses it.
+
+_SUSPECT_FILE_VERSION = 1
+
+
+def _suspect_sessions_path() -> Path:
+    """Resolved at call time so tests that monkeypatch config.DATA_DIR are
+    honoured (same pattern as the gap-attempt ledger)."""
+    return config.DATA_DIR / config.OHLCV_SUSPECT_SESSIONS_FILE
+
+
+def _clean_suspect_entry(key, entry) -> Optional[dict]:
+    """A validated copy of one stored session, or None if unusable."""
+    try:
+        day = pd.Timestamp(str(key))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(entry, dict) or pd.isna(day):
+        return None
+
+    def _int(name):
+        try:
+            return max(0, int(entry.get(name) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _float(name):
+        try:
+            v = float(entry.get(name) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return v if np.isfinite(v) else 0.0
+
+    still = entry.get("still_null")
+    return {
+        "flagged_at": str(entry.get("flagged_at") or ""),
+        "flagged_by": str(entry.get("flagged_by") or ""),
+        "tickers_on_session": _int("tickers_on_session"),
+        "null_at_flag": _int("null_at_flag"),
+        "pct_at_flag": _float("pct_at_flag"),
+        "burst_pct": _float("burst_pct"),
+        "burst_start": (str(entry["burst_start"])
+                        if entry.get("burst_start") else None),
+        "still_null": sorted({str(s) for s in still if s}
+                             if isinstance(still, list) else set()),
+        "last_checked_at": (str(entry["last_checked_at"])
+                            if entry.get("last_checked_at") else None),
+    }
+
+
+def load_suspect_sessions() -> dict:
+    """``{"YYYY-MM-DD": entry}`` for every session still flagged. A missing,
+    unreadable or malformed file degrades to "nothing flagged" — this is a
+    reminder list, and losing it costs a reminder, never data."""
+    import json
+    try:
+        data = json.loads(_suspect_sessions_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        log.warning("suspect-session list unreadable, ignoring it: %s", exc)
+        return {}
+    sessions = data.get("sessions") if isinstance(data, dict) else None
+    if not isinstance(sessions, dict):
+        return {}
+    out = {}
+    for key, entry in sessions.items():
+        clean = _clean_suspect_entry(key, entry)
+        if clean is None:
+            log.warning("suspect-session list: dropped unreadable entry %r",
+                        key)
+            continue
+        out[pd.Timestamp(str(key)).date().isoformat()] = clean
+    return out
+
+
+def save_suspect_sessions(sessions: dict) -> bool:
+    """Atomic write. Returns False (and logs) instead of raising."""
+    import json
+    payload = {"version": _SUSPECT_FILE_VERSION,
+               "sessions": {k: sessions[k] for k in sorted(sessions)}}
+    try:
+        config.atomic_write_text(_suspect_sessions_path(),
+                                 json.dumps(payload, indent=1))
+        return True
+    except OSError as exc:
+        log.warning("suspect-session list write failed: %s", exc)
+        return False
+
+
+def watched_session_days(sessions: dict) -> tuple:
+    """The flagged sessions as tz-naive days, for `download_one(watch_dates=)`."""
+    return tuple(sorted(pd.Timestamp(k) for k in sessions))
+
+
+def suspect_session_resolved(entry: dict) -> bool:
+    """Both conditions in config.OHLCV_SUSPECT_RESOLVED_* hold."""
+    remaining = len(entry.get("still_null") or ())
+    on_session = int(entry.get("tickers_on_session") or 0)
+    flagged = int(entry.get("null_at_flag") or 0)
+    return (remaining * 100.0 < on_session * config.OHLCV_SUSPECT_RESOLVED_PCT
+            and remaining * 100.0
+            <= flagged * config.OHLCV_SUSPECT_RESOLVED_SHARE_PCT)
+
+
+class SessionCheck(NamedTuple):
+    """What one run learned about one flagged session.
+
+    kind "flagged": this run raised the warning and started the watch.
+    kind "rechecked": this run read at least one of the session's null bars
+    (``rechecked``) — ``repaired`` now carry prices, ``still_null`` do not,
+    ``no_bar`` no longer have a bar on that date at all — or found a ticker
+    newly null on it (``newly_null``). ``remaining`` is the size of the list
+    afterwards; ``resolved`` says the session came off it.
+    """
+    session: str
+    kind: str
+    rechecked: int = 0
+    repaired: int = 0
+    still_null: int = 0
+    no_bar: int = 0
+    newly_null: int = 0
+    remaining: int = 0
+    tickers_on_session: int = 0
+    null_at_flag: int = 0
+    pct_at_flag: float = 0.0
+    resolved: bool = False
+
+
+def _bar_state(result, day: pd.Timestamp):
+    """"null" / "priced" / "absent" for `day` in what `result` wrote, or None
+    when this run says nothing about it (not written, not watched)."""
+    if getattr(result, "status", None) != "ok":
+        return None
+    watched = getattr(result, "watched_bars", None) or {}
+    if day in watched:
+        state = watched[day]
+        return "absent" if state is None else ("null" if state else "priced")
+    if getattr(result, "last_bar_date", None) == day:
+        return "null" if getattr(result, "last_bar_nan", False) else "priced"
+    return None
+
+
+def update_suspect_sessions(sessions: dict, results, health=None, *,
+                            flagged_by: str = "", now=None):
+    """Fold one run into the flagged-session list. Pure: returns
+    ``(new_sessions, [SessionCheck, ...])`` and touches no file.
+
+    1. When ``health`` is suspect and its session is not already listed, the
+       session is added (the "flagged" event).
+    2. For every listed session, each ticker this run WROTE reports that
+       session's bar: a listed ticker whose bar now has a price comes off the
+       list; one still null stays; an unlisted ticker whose bar is null goes on.
+       Tickers the run did not write say nothing and stay as they were — which
+       is what keeps a partial run from clearing a session it never re-read.
+    3. A previously listed session the run learned something about is judged
+       with `suspect_session_resolved` and dropped when it passes. A session
+       flagged by this very run is never judged in the same run.
+    """
+    stamp = (now or datetime.now().astimezone()).isoformat(timespec="seconds")
+    out = {k: dict(v, still_null=list(v.get("still_null") or ()))
+           for k, v in sessions.items()}
+    new_keys: set = set()
+    if (health is not None and getattr(health, "session", None) is not None
+            and health.is_suspect()):
+        key = _naive_day(health.session).date().isoformat()
+        if key not in out:
+            out[key] = {
+                "flagged_at": stamp, "flagged_by": flagged_by,
+                "tickers_on_session": int(health.total),
+                "null_at_flag": int(health.null_count),
+                "pct_at_flag": round(float(health.pct), 2),
+                "burst_pct": round(float(health.burst_pct), 2),
+                "burst_start": health.burst_start,
+                "still_null": [], "last_checked_at": None,
+            }
+            new_keys.add(key)
+
+    results = list(results)
+    events: list = []
+    for key in sorted(out):
+        entry = out[key]
+        day = pd.Timestamp(key)
+        still = set(entry["still_null"])
+        rechecked = repaired = still_null = no_bar = newly = 0
+        for r in results:
+            state = _bar_state(r, day)       # None for anything not written
+            if state is None:
+                continue
+            sym = str(getattr(r, "symbol", ""))
+            if sym in still:
+                rechecked += 1
+                if state == "null":
+                    still_null += 1
+                else:
+                    still.discard(sym)
+                    if state == "priced":
+                        repaired += 1
+                    else:
+                        no_bar += 1
+            elif state == "null":
+                still.add(sym)
+                newly += 1
+        entry["still_null"] = sorted(still)
+        common = dict(
+            remaining=len(still),
+            tickers_on_session=int(entry.get("tickers_on_session") or 0),
+            null_at_flag=int(entry.get("null_at_flag") or 0),
+            pct_at_flag=float(entry.get("pct_at_flag") or 0.0),
+        )
+        if key in new_keys:
+            events.append(SessionCheck(key, "flagged", **common))
+            continue
+        if rechecked == 0 and newly == 0:
+            continue                    # learned nothing: no verdict
+        entry["last_checked_at"] = stamp
+        resolved = suspect_session_resolved(entry)
+        events.append(SessionCheck(
+            key, "rechecked", rechecked=rechecked, repaired=repaired,
+            still_null=still_null, no_bar=no_bar, newly_null=newly,
+            resolved=resolved, **common,
+        ))
+        if resolved:
+            del out[key]
+    return out, events
+
+
+def describe_suspect_session(key: str, entry: dict) -> str:
+    """One-line reminder for a still-flagged session (launch log, tooltip,
+    dismiss dialog)."""
+    remaining = len(entry.get("still_null") or ())
+    on_session = int(entry.get("tickers_on_session") or 0)
+    pct = remaining / on_session * 100.0 if on_session else 0.0
+    flagged_at = str(entry.get("flagged_at") or "")[:16].replace("T", " ")
+    by = entry.get("flagged_by") or "an OHLCV update"
+    checked = entry.get("last_checked_at")
+    checked_txt = (f"last re-checked {str(checked)[:16].replace('T', ' ')}"
+                   if checked else "not re-checked yet")
+    return (
+        f"{key}: {remaining:,} of {on_session:,} tickers ({pct:.1f}%) still "
+        f"have a null bar — {int(entry.get('null_at_flag') or 0):,} when "
+        f"flagged {flagged_at} by the {by}; {checked_txt}"
     )
 
 
@@ -732,6 +992,74 @@ def _reject_conflicting_bars(
         return new_df
 
 
+def _keep_priced_cached_bars(
+    symbol: str, old_df: pd.DataFrame, new_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, int]:
+    """Drop incoming bars whose Close is null where the cache already holds a
+    bar with a real Close for the same date (v8.0.1). Returns the filtered
+    frame and how many bars were refused.
+
+    `_reject_conflicting_bars` measures disagreement as a percentage of the
+    cached Close, and a null on either side makes that percentage null, which
+    it reads as "no conflict". Half of that is wanted: a NULL cached bar must
+    lose to a real incoming one, because that is how the refetch overlap
+    repairs a null-priced session on the next update. The other half was a
+    hole: a null re-send of a date already held with real prices also passed,
+    and the `keep="last"` merge adopted it, wiping good prices for every date
+    in the overlap window. Verified 2026-09-27 on a scratch file — a cached
+    Close of 100.0 came back NaN with overwrite off and on.
+
+    A null bar carries nothing a priced one lacks, so this applies in BOTH
+    modes: a deliberate deep-refresh overwrite is a request for better data,
+    never for less. The cached bar is kept whole (Volume included) rather than
+    patched field by field. A null bar on a date the cache does not hold is
+    left alone: the newest-session health check depends on seeing it.
+    """
+    try:
+        if ("Close" not in old_df.columns or "Close" not in new_df.columns
+                or new_df.empty or old_df.empty):
+            return new_df, 0
+        old_close = pd.to_numeric(old_df["Close"], errors="coerce")
+        old_close = old_close[~old_close.index.duplicated(keep="last")]
+        old_close = old_close.reindex(new_df.index)
+        new_close = pd.to_numeric(new_df["Close"], errors="coerce")
+        refuse = (new_close.isna() & old_close.notna()).to_numpy()
+        n = int(refuse.sum())
+        if n == 0:
+            return new_df, 0
+        # Debug only: a bad-source evening would otherwise log a line for
+        # thousands of tickers. The run total is reported by UpdateWorker.
+        log.debug(
+            "%s — refused %d null re-sent bar(s), cached prices kept: %s",
+            symbol, n,
+            ", ".join(str(d.date()) for d in new_df.index[refuse][:5]),
+        )
+        return new_df.loc[~refuse], n
+    except Exception as exc:      # never let a guard break an update
+        log.debug("%s — null-bar guard skipped: %s", symbol, exc)
+        return new_df, 0
+
+
+def _watched_bar_states(combined: pd.DataFrame, watch_dates) -> dict:
+    """``{day: True | False | None}`` for each watched day in the frame being
+    written — null Close, priced, or no bar at all (v8.0.1)."""
+    if not watch_dates or "Close" not in combined.columns:
+        return {}
+    idx = combined.index
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert(None)
+    days = pd.DatetimeIndex(idx).normalize()
+    close = pd.to_numeric(combined["Close"], errors="coerce").to_numpy()
+    # Last occurrence wins, matching the merge's own dedup rule.
+    pos = {d: i for i, d in enumerate(days)}
+    out = {}
+    for d in watch_dates:
+        day = _naive_day(d)
+        i = pos.get(day)
+        out[day] = None if i is None else bool(pd.isna(close[i]))
+    return out
+
+
 # ── Single-ticker download ─────────────────────────────────────────────
 
 def download_one(
@@ -739,6 +1067,7 @@ def download_one(
     *,
     force_start: Optional[date] = None,
     overwrite: bool = False,
+    watch_dates=(),
 ) -> ScrapeResult:
     """
     Download (or incrementally update) OHLCV for one ticker.
@@ -761,6 +1090,15 @@ def download_one(
     A forced window NEVER shrinks a file: the merge branch is taken whenever a
     cached file exists, and the write is refused outright if the merged frame
     somehow came out shorter than what was already on disk.
+
+    In either mode a re-sent bar with a null Close never replaces a cached bar
+    that has one (v8.0.1, `_keep_priced_cached_bars`; counted in
+    ``null_bars_refused``).
+
+    ``watch_dates`` (v8.0.1) are sessions flagged by an earlier null-bar
+    warning. The state of each one in the frame as written is reported in
+    ``watched_bars`` so the run can confirm, ticker by ticker, whether the
+    flagged bars now carry prices. Read from the in-memory frame: no extra I/O.
     """
     result = ScrapeResult(symbol=symbol)
     pq = _parquet_path(symbol)
@@ -875,6 +1213,11 @@ def download_one(
         if last_date is not None and pq.exists():
             old_df = pd.read_parquet(pq)
             prior_rows = len(old_df)
+            # v8.0.1: before either merge rule below — a null re-send must not
+            # displace real cached prices, overwrite requested or not.
+            new_df, result.null_bars_refused = _keep_priced_cached_bars(
+                symbol, old_df, new_df,
+            )
             if not new_df.empty:
                 # Audit 2026-08-12 (INT-11): gate the MERGE, not just the log.
                 # `keep="last"` meant a bad yfinance response silently
@@ -954,6 +1297,7 @@ def download_one(
             result.last_bar_date = _naive_day(combined.index[-1])
             if "Close" in combined.columns:
                 result.last_bar_nan = bool(pd.isna(combined["Close"].iloc[-1]))
+        result.watched_bars = _watched_bar_states(combined, watch_dates)
 
         # Validate
         result.anomalies = validate_ticker(symbol, combined)
@@ -1051,14 +1395,15 @@ def download_many(
     stop_flag: Optional[Callable[[], bool]] = None,
     force_start: Optional[date] = None,
     overwrite: bool = False,
+    watch_dates=(),
 ) -> list[ScrapeResult]:
     """Download OHLCV for multiple tickers in parallel with a shared rate
     limit. progress_cb is invoked in completion order as each result
     arrives; the returned list is also in completion order.
 
-    ``force_start`` / ``overwrite`` are forwarded verbatim to download_one —
-    see its docstring. Both default off, so every existing caller keeps the
-    ordinary incremental behaviour.
+    ``force_start`` / ``overwrite`` / ``watch_dates`` are forwarded verbatim to
+    download_one — see its docstring. All default off, so every existing
+    caller keeps the ordinary incremental behaviour.
 
     max_workers threads each call download_one; a shared rate limiter
     enforces ≤ 1 request per min_interval_sec (defaults to
@@ -1080,7 +1425,8 @@ def download_many(
         limiter.acquire()
         if stop_flag and stop_flag():
             return ScrapeResult(symbol=sym, status="stopped")
-        return download_one(sym, force_start=force_start, overwrite=overwrite)
+        return download_one(sym, force_start=force_start, overwrite=overwrite,
+                            watch_dates=watch_dates)
 
     results: list[ScrapeResult] = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:

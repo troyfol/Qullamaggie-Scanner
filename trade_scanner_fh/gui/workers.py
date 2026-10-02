@@ -16,9 +16,11 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from .. import config
 from ..data_engine import (
     _last_cached_date, cached_spans, clear_ohlcv_cache, download_many,
-    download_one, find_interior_gaps, prefetch_ohlcv, rebuild_ticker,
-    record_gap_attempts, reference_sessions, select_gap_rebuilds,
-    summarize_last_bar_health, trading_days_back, write_anomaly_report,
+    download_one, find_interior_gaps, load_suspect_sessions, prefetch_ohlcv,
+    rebuild_ticker, record_gap_attempts, reference_sessions,
+    save_suspect_sessions, select_gap_rebuilds, summarize_last_bar_health,
+    trading_days_back, update_suspect_sessions, watched_session_days,
+    write_anomaly_report,
 )
 from ..scanner import ScanParams, ScanResult, build_scan_context, run_scan
 from ..ticker_universe import refresh_universe
@@ -40,6 +42,10 @@ class WorkerScanResult:
     errors: list = field(default_factory=list)
     elapsed_sec: float = 0.0
     sequenced: bool = False
+    # Lookup mode (v8.0.1): this run was a lookup, and per period what
+    # happened to each requested ticker (`ScanResult.outcomes`).
+    lookup: bool = False
+    period_outcomes: dict = field(default_factory=dict)
 
     def total_unique_symbols(self) -> set[str]:
         """Union of `symbol` across every period's DataFrame."""
@@ -68,9 +74,13 @@ class ScanWorker(QThread):
         params: Union[ScanParams, list[ScanParams], list[tuple[str, ScanParams]]],
         sequenced: bool = False,
         omit_intra_run: bool = False,
+        lookup: bool = False,
     ):
         super().__init__()
         self.symbols = symbols
+        # v8.0.1 Lookup mode: `symbols` is the user's typed list; run_scan
+        # records an outcome per ticker (see scanner.run_scan `lookup`).
+        self.lookup = lookup
         # Normalize params to list[(label, ScanParams)]. Bare ScanParams or
         # list[ScanParams] are wrapped with a default label derived from the
         # date range — keeps backward compat with any external callers and
@@ -110,6 +120,7 @@ class ScanWorker(QThread):
         # any earlier completed timeframes still surface.
         period_results: dict[str, pd.DataFrame] = {}
         period_order: list[str] = []
+        period_outcomes: dict[str, dict] = {}
         all_errors: list = []
         total_elapsed = 0.0
         n = len(self.params_list)
@@ -159,6 +170,7 @@ class ScanWorker(QThread):
                         )
                         period_results[label] = pd.DataFrame()
                         period_order.append(label)
+                        period_outcomes[label] = {}
                         continue
 
                 def cb(done, total, sym, _lbl=label):
@@ -171,9 +183,11 @@ class ScanWorker(QThread):
                     progress_cb=cb,
                     cancel_token=self._stop.is_set,
                     context=scan_context,
+                    lookup=self.lookup,
                 )
                 total_elapsed += result.elapsed_sec
                 all_errors.extend(result.errors)
+                period_outcomes[label] = dict(getattr(result, "outcomes", {}) or {})
 
                 df = result.results_df
                 if df is None:
@@ -210,6 +224,8 @@ class ScanWorker(QThread):
             errors=all_errors,
             elapsed_sec=total_elapsed,
             sequenced=self.sequenced,
+            lookup=self.lookup,
+            period_outcomes=period_outcomes,
         )
         # Emit `finished` even after a crash — the slot needs to know
         # the scan ended so it can re-enable the Scan button.
@@ -282,6 +298,31 @@ class UniverseRefreshWorker(QThread):
 # OHLCV update worker (incremental daily refresh)
 # ============================================================================
 
+def format_session_check(ev) -> str:
+    """Log-panel line for one `data_engine.SessionCheck` (v8.0.1)."""
+    tot = ev.tickers_on_session
+    if ev.kind == "flagged":
+        return (
+            f"OHLCV health: now watching {ev.session} — {ev.null_at_flag:,} "
+            f"null bar(s) of {tot:,} recorded. Later updates re-check exactly "
+            f"those tickers and report the result here."
+        )
+    parts = [f"{ev.repaired:,} now have prices", f"{ev.still_null:,} still null"]
+    if ev.no_bar:
+        parts.append(f"{ev.no_bar:,} no longer have a bar that day")
+    head = (f"OHLCV health: {ev.session} re-checked — {ev.rechecked:,} of its "
+            f"flagged bar(s) re-read: " + ", ".join(parts))
+    if ev.newly_null:
+        head += f"; {ev.newly_null:,} newly null"
+    pct = ev.remaining / tot * 100.0 if tot else 0.0
+    tail = (f". {ev.remaining:,} of {tot:,} ({pct:.1f}%) remain null (was "
+            f"{ev.null_at_flag:,} / {ev.pct_at_flag:.1f}% when flagged)")
+    if ev.resolved:
+        return head + tail + " → RESOLVED, no longer watched."
+    return (head + tail + " → still suspect. Data > Deep OHLCV Refresh "
+            "re-requests every ticker once the session has settled.")
+
+
 class UpdateWorker(QThread):
     """Incrementally updates OHLCV parquet files in the background."""
 
@@ -296,9 +337,16 @@ class UpdateWorker(QThread):
                  backoff_wait: int = 30,
                  max_retries: int = 3,
                  force_days_back: int | None = None,
-                 overwrite: bool = False):
+                 overwrite: bool = False,
+                 run_label: str = "OHLCV update"):
         super().__init__()
         self.symbols = symbols
+        # Which action started this run, for the suspect-session record
+        # ("flagged … by the launch update") — v8.0.1.
+        self.run_label = run_label
+        # Sessions an earlier null-bar warning flagged; read at the start of
+        # the download pass and reported on per ticker (v8.0.1).
+        self._watch_days: tuple = ()
         # Deep refresh (2026-08-29). When set, the per-ticker staleness check
         # is skipped entirely and EVERY symbol is re-pulled over a window of
         # this many trading days. Staleness is judged by a file's last DATE, so
@@ -467,6 +515,15 @@ class UpdateWorker(QThread):
         backoff_threshold = self.backoff_threshold
         backoff_wait_base = self.backoff_wait
 
+        # v8.0.1: every ticker reports the state of its bar on each session a
+        # previous run flagged, so `_finish` can confirm the repair (or not).
+        try:
+            self._watch_days = watched_session_days(load_suspect_sessions())
+        except Exception as exc:      # a reminder list must never stop a run
+            log.warning("suspect-session list not loaded: %s", exc)
+            self._watch_days = ()
+        watch = self._watch_days
+
         def _on_result(res):
             """Invoked from the as_completed loop for each finished ticker.
             Runs in the UpdateWorker thread (not a pool worker), so list
@@ -506,6 +563,7 @@ class UpdateWorker(QThread):
                 stop_flag=self._stop.is_set,
                 force_start=force_start,
                 overwrite=self.overwrite,
+                watch_dates=watch,
             )
             batch_start += len(batch)
 
@@ -540,8 +598,12 @@ class UpdateWorker(QThread):
                             probe_sym,
                             force_start=force_start,
                             overwrite=self.overwrite,
+                            watch_dates=watch,
                         )
                         if probe.status == "ok":
+                            # Kept with the rest so the probe ticker counts in
+                            # the health checks and the anomaly report too.
+                            self._results.append(probe)
                             updated += 1
                             completed += 1
                             batch_start += 1
@@ -593,21 +655,34 @@ class UpdateWorker(QThread):
         overwritten = sum(
             getattr(r, "bars_overwritten", 0) or 0 for r in self._results
         )
+        refused = sum(
+            getattr(r, "null_bars_refused", 0) or 0 for r in self._results
+        )
+        refused_tickers = sum(
+            1 for r in self._results
+            if (getattr(r, "null_bars_refused", 0) or 0) > 0
+        )
         msg = (f"OHLCV update complete: {updated} updated, {errors} errors"
                + (f", {gaps_fixed} gap-repaired" if gaps_fixed else "")
                + (f", {overwritten:,} cached bar(s) overwritten"
-                  if overwritten else ""))
+                  if overwritten else "")
+               + (f", {refused:,} null re-sent bar(s) refused across "
+                  f"{refused_tickers:,} ticker(s) (cached prices kept)"
+                  if refused else ""))
         self.log_msg.emit(msg)
         log.info(msg)
 
-        self._report_last_bar_health()
+        health = self._report_last_bar_health()
+        self._update_suspect_sessions(health)
 
         self.error_tickers.emit(self._failed_tickers)
         self.finished.emit(updated, errors)
 
-    def _report_last_bar_health(self) -> None:
+    def _report_last_bar_health(self):
         """Warn when this run wrote null-priced bars for most of the tickers
-        that traded on the newest session (2026-08-29).
+        that traded on the newest session (2026-08-29). Returns the
+        `LastBarHealth` it judged (None when it could not judge), which
+        `_update_suspect_sessions` uses to start watching a flagged session.
 
         `validate_ticker` already counted these NaNs, but only per ticker and
         only into a CSV — so the one number that mattered, "what fraction of
@@ -624,9 +699,9 @@ class UpdateWorker(QThread):
             health = summarize_last_bar_health(self._results)
         except Exception as exc:      # a report must never break the update
             log.warning("null last-bar check skipped: %s", exc)
-            return
+            return None
         if not health.total:
-            return
+            return health
 
         session = (
             health.session.date() if hasattr(health.session, "date")
@@ -652,12 +727,39 @@ class UpdateWorker(QThread):
                 f"treat EVERY ticker's {session} bar as suspect, not only the "
                 f"null ones (their Volume is typically understated too). Once "
                 f"the session has settled, run Data > Deep OHLCV Refresh over "
-                f"the whole store to repair it."
+                f"the whole store to repair it. Every later OHLCV update "
+                f"re-checks these bars and reports whether they now carry "
+                f"prices; until they do, a reminder shows at each launch."
             )
             self.log_msg.emit(warning)
             log.warning(warning)
         else:
             log.info("Last-bar health: %s", detail)
+        return health
+
+    def _update_suspect_sessions(self, health) -> None:
+        """Record a newly flagged session and re-check the ones already
+        flagged (v8.0.1) — see data_engine.update_suspect_sessions. Runs on
+        stopped and partial runs too: the bookkeeping is per ticker, so a
+        partial run can only ever clear the tickers it actually re-read."""
+        try:
+            sessions = load_suspect_sessions()
+            updated, events = update_suspect_sessions(
+                sessions, self._results, health, flagged_by=self.run_label,
+            )
+            if updated != sessions:
+                save_suspect_sessions(updated)
+        except Exception as exc:      # a report must never break the update
+            log.warning("suspect-session re-check skipped: %s", exc,
+                        exc_info=True)
+            return
+        for ev in events:
+            line = format_session_check(ev)
+            self.log_msg.emit(line)
+            if ev.kind == "rechecked" and not ev.resolved:
+                log.warning(line)
+            else:
+                log.info(line)
 
     def _repair_interior_gaps(self) -> int:
         """Detect and rebuild tickers with holes inside their own date range.

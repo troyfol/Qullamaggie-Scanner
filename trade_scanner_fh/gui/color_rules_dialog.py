@@ -8,6 +8,12 @@ this window only edits a working copy and hands it back via `rules_applied`.
 Round-tripping is the contract the tests pin: loading any rule into the
 editor and reading it straight back returns an identical rule, so opening
 the dialog and pressing OK never changes what a rule does.
+
+Favorites (v8.0.1): right-click a rule to save a copy of it by name; the
+"Favorites" dropdown adds a saved one back into the list (Apply paints it,
+as with any edit). A favorite the scan on screen cannot feed — a column its
+conditions read is missing — is greyed out with the reason. The store is
+gui/color_favorites.py.
 """
 
 from __future__ import annotations
@@ -18,11 +24,13 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QDialog,
-    QDialogButtonBox, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QPushButton, QScrollArea,
-    QSpinBox, QSplitter, QVBoxLayout, QWidget,
+    QDialogButtonBox, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
+    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
+    QMessageBox, QPushButton, QScrollArea, QSpinBox, QSplitter, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
+from . import color_favorites as F
 from . import coloring as C
 from .widgets import format_human_number, parse_human_number
 
@@ -657,7 +665,7 @@ class ColorRulesDialog(QDialog):
     rules_applied = pyqtSignal(list)
 
     def __init__(self, rules, columns, target_columns, preview_fn=None,
-                 parent=None):
+                 parent=None, available_columns_fn=None):
         super().__init__(parent)
         self.setWindowTitle("Color Rules")
         self.setModal(False)
@@ -665,6 +673,10 @@ class ColorRulesDialog(QDialog):
         self._columns = columns
         self._target_columns = target_columns
         self._preview_fn = preview_fn
+        # () -> set of column keys in the scan on screen, or None when there
+        # is none. Asked each time the Favorites menu opens, so a scan that
+        # finishes while this window is open is picked up (v8.0.1).
+        self._available_columns_fn = available_columns_fn
         self._rules: list = [r.copy() for r in rules]
         self._current = -1
 
@@ -681,7 +693,30 @@ class ColorRulesDialog(QDialog):
         split = QSplitter(Qt.Orientation.Horizontal)
         left = QWidget()
         ll = QVBoxLayout(left)
+        fav_row = QHBoxLayout()
+        self.btn_favorites = QToolButton()
+        self.btn_favorites.setText("★ Favorites")
+        self.btn_favorites.setToolTip(
+            "Add a saved favorite rule to this list. Right-click a rule to "
+            "save it as a favorite.")
+        self.btn_favorites.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.fav_menu = QMenu(self.btn_favorites)
+        self.fav_menu.setToolTipsVisible(True)
+        self.fav_menu.aboutToShow.connect(self._populate_favorites_menu)
+        self.btn_favorites.setMenu(self.fav_menu)
+        fav_row.addWidget(self.btn_favorites)
+        fav_row.addStretch()
+        ll.addLayout(fav_row)
+        # Favorites messages get their own line: `status` below is rewritten
+        # by the debounced preview right after every list change.
+        self.fav_note = QLabel("")
+        self.fav_note.setWordWrap(True)
+        self.fav_note.setStyleSheet("color: #bbb;")
+        ll.addWidget(self.fav_note)
         self.list = QListWidget()
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._rule_context_menu)
         ll.addWidget(self.list, 1)
         btns = QHBoxLayout()
         self.btn_add = QPushButton("Add")
@@ -841,6 +876,152 @@ class ColorRulesDialog(QDialog):
         self._current = -1
         self._rebuild_list(0)
 
+    # -- favorites (v8.0.1) ---------------------------------------------
+
+    # Prompts are separate methods so tests can answer them.
+    def _ask_text(self, title: str, label: str, default: str = ""):
+        text, ok = QInputDialog.getText(self, title, label, text=default)
+        return text if ok else None
+
+    def _confirm(self, title: str, text: str) -> bool:
+        return QMessageBox.question(
+            self, title, text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes
+
+    def _rule_context_menu(self, pos):
+        item = self.list.itemAt(pos)
+        if item is None:
+            return
+        row = self.list.row(item)
+        self.list.setCurrentRow(row)
+        menu = QMenu(self)
+        act = menu.addAction("Save as favorite…")
+        act.triggered.connect(lambda: self.save_rule_as_favorite(row))
+        menu.exec(self.list.viewport().mapToGlobal(pos))
+
+    def save_rule_as_favorite(self, row: int = None):
+        """Save a copy of the rule at `row` (default: the selected one) under
+        a name the user picks. Returns the name saved, or None."""
+        row = self._current if row is None else row
+        if not (0 <= row < len(self._rules)):
+            return None
+        self._commit_editor()
+        rule = self._rules[row].copy()
+        name = self._ask_text("Save as favorite", "Favorite name:", rule.name)
+        name = (name or "").strip()
+        if not name:
+            return None
+        favs = F.load_favorites()
+        existing = F.find(favs, name)
+        if existing is not None and not self._confirm(
+                "Replace favorite",
+                f"A favorite called “{existing.name}” already exists. "
+                f"Replace it with this rule?"):
+            return None
+        if not F.save_favorites(F.upsert(favs, name, rule)):
+            self.fav_note.setText(
+                "Could not write the favorites file — see the log.")
+            return None
+        self.fav_note.setText(f"Saved “{name}” to favorites.")
+        return name
+
+    def _requirement_label(self, key: str) -> str:
+        if key == C.ANY_QUARTER:
+            return "Q-X earnings columns"
+        for prefix, label in C.RUN_SOURCES:
+            if key == C.run_key(prefix):
+                return f"the {label} filter"
+        for label, k, _kind in self._columns:
+            if k == key:
+                return label
+        for label, k in self._target_columns:
+            if k == key:
+                return label
+        return key
+
+    def favorite_availability(self, fav) -> tuple:
+        """(usable, reason) for `fav` against the scan on screen."""
+        cols = (self._available_columns_fn()
+                if self._available_columns_fn is not None else None)
+        if cols is None:
+            return False, "run a scan first"
+        inputs, targets = C.unmet_requirements(fav.rule, cols)
+
+        def names(keys):
+            labels = [self._requirement_label(k) for k in keys]
+            more = len(labels) - 3
+            return ", ".join(labels[:3]) + (f" +{more} more" if more > 0 else "")
+
+        # One reason, the more basic first: a menu entry has to stay readable.
+        if inputs:
+            return False, "needs " + names(inputs)
+        if targets:
+            return False, "none of its colored columns are in this scan (" \
+                + names(targets) + ")"
+        return True, ""
+
+    def _populate_favorites_menu(self):
+        menu = self.fav_menu
+        menu.clear()
+        favs = F.load_favorites()
+        if not favs:
+            empty = menu.addAction(
+                "No favorites yet — right-click a rule to save one")
+            empty.setEnabled(False)
+        for fav in favs:
+            ok, reason = self.favorite_availability(fav)
+            text = fav.name if ok else f"{fav.name}    ({reason})"
+            act = menu.addAction(_swatch(self._swatch_for(fav.rule)), text)
+            act.setEnabled(ok)
+            act.setToolTip(
+                f"Add “{fav.name}” to the rule list (Apply paints it)."
+                if ok else f"Not available for the scan on screen: {reason}.")
+            act.triggered.connect(
+                lambda _checked=False, n=fav.name: self.apply_favorite(n))
+        menu.addSeparator()
+        save = menu.addAction("Save selected rule as favorite…")
+        save.setEnabled(0 <= self._current < len(self._rules))
+        save.triggered.connect(lambda: self.save_rule_as_favorite())
+        manage = menu.addAction("Manage favorites…")
+        manage.setEnabled(bool(favs))
+        manage.triggered.connect(self.manage_favorites)
+
+    def apply_favorite(self, name: str):
+        """Add a fresh copy of favorite `name` above the selected rule (as
+        Add does) and select it; if an identical rule is already listed,
+        select that one instead. Nothing is painted until Apply / OK.
+        Returns the row selected, or None when nothing happened."""
+        fav = F.find(F.load_favorites(), name)
+        if fav is None:
+            self.fav_note.setText(f"No favorite called “{name}”.")
+            return None
+        ok, reason = self.favorite_availability(fav)
+        if not ok:                  # the menu greys these out; belt + braces
+            self.fav_note.setText(f"“{fav.name}” is not available: {reason}.")
+            return None
+        self._commit_editor()
+        rule = F.instantiate(fav)
+        sig = F.signature(rule)
+        for i, r in enumerate(self._rules):
+            if F.signature(r) == sig:
+                self._current = -1
+                self._rebuild_list(i)
+                self.fav_note.setText(
+                    f"“{fav.name}” is already in the list (as “{r.name}”) — "
+                    f"selected it.")
+                return i
+        at = max(self._current, 0)
+        self._rules.insert(at, rule)
+        self._current = -1
+        self._rebuild_list(at)
+        self.fav_note.setText(f"Added “{fav.name}” — press Apply to paint it.")
+        return at
+
+    def manage_favorites(self):
+        ManageFavoritesDialog(self).exec()
+
     # -- status / apply -------------------------------------------------
 
     def _schedule_status(self):
@@ -903,3 +1084,89 @@ class ColorRulesDialog(QDialog):
     def _ok(self):
         self.apply()
         self.accept()
+
+
+class ManageFavoritesDialog(QDialog):
+    """Rename or delete saved favorites. Every change is written at once;
+    rules already added to a preset from a favorite are copies and are not
+    touched."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage favorites")
+        self.setMinimumWidth(380)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            "Favorites are shared by every preset. Renaming or deleting one "
+            "does not change rules already added from it."))
+        self.list = QListWidget()
+        lay.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        self.btn_rename = QPushButton("Rename…")
+        self.btn_delete = QPushButton("Delete")
+        row.addWidget(self.btn_rename)
+        row.addWidget(self.btn_delete)
+        row.addStretch()
+        lay.addLayout(row)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        box.rejected.connect(self.reject)
+        lay.addWidget(box)
+        self.btn_rename.clicked.connect(self.rename_selected)
+        self.btn_delete.clicked.connect(self.delete_selected)
+        self._fill()
+
+    # Prompts are separate methods so tests can answer them.
+    def _ask_text(self, title: str, label: str, default: str = ""):
+        text, ok = QInputDialog.getText(self, title, label, text=default)
+        return text if ok else None
+
+    def _confirm(self, title: str, text: str) -> bool:
+        return QMessageBox.question(
+            self, title, text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes
+
+    def _fill(self, select: str = None):
+        self.list.clear()
+        for fav in F.load_favorites():
+            it = QListWidgetItem(
+                _swatch(ColorRulesDialog._swatch_for(fav.rule)), fav.name)
+            it.setData(Qt.ItemDataRole.UserRole, fav.name)
+            if fav.saved_at:
+                it.setToolTip(f"Saved {fav.saved_at[:16].replace('T', ' ')}")
+            self.list.addItem(it)
+            if select is not None and F.find([fav], select) is not None:
+                self.list.setCurrentItem(it)
+        if self.list.currentRow() < 0 and self.list.count():
+            self.list.setCurrentRow(0)
+        has = self.list.count() > 0
+        self.btn_rename.setEnabled(has)
+        self.btn_delete.setEnabled(has)
+
+    def _selected(self):
+        it = self.list.currentItem()
+        return it.data(Qt.ItemDataRole.UserRole) if it is not None else None
+
+    def rename_selected(self):
+        old = self._selected()
+        if old is None:
+            return
+        new = (self._ask_text("Rename favorite", "New name:", old) or "").strip()
+        if not new or new == old:
+            return
+        try:
+            favs = F.rename(F.load_favorites(), old, new)
+        except (KeyError, ValueError) as exc:
+            QMessageBox.warning(self, "Rename favorite", str(exc))
+            return
+        F.save_favorites(favs)
+        self._fill(select=new)
+
+    def delete_selected(self):
+        name = self._selected()
+        if name is None or not self._confirm(
+                "Delete favorite", f"Delete the favorite “{name}”?"):
+            return
+        F.save_favorites(F.delete(F.load_favorites(), name))
+        self._fill()

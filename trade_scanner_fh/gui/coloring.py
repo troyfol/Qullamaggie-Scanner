@@ -980,3 +980,59 @@ def evaluate(df, rules, layout_keys, *, records=None,
             report[rule.id] = {"rows": int(np.count_nonzero(hit)),
                                "missing": sorted(ctx.missing)}
     return out
+
+
+# ======================================================================
+# Requirements (v8.0.1 — colour-rule favorites)
+# ======================================================================
+
+# Stands for "at least one Q-X quarter column": what a quarter-scope rule
+# needs before it has anything to test.
+ANY_QUARTER = "q{k}_*"
+
+
+def _present(key: str, columns) -> bool:
+    """Is `key` available among `columns`? A `{k}` template, or a quarter
+    TYPE id such as `q_reported_eps`, counts as present when ANY quarter of
+    that type is; ANY_QUARTER when any Q-X column at all is."""
+    if key == ANY_QUARTER:
+        return quarter_count(columns) >= 1
+    if K in key:
+        pattern = re.compile(
+            "^" + re.escape(key).replace(re.escape(K), r"\d+") + "$")
+        return any(pattern.match(str(c)) for c in columns)
+    if _is_q_type(key):
+        suffix = key[2:]
+        return any((m := _Q_COL.match(str(c))) and m.group(2) == suffix
+                   for c in columns)
+    return key in columns
+
+
+def unmet_requirements(rule: Rule, columns) -> tuple:
+    """``(missing_inputs, missing_targets)`` for `rule` against the column
+    keys a scan produced — a static check, nothing is evaluated.
+
+    * missing_inputs: every column a condition reads (`Condition.columns`,
+      which includes an "in the run of" filter's run data) that is absent.
+      A quarter-scope rule whose inputs are all there still needs Q-X
+      columns to test; ANY_QUARTER is reported then — only then, so the
+      reason names the specific filter whenever there is one. The
+      earnings-date match and "any display-only filter" tests read the
+      scan's own per-row data and need no particular column.
+    * missing_targets: a "Chosen columns" rule none of whose targets exist —
+      all of them, since any one would do. Empty otherwise.
+    """
+    cols = set(columns)
+    missing: list = []
+    for cond in rule.conditions:
+        for key in cond.columns():
+            if key not in missing and not _present(key, cols):
+                missing.append(key)
+    if rule.scope == "quarter" and not missing \
+            and not _present(ANY_QUARTER, cols):
+        missing.append(ANY_QUARTER)
+    targets: list = []
+    if rule.target == "columns" and rule.target_columns and not any(
+            _present(k, cols) for k in rule.target_columns):
+        targets = list(rule.target_columns)
+    return missing, targets
