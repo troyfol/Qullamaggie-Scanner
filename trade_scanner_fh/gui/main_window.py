@@ -1548,6 +1548,12 @@ class MainWindow(QMainWindow):
         self.results_table.columns_reset_requested.connect(
             self._reset_columns_to_default
         )
+        # v8.1.0: double-click a ticker → its Quarter view (one window per
+        # double-click; open ones are tracked so they are not collected).
+        self._quarter_views: list = []
+        self.results_table.quarter_view_requested.connect(
+            self._open_quarter_view
+        )
         self.results_table.set_unhide_providers(
             rows=self._row_unhide_items, columns=self._column_unhide_items,
         )
@@ -8394,6 +8400,47 @@ class MainWindow(QMainWindow):
         self, canonical_keys: list[str],
     ) -> None:
         self._columns_mgr._reconcile_column_order_for_scan(canonical_keys)
+
+    # ── Quarter view (v8.1.0) ──────────────────────────────────────────
+
+    def _open_quarter_view(self, src_row: int):
+        """Open a Quarter view of the double-clicked ticker: a snapshot of
+        its row in the period on screen, laid out by `quarter_view`. The
+        user's rule: quarters regardless of hiding, metrics as currently
+        hidden / shown, the table's own colours. One window per
+        double-click."""
+        from .quarter_view import QuarterViewDialog, build_quarter_view
+        snap = self.results_table.row_snapshot(src_row)
+        if snap is None:
+            return
+        row, styles = snap
+        try:
+            hidden_keys = set(self._deleted_column_keys)
+        except (AttributeError, RuntimeError, TypeError):
+            hidden_keys = set()
+        view = build_quarter_view(
+            row, styles=styles,
+            hidden_types=self._effective_hidden_earnings_types(),
+            hidden_keys=hidden_keys,
+            period=getattr(self, "_active_period", None),
+        )
+        dlg = QuarterViewDialog(view, parent=self,
+                                on_exported=self._on_quarter_view_exported)
+        self._quarter_views.append(dlg)
+        dlg.finished.connect(
+            lambda _result, d=dlg: self._forget_quarter_view(d))
+        dlg.show()
+        return dlg
+
+    def _forget_quarter_view(self, dlg) -> None:
+        if dlg in self._quarter_views:
+            self._quarter_views.remove(dlg)
+
+    def _on_quarter_view_exported(self, path: str, view) -> None:
+        self.log_panel.write_line(
+            f"Quarter view export: {view.symbol} → {path} "
+            f"({len(view.quarters)} quarter(s), {len(view.rows)} row(s))")
+        self.status.showMessage(f"Exported {view.symbol} quarters to {path}")
 
     # ── Hide / unhide (v8.0.0) ─────────────────────────────────────
     # Replaced hard row delete + single-level undo and column delete. The

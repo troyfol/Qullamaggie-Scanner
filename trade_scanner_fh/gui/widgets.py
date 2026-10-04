@@ -3618,6 +3618,10 @@ class ResultsTable(QTableView):
     # `_deleted_column_keys`, then re-renders.
     columns_reset_requested = pyqtSignal()
 
+    # v8.1.0: a plain left double-click on a row asks for its Quarter view.
+    # Payload is the SOURCE (frame) row, already mapped through the sort.
+    quarter_view_requested = pyqtSignal(int)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.model_src = QStandardItemModel()
@@ -3715,6 +3719,9 @@ class ResultsTable(QTableView):
         # The frame on screen, for hover tooltips (v8.0.2). Source-model row
         # r is frame row r; `viewportEvent` builds the text on demand.
         self._tip_df = None
+        # The colour-rule verdict per frame row from the last populate
+        # (v8.1.0), so a Quarter view paints exactly what the table did.
+        self._row_styles: list = []
         # Colour rules (v8.0.0). A table nobody configures paints the
         # pre-v8 schemes, because the defaults ARE those schemes.
         from . import coloring as _coloring
@@ -3977,6 +3984,36 @@ class ResultsTable(QTableView):
             return True
         return super().viewportEvent(event)
 
+    def mouseDoubleClickEvent(self, event):
+        """v8.1.0: a PLAIN left double-click on a row requests its Quarter
+        view. Modified or other-button double-clicks keep Qt's default — the
+        TradeStation hotkey's mouse cues (right, Shift/Ctrl+left, middle)
+        fire on the first press and must not also open a window — and
+        nothing opens while a render is still filling the table."""
+        if (event.button() == Qt.MouseButton.LeftButton
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                and not self._populate_in_flight
+                and self._tip_df is not None):
+            index = self.indexAt(event.position().toPoint())
+            if index.isValid():
+                src = self.proxy.mapToSource(index).row()
+                if 0 <= src < len(self._tip_df):
+                    self.quarter_view_requested.emit(src)
+                    event.accept()
+                    return
+        super().mouseDoubleClickEvent(event)
+
+    def row_snapshot(self, src_row: int):
+        """``(row dict, RowStyles | None)`` for frame row `src_row` — a copy
+        of the row and the colours populate computed for it, so a Quarter
+        view keeps them through later renders. None when out of range."""
+        df = self._tip_df
+        if df is None or not (0 <= src_row < len(df)):
+            return None
+        styles = (self._row_styles[src_row]
+                  if src_row < len(self._row_styles) else None)
+        return df.iloc[src_row].to_dict(), styles
+
     def _tooltip_at(self, pos):
         """Tooltip text for the cell under viewport position `pos`."""
         df = self._tip_df
@@ -4201,6 +4238,7 @@ class ResultsTable(QTableView):
 
     def _populate_impl(self, df):
         self._tip_df = df if df is not None and not df.empty else None
+        self._row_styles = []
         was_sortable = self.isSortingEnabled()
         self.setSortingEnabled(False)
         # Critical perf wrappers — measured against a 379-row × 97-col
@@ -4286,6 +4324,7 @@ class ResultsTable(QTableView):
             except Exception as exc:
                 log.warning("colour rules skipped for this render: %s", exc,
                             exc_info=True)
+            self._row_styles = list(styles or [])
             for r in range(n):
                 try:
                     self._populate_row(

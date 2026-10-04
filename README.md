@@ -2906,6 +2906,40 @@ The text is built only when you hover (from the frame on screen), so a large
 render pays nothing for it. The fiscal quarter is there because report order
 and fiscal order disagree for late filers.
 
+### Quarter view (v8.1.0)
+
+**Double-click a ticker** in the results table to open its Quarter view: the
+quarters as **columns** and the per-quarter metrics as **rows** — the Q-X
+block values, laid out to read across time.
+
+- **Columns** are every quarter the scan produced for that ticker, whatever is
+  hidden in the table. Each header shows the quarter, its report date and its
+  fiscal quarter (`Q-3 / 2026-02-10 / FQ 2025-12`), so the Q-X Date columns are
+  not repeated as rows.
+- **Rows** are Reported / Surp $ / Surp % / YoY for EPS, then Rev, as the scan
+  has them. A metric is left out when its Hide Q Columns type is ticked, or
+  when every one of its quarters is hidden individually.
+- A **✓ row** for each active Consecutive Beats, YoY Growth or Accelerating
+  filter marks the quarters its run counted.
+- **Colours are the table's own**, cell for cell; a cell hidden in the table
+  was never coloured there and shows uncoloured (the view says so). Cells
+  carry the same hover tooltip as the table.
+- A scan without Q-X blocks shows Q-1 from the Current rows, or explains how to
+  get quarters (turn on a Consecutive Beats or YoY Growth filter —
+  display-only is enough).
+- **Copy** puts the grid on the clipboard as tab-separated text (pastes into
+  Excel); **Export to Excel…** writes one sheet in the same layout with real
+  numbers and dates in the table's number formats, colours included unless
+  *Include colours* is unticked. Default name
+  `TICKER_quarters_PERIOD_DATE.xlsx`.
+
+Each double-click opens its own window, so several tickers can sit side by
+side. A view is a **snapshot** of that row in the period on screen: a later
+scan, hide or colour change does not alter an open view. Only a plain left
+double-click opens one — Shift / Ctrl / right / middle double-clicks keep
+their usual meaning, so the TradeStation hotkey's mouse cues never also open a
+window — and nothing opens while the table is still filling.
+
 ### Cut + Paste columns (manual reorder)
 
 Symmetric with row cut/paste — reorder columns via the header right-click menu:
@@ -3384,7 +3418,7 @@ data directory.
 
 ## Testing
 
-Test suite at `trade_scanner_fh/tests/` — **2,527 tests, all passing** as of 2026-10-04 (v8.0.2 added 84 for the shared ticker parser and every dialog that uses it, the shared quarter-block count, new columns going to the right, and the earnings date columns with their hover tooltips; v8.0.1 added 104 across the null re-send guard, the flagged-session re-check, the colour-rule favorites, Lookup mode with its earnings refresh, and the layout / monitor-move fixes; v8.0.0 added 236 across the eight fixes, hide / unhide, the colour-rule engine and its editor, and the round-2 fixes from user testing; v6.3.3 added 18, v6.3.2 added 40, v6.3.1 added 16, v6.3.0 added 93 across the disagreement merge, the failure taxonomy, the trim scoping, both new features and the unified series engine; v6.2.0 brought it to 1,759; v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
+Test suite at `trade_scanner_fh/tests/` — **2,554 tests, all passing** as of 2026-10-04 (v8.1.0 added 27 for the Quarter view; v8.0.2 added 84 for the shared ticker parser and every dialog that uses it, the shared quarter-block count, new columns going to the right, and the earnings date columns with their hover tooltips; v8.0.1 added 104 across the null re-send guard, the flagged-session re-check, the colour-rule favorites, Lookup mode with its earnings refresh, and the layout / monitor-move fixes; v8.0.0 added 236 across the eight fixes, hide / unhide, the colour-rule engine and its editor, and the round-2 fixes from user testing; v6.3.3 added 18, v6.3.2 added 40, v6.3.1 added 16, v6.3.0 added 93 across the disagreement merge, the failure taxonomy, the trim scoping, both new features and the unified series engine; v6.2.0 brought it to 1,759; v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
 
 ```bash
 cd c:/python/EDA_Project/Trade_Scanner_FH
@@ -3505,6 +3539,7 @@ client's rate limiter).
 | `test_v801_layout.py` | **v8.0.1.** Monitor moves: FlowLayout wrapping / minimum / gaps / hidden items, filter rows fitting a narrow panel with every label kept beside its input, the panel's content-derived minimum (no sideways scrollbar), the window fitting a 1,080 px monitor measured with the dark theme, every full-width row being a wrapping layout, the top bar holding every control, fit-to-monitor (shrink + pull on-screen, maximized left alone), fitting only after the move settles on a new monitor and never with the mouse button held, and a guard against any `nativeEvent` override (it crashes PyQt 6.7.1 on show) |
 | `test_v801_lookup.py` | **v8.0.1.** Lookup mode: parsing and share-class matching, `lookup_params` (Top X% off; display-only builds zero funnel stages with every filter on; caller's params untouched), `run_scan(lookup=True)` outcomes (passed / failed at a stage / no data / quarantine / error, benchmarks kept, Top X% guard), the worker's per-period outcomes, the report, the dialog's STW form factor, the window using the scan's own periods and params, and completion leaving scan history and the session counter alone |
 | `test_v802_ticker_input.py` | **v8.0.2.** The shared ticker parser on the user's own 45-ticker TradeStation / finviz paste (CRLF and tab variants, every tag placement, inner `$` / `^` kept, re-parsing a saved list changes nothing), and every list dialog and Spot Fill prompt driven end to end through a scripted dialog — including the one-line `blacklist.txt` / `greylist.txt` files a column paste used to break. Mutation-checked: reverting any of the 14 call sites or 3 parser rules fails it |
+| `test_v810_quarter_view.py` | **v8.1.0.** The Quarter view's layout rules (own quarters only, date headers, sides, hidden types vs individually hidden quarters, ✓ rows incl. numpy run lists and the series hide, colours from RowStyles, tooltips, the Current fallback, the empty note, TSV, file-safe names); the xlsx read back (dates, numbers, number formats, ✓, freeze panes, colours on / off); a real sorted table — which double-clicks open a view (plain left only, never mid-render) and the snapshot surviving a re-render; and the real window — one window per double-click, closed ones forgotten, colours identical to the table, hides, snapshot vs a new scan, Copy, Export, the nothing-to-show state. Mutation-checked: 20 of 20 rule breaks caught |
 | `test_v802_dates_and_tooltips.py` | **v8.0.2.** The growth / accelerating Start / End columns (real run dates, empty when there is no run), Last Report Date beside Q-X blocks, the tooltip-only keys (beats run dates, fiscal quarters, ER dates); the seven Dates types (all default-hidden, a run date under both its Dates and its (all cols) tick); the real window — hidden on a fresh scan, untick to show, presets save / a pre-8.0.2 preset re-hides, (all cols) beats a shown Dates tick, Show All, the export dialog, the unhide menu, the button count; and every tooltip kind, including the real table under a sort. Mutation-checked: 20 of 20 rule breaks caught |
 | `test_v802_quarters_and_columns.py` | **v8.0.2.** `q_block_count` (highest cap wins, 0 beats every number, the 20 ceiling, display-only and accelerating rows counted, switched-off rows ignored, both sides drawn alike); the column merge (new columns right, removals drop, extra quarter blocks extend their run in both layouts, a new side goes right even without a counter); and the real window scan after scan — additions, an empty scan, a removal plus a fourth quarter, after Reset, after a drag. With the two end-to-end cap tests in `test_display_only.py`, mutation-checked: 14 of 14 rule breaks caught |
 | `test_v801_color_favorites.py` | **v8.0.1.** The favorites store (copy semantics, case-insensitive names, rename / delete, unreadable files), `unmet_requirements` for every condition kind and target, and the dialog: right-click save, overwrite confirmation, greyed entries with reasons, picking adds without painting, duplicates select, Manage dialog, end to end across presets |
@@ -3716,6 +3751,7 @@ directories, and the previous `_internal/`.
 | `gui/color_favorites.py` | **v8.0.1.** Colour-rule favorites store — named single-rule copies shared by every preset, in `scanner_data/color_rule_favorites.json` |
 | `gui/flow_layout.py` | **v8.0.1.** `FlowLayout` (a row that wraps instead of forcing its parent's width; minimum = widest single item, height-for-width) and `WrappingBar` (the top control bar, search row and ribbon: wrapping, with groups so a label stays with its control) |
 | `gui/lookup.py` | **v8.0.1.** Lookup mode — matching the typed list to cached symbols, the Lookup dialog, the per-ticker report (parameter changes live in `scanner.lookup_params`) |
+| `gui/quarter_view.py` | **v8.1.0.** The Quarter view — `build_quarter_view` (pure: one results row → quarters × metrics + run ✓ rows, the table's colours), the window, Copy (`view_as_tsv`) and `write_quarter_view_xlsx` |
 | `gui/ticker_input.py` | **v8.0.2.** `parse_ticker_list` / `strip_qualifiers` — the one parser behind every ticker-list box and the Spot Fill prompts (TradeStation columns, finviz `(HB)` tags), plus the shared dialog wording |
 | `gui/hiding.py` | `HideManager` — hide / unhide rows and columns, undo stack, preset replace, indicators |
 
@@ -3738,6 +3774,30 @@ therefore refreshes that ticker's attributes at no extra cost, independently
 of whether the sweep ever runs.
 
 ## Changelog
+
+### v8.1.0 — Quarter view (2026-10-04)
+
+**Double-click a ticker to read its quarters across time.** A new window per
+double-click shows that ticker's quarters as columns (report date and fiscal
+quarter in each header) and the per-quarter metrics in the scan as rows, with
+a ✓ row per Beats / Growth / Accelerating filter under the quarters its run
+counted. Quarters ignore hiding; metrics follow it (a metric is dropped when
+its Hide Q type is ticked or every quarter of it is hidden). Colours are the
+table's own — reused from the render rather than re-evaluated, because the
+date-match rule's palette depends on which columns are visible, so a second
+evaluation could have coloured a visible cell differently. Copy and Export to
+Excel (one sheet, real numbers and dates, colours optional) are on the window.
+See [Quarter view](#quarter-view-v810).
+
+Contained by design: `gui/quarter_view.py` is new; the table only gained a
+double-click signal (plain left button, no modifiers, never mid-render), a
+row-snapshot accessor and a kept copy of the colours it computed. The scan,
+the stores and every existing table behaviour are unchanged. Smoke-tested on
+599 real tickers from a scratch copy of the store with Beats, Growth,
+Accelerating and Current rows on: every view's quarters were the ticker's own,
+all 45,680 metric cells equalled the row's values, every ✓ row matched its
+run, colours matched the table cell for cell (12,626 coloured), and 25
+exported sheets read back identical; about 2 ms to build a view.
 
 ### v8.0.2 — paste TradeStation columns and finviz lists, one quarter depth, new columns on the right, earnings date columns and hover tooltips (2026-10-04)
 
