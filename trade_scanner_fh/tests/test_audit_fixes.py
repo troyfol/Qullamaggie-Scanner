@@ -115,10 +115,11 @@ def test_per_column_gating_only_active_columns_appear(fake_scan_cache):
         )
 
 
-def test_last_report_date_suppressed_when_beats_active(fake_scan_cache):
-    """When a beat filter (or display-only) is active, the Q-1 Date
-    column shows the same date as `last_report_date` would, so
-    `last_report_date` is suppressed to avoid redundancy."""
+def test_last_report_date_kept_when_beats_active(fake_scan_cache):
+    """v8.0.2 (the user's rule): every earnings filter produces a date
+    column. `last_report_date` used to be suppressed beside a beat's Q-1
+    Date as redundant; it is now always produced and HIDDEN by default
+    through Hide Q Columns instead."""
     end = pd.Timestamp(date(2026, 4, 30))
     _write_ohlcv("AAPL", end)
     pd.DataFrame([
@@ -131,8 +132,7 @@ def test_last_report_date_suppressed_when_beats_active(fake_scan_cache):
         dist_high_enabled=False, pct_gain_enabled=False,
         adr_enabled=False, min_price_enabled=False,
         avg_vol_enabled=False, dollar_vol_enabled=False,
-        # Both an individual + a beat active. last_report_date is
-        # suppressed because the q1_report_date_eps column shows it.
+        # Both an individual + a beat active.
         reported_eps_display_only=True,
         consec_eps_beats_display_only=True,
     )
@@ -142,11 +142,8 @@ def test_last_report_date_suppressed_when_beats_active(fake_scan_cache):
     assert "reported_eps" in df.columns
     assert "consec_eps_beats" in df.columns
     assert "q1_report_date_eps" in df.columns
-    # last_report_date suppressed when beat is active.
-    assert "last_report_date" not in df.columns, (
-        "last_report_date should be suppressed when a beat filter is active "
-        "(redundant with the Q-1 Date column)."
-    )
+    assert df.loc["AAPL", "last_report_date"] == \
+        df.loc["AAPL", "q1_report_date_eps"]
 
 
 def test_h2_columns_missing_when_history_parquet_absent(fake_scan_cache):

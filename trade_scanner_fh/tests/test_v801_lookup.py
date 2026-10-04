@@ -250,7 +250,8 @@ def test_dialog_matches_the_manual_input_stw_form_factor(_qapp):
     m = d.layout().contentsMargins()
     assert (m.left(), m.top(), m.right(), m.bottom()) == (30, 20, 30, 20)
     assert d.txt.minimumHeight() == 120
-    assert any(lbl.text() == "Enter tickers (comma-separated):"
+    # v8.0.2: the prompt is shared with Manual Input STW (ticker_input).
+    assert any(lbl.text() == L.INPUT_PROMPT
                for lbl in d.findChildren(QLabel))
     assert d.tickers() == ["AAPL", "MSFT"] and d.display_only() is True
     assert L.LookupDialog().display_only() is False, "as set by default"

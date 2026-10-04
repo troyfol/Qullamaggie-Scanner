@@ -1850,14 +1850,14 @@ def test_columns_manager_dialog_reset_button_emits_signal(_qapp):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Scan reconcile rule: prepend additions, drop removals
+# Scan reconcile rule: additions to the RIGHT (v8.0.2), drop removals
 # ──────────────────────────────────────────────────────────────────────
 
-def test_reconcile_prepends_new_columns_to_saved_order(_qapp):
-    """A scan that adds NEW columns puts them at the FRONT of the
-    saved order. Existing saved-order keys keep their relative
-    positions; canonical order of the additions determines their
-    relative ordering."""
+def test_reconcile_appends_new_columns_to_the_right(_qapp):
+    """A scan that adds NEW columns puts them at the RIGHT of the saved
+    order (v8.0.2, the user's rule; they used to be prepended). Existing
+    saved-order keys keep their relative positions; canonical order of
+    the additions determines their relative ordering."""
     from trade_scanner_fh.gui.main_window import MainWindow
     parent = MainWindow.__new__(MainWindow)
     parent._results_column_order = ["sti", "symbol", "close", "pct_gain"]
@@ -1866,11 +1866,8 @@ def test_reconcile_prepends_new_columns_to_saved_order(_qapp):
         "avg_vol", "rs_market", "sti",
     ]
     parent._reconcile_column_order_for_scan(canonical)
-    # avg_vol + rs_market are new (canonical order); they prepend
-    assert parent._results_column_order[:2] == ["avg_vol", "rs_market"]
-    # The user's prior layout follows
-    assert parent._results_column_order[2:] == [
-        "sti", "symbol", "close", "pct_gain",
+    assert parent._results_column_order == [
+        "sti", "symbol", "close", "pct_gain", "avg_vol", "rs_market",
     ]
 
 
@@ -1892,14 +1889,17 @@ def test_reconcile_drops_removed_columns(_qapp):
     ]
 
 
-def test_reconcile_empty_saved_order_stays_empty(_qapp):
-    """When the saved order is empty (default), reconcile is a no-op
-    so canonical order applies on the next populate."""
+def test_reconcile_with_nothing_on_screen_records_the_canonical_order(_qapp):
+    """No saved order and no previous results (first scan, or after a
+    preset load): the canonical order stands — and is now RECORDED, so
+    the next scan has a layout to add to (v8.0.2; it used to stay empty
+    and new columns landed wherever their panel row sits)."""
     from trade_scanner_fh.gui.main_window import MainWindow
     parent = MainWindow.__new__(MainWindow)
     parent._results_column_order = []
+    parent._last_results_df = None
     parent._reconcile_column_order_for_scan(["a", "b", "c"])
-    assert parent._results_column_order == []
+    assert parent._results_column_order == ["a", "b", "c"]
 
 
 # ──────────────────────────────────────────────────────────────────────

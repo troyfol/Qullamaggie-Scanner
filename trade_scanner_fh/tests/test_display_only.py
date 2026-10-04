@@ -1035,10 +1035,11 @@ def test_quarter_cap_limits_populated_q_columns(_q_cap_cache):
         assert f"q{k}_reported_eps" not in df.columns
 
 
-def test_quarter_cap_per_side_independent(_q_cap_cache):
-    """EPS cap and Rev cap are independent. Setting EPS cap=4 and
-    Rev cap=2 should produce 4 EPS quarters and 2 Rev quarters
-    in the row."""
+def test_quarter_cap_highest_wins_on_both_sides(_q_cap_cache):
+    """v8.0.2 (the user's rule): the quarter blocks shown are the HIGHEST
+    Q Cap among the active quarter filters, one count for both sides. EPS
+    cap=4 + Rev cap=2 used to give 4 EPS and 2 Rev blocks; now both get 4.
+    Each streak is still counted over its own cap (display only)."""
     from datetime import date as _d
     from trade_scanner_fh import scanner
     from trade_scanner_fh.scanner import ScanParams
@@ -1064,10 +1065,10 @@ def test_quarter_cap_per_side_independent(_q_cap_cache):
     for k in (5, 6):
         assert f"q{k}_report_date_eps" not in df.columns
 
-    # 2 Rev quarters; q3..q6 Rev absent
-    for k in range(1, 3):
+    # Rev follows the shared count too: 4 blocks, not its own cap of 2
+    for k in range(1, 5):
         assert f"q{k}_report_date_rev" in df.columns
-    for k in (3, 4, 5, 6):
+    for k in (5, 6):
         assert f"q{k}_report_date_rev" not in df.columns
 
 
@@ -1092,6 +1093,56 @@ def test_quarter_cap_zero_means_full_population(_q_cap_cache):
     # All 6 quarters present.
     for k in range(1, 7):
         assert f"q{k}_report_date_eps" in df.columns, f"q{k} missing under cap=0"
+
+
+def _cap_scan(**kw):
+    """run_scan over the `_q_cap_cache` ticker with every price filter off."""
+    from datetime import date as _d
+    from trade_scanner_fh import scanner
+    from trade_scanner_fh.scanner import ScanParams
+    p = ScanParams(
+        start_date=_d(2024, 1, 1), end_date=_d(2026, 4, 30),
+        sma1_enabled=False, sma2_enabled=False, sti_enabled=False,
+        dist_high_enabled=False, pct_gain_enabled=False,
+        adr_enabled=False, min_price_enabled=False,
+        avg_vol_enabled=False, dollar_vol_enabled=False, **kw)
+    df = scanner.run_scan(["TKR"], p).results_df
+    assert not df.empty
+    return df
+
+
+def _eps_blocks(df) -> int:
+    return max(k for k in range(1, 21) if f"q{k}_reported_eps" in df.columns)
+
+
+def test_a_wider_cap_widens_the_display_not_the_streak(_q_cap_cache):
+    """v8.0.2, display only: EPS Beats capped at 2 next to an UNCAPPED
+    display-only YoY Growth row shows all 6 quarters, but the beats streak
+    is still counted over its own 2 — every one of TKR's 6 quarters beats,
+    so a pool widened to 6 would report 6."""
+    df = _cap_scan(
+        consec_eps_beats_display_only=True, consec_eps_beats_min=0,
+        consec_eps_beats_quarter_cap=2,
+        consec_eps_growth_display_only=True, consec_eps_growth_min=0,
+        consec_eps_growth_quarter_cap=0)
+    assert _eps_blocks(df) == 6
+    assert int(df["consec_eps_beats"].iloc[0]) == 2
+    alone = _cap_scan(
+        consec_eps_beats_display_only=True, consec_eps_beats_min=0,
+        consec_eps_beats_quarter_cap=0)
+    assert int(alone["consec_eps_beats"].iloc[0]) == 6, \
+        "control: uncapped, the same history counts 6"
+
+
+def test_an_accelerating_rows_cap_counts_toward_the_blocks(_q_cap_cache):
+    """The accelerating rows draw no blocks of their own, but their Q Cap
+    is a quarter cap like any other: uncapped, it widens the beats blocks."""
+    df = _cap_scan(
+        consec_eps_beats_display_only=True, consec_eps_beats_min=0,
+        consec_eps_beats_quarter_cap=2,
+        accel_eps_surp_display_only=True, accel_eps_surp_quarter_cap=0)
+    assert _eps_blocks(df) == 6
+    assert int(df["consec_eps_beats"].iloc[0]) == 2
 
 
 def test_quarter_cap_above_history_safe():

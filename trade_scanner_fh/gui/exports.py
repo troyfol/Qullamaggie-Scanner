@@ -349,23 +349,31 @@ class ExportsController:
         # export is exactly what is on screen, but one tick away.
         prechecked = {k for _h, k, _f in export_columns}
         hidden_types: set = set()
-        for attr in ("_hidden_earnings_col_types", "_hidden_fv_col_types"):
+        # v8.0.2: the EFFECTIVE earnings set, so a default-hidden date column
+        # is re-offered unticked like any other hidden type.
+        try:
+            hidden_types |= set(win._effective_hidden_earnings_types())
+        except (AttributeError, RuntimeError, TypeError):
             try:
-                hidden_types |= set(getattr(win, attr))
+                hidden_types |= set(win._hidden_earnings_col_types)
             except (AttributeError, RuntimeError, TypeError):
                 pass
+        try:
+            hidden_types |= set(win._hidden_fv_col_types)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
         try:
             hidden_keys = set(win._deleted_column_keys)
         except (AttributeError, RuntimeError, TypeError):
             hidden_keys = set()
         offered_hidden = False
         if hidden_types or hidden_keys:
-            from .widgets import column_type_of
+            from .widgets import is_type_hidden
             for col in win._hide_types_source_columns():
                 key = col[1]
                 if key in prechecked:
                     continue
-                if key in hidden_keys or column_type_of(key) in hidden_types:
+                if key in hidden_keys or is_type_hidden(key, hidden_types):
                     export_columns.append(col)
                     offered_hidden = True
 

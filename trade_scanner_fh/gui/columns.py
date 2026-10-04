@@ -4,7 +4,7 @@ Results-table column layout management — extracted from MainWindow
 
 Owns the Columns ▾ dropdown wiring, header-drag order persistence, the
 per-session hidden-column set, the interleave-quarters layout flip, and
-the scan-time reconcile rule (prepend additions / drop removals).
+the scan-time reconcile rule (new columns to the right / drop removals).
 
 Design notes (load-bearing for the test suite — do not "simplify"):
 
@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 
 from .dialogs import ColumnsManagerDialog
-from .widgets import RESULT_COLUMNS
+from .widgets import _Q_COL_RE, RESULT_COLUMNS
 
 # Same logger channel as main_window so the extracted log lines keep
 # their historical "scanner.gui" tag in the panel / subsystem files.
@@ -317,26 +317,80 @@ class ColumnManager:
     def _reconcile_column_order_for_scan(
         self, canonical_keys: list[str],
     ) -> None:
-        """Apply the prepend-additions / drop-removals rule to
-        `_results_column_order` based on a fresh canonical column
-        list (output of `_build_dynamic_columns` for the active
-        period). No-op when the saved order is empty (canonical
-        already wins).
+        """Fold a fresh scan's columns into `_results_column_order`: what was
+        already on screen keeps its place, a column whose filter was switched
+        off drops out, and a NEW column goes to the RIGHT of everything that
+        was there (v8.0.2, the user's rule: "their related metrics … always go
+        to the right of the stuff that was already in the scan").
 
-        Behavior:
-          • Saved order empty → leave it empty (canonical applies).
-          • Saved order non-empty → drop any saved keys NOT in the
-            new canonical set; prepend any new canonical keys NOT
-            already in the saved order, in their canonical order
-            (which mirrors the indicator panel's top-to-bottom
-            arrangement, i.e. "first added = leftmost in table").
+        `canonical_keys` is `_build_dynamic_columns` for the new results.
+        The layout they join is the saved order or, when nothing is saved
+        (never reordered, Reset, an interleave flip), the layout the table is
+        showing for the previous results. With neither — the first scan, or
+        the first after loading a preset — the canonical order stands.
+        Either way the result is stored, so the next scan has a layout to
+        append to; before v8.0.2 an empty order stayed empty (new columns
+        landed wherever their panel row sits) and a saved one took new
+        columns at the FAR LEFT.
+
+        One exception, also the user's choice: extra Q-X blocks on a side
+        that already shows blocks extend that run — Q-5 lands after Q-4, not
+        at the right edge. A side appearing for the first time is new like
+        anything else.
         """
         win = self.win
-        if not win._results_column_order:
-            return
-        canonical_set = set(canonical_keys)
-        saved = list(win._results_column_order)
-        kept = [k for k in saved if k in canonical_set]
-        saved_set = set(kept)
-        additions = [k for k in canonical_keys if k not in saved_set]
-        win._results_column_order = additions + kept
+        base = list(getattr(win, "_results_column_order", []) or [])
+        if not base:
+            base = self._previous_layout_keys()
+        win._results_column_order = merge_new_columns_right(
+            base, list(canonical_keys))
+
+    def _previous_layout_keys(self) -> list[str]:
+        """Keys of the layout the table shows for the results being replaced,
+        hidden columns (by key or by type) included, or [] when there are
+        none. With no saved order that layout is the canonical one."""
+        win = self.win
+        try:
+            df = win._last_results_df
+            if df is None or df.empty:
+                return []
+            return [c[1] for c in win.results_table.unfiltered_columns_for(df)]
+        except (AttributeError, RuntimeError, TypeError) as exc:
+            log.debug("column reconcile: previous layout unavailable: %s", exc)
+            return []
+
+
+def _q_block_side(key: str):
+    """'eps' / 'rev' for a Q-X block column key (``q3_reported_eps``), else
+    None."""
+    m = _Q_COL_RE.match(key)
+    if m is None:
+        return None
+    suffix = m.group(2)
+    if "eps" in suffix:
+        return "eps"
+    if "rev" in suffix:
+        return "rev"
+    return None
+
+
+def merge_new_columns_right(base: list, canonical: list) -> list:
+    """`base` without the keys `canonical` no longer has, then every new key
+    at the right in canonical order — except a new Q-X block key on a side
+    `base` already shows, which goes straight after its canonical
+    predecessor so the quarter run stays contiguous. Empty `base` → the
+    canonical order."""
+    in_scan = set(canonical)
+    out = [k for k in base if k in in_scan]
+    placed = set(out)
+    sides_shown = {s for s in map(_q_block_side, out) if s}
+    for i, key in enumerate(canonical):
+        if key in placed:
+            continue
+        if _q_block_side(key) in sides_shown and i > 0 \
+                and canonical[i - 1] in placed:
+            out.insert(out.index(canonical[i - 1]) + 1, key)
+        else:
+            out.append(key)
+        placed.add(key)
+    return out

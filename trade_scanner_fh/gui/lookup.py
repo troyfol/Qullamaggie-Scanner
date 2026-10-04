@@ -12,14 +12,13 @@ timeframes, custom range or Sequenced Run. Two modes:
 
 The parameter adjustments live in `scanner.lookup_params`; `run_scan(lookup=
 True)` records what happened to each ticker. This module holds the pieces the
-window needs around that: parsing the typed list, matching it to cached
-symbols, the input dialog (built to the Manual Input STW dialog's form
+window needs around that: matching the typed list (parsed by the shared
+`ticker_input.parse_ticker_list`) to cached symbols, the input dialog (built to the Manual Input STW dialog's form
 factor) and the per-ticker report written to the log after each run.
 """
 
 from __future__ import annotations
 
-import re
 from typing import Iterable
 
 from PyQt6.QtWidgets import (
@@ -28,8 +27,9 @@ from PyQt6.QtWidgets import (
 )
 
 from .. import scanner as S
-
-_SPLIT = re.compile(r"[,;\s]+")
+# v8.0.2: the parser is shared by every ticker dialog; re-exported here
+# because the lookup path and its tests reach it as lookup.parse_ticker_list.
+from .ticker_input import INPUT_PROMPT, parse_ticker_list  # noqa: F401
 
 # Pre-lookup earnings refresh choices (v8.0.1). "all" is the three
 # earnings-HISTORY sources — the same set as Data → Run Earnings Smart Refresh
@@ -39,19 +39,6 @@ REFRESH_FINVIZ = "finviz"
 REFRESH_ALL = "all"
 REFRESH_SOURCES = {REFRESH_FINVIZ: ("finviz",),
                    REFRESH_ALL: ("finviz", "zacks", "finnhub")}
-
-
-def parse_ticker_list(text: str) -> list:
-    """Tickers from free text: commas (as the dialog asks), but also
-    newlines, spaces and semicolons, since pasted lists use all of them.
-    Upper-cased, a leading ``$`` dropped, duplicates removed in order."""
-    out, seen = [], set()
-    for tok in _SPLIT.split(text or ""):
-        t = tok.strip().lstrip("$").upper()
-        if t and t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
 
 
 def resolve_tickers(tickers: Iterable[str], cached) -> list:
@@ -148,7 +135,9 @@ class LookupDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 20, 30, 20)
 
-        layout.addWidget(QLabel("Enter tickers (comma-separated):"))
+        prompt = QLabel(INPUT_PROMPT)
+        prompt.setWordWrap(True)
+        layout.addWidget(prompt)
         self.txt = QTextEdit()
         self.txt.setMinimumHeight(120)
         self.txt.setPlaceholderText("AAPL, MSFT, NVDA, TSLA, ...")

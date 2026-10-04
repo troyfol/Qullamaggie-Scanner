@@ -20,14 +20,16 @@ from typing import Optional
 
 import pandas as pd
 
-from PyQt6.QtCore import QSortFilterProxyModel, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import (
+    QEvent, QSortFilterProxyModel, Qt, pyqtSignal, pyqtSlot,
+)
 from PyQt6.QtGui import (
     QColor, QFont, QStandardItem, QStandardItemModel, QValidator,
 )
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QHBoxLayout, QHeaderView, QLabel,
     QMenu, QPushButton, QScrollArea, QSpinBox, QTableView, QTextEdit,
-    QVBoxLayout, QWidget,
+    QToolTip, QVBoxLayout, QWidget,
 )
 
 from .. import config
@@ -1056,8 +1058,10 @@ class IndicatorPanel(QScrollArea):
         # red-on-fail never fires (streak < 0 is impossible). Lets the
         # user surface the streak count + Q-i blocks for context without
         # any threshold gating or red coloring.
-        # Quarter Cap spinbox: 0 = no cap (use full MAX_BEATS_QUARTERS=20),
-        # any value 1-20 limits the rendered Q-i columns to that count.
+        # Quarter Cap spinbox: 0 = no cap; 1-20 limits the quarters this
+        # row's streak is counted over. How many Q-i blocks the table shows
+        # is shared by every active quarter row — the highest cap wins, no
+        # cap = 20 (`scanner.q_block_count`, v8.0.2).
         self._add("consec_eps_beats", "Consecutive EPS Beats", [
             {"name": "min_count", "label": "Min", "type": "int", "default": 3, "min": 0, "max": 50},
             {"name": "threshold_pct", "label": "Threshold %", "type": "float", "default": 0.0, "min": -9999.0, "max": 9999.0, "step": 0.5},
@@ -2104,34 +2108,50 @@ RESULT_COLUMNS = [
     # NaN means "no qualifying window", which the table renders as N/A.
     # v8.0.0: the growth filters gained the accelerating filters' Span / V
     # pair, so the run a count describes can be read off the row.
+    # v8.0.2: Start / End are the REPORT dates of the run's first and last
+    # quarters (Span shows their fiscal quarters). Hidden by default through
+    # Hide Q Columns — the user's rule: every earnings filter produces a date
+    # column, and only the beats rows show theirs (the Q-X Dates) by default.
     ("Consec YoY EPS Grw", "consec_eps_growth",  lambda x: str(int(x))),
     ("Consec YoY EPS Grw Span", "consec_eps_growth_span", str),
     ("Consec YoY EPS Grw V", "consec_eps_growth_vals", str),
+    ("Consec YoY EPS Grw Start", "consec_eps_growth_start_date", _fmt_date),
+    ("Consec YoY EPS Grw End", "consec_eps_growth_end_date", _fmt_date),
     ("Consec YoY EPS Grw Avg", "consec_eps_growth_period_avg", _fmt_period_pct),
     ("Consec YoY EPS Grw Max", "consec_eps_growth_period_max", _fmt_period_pct),
     ("Consec YoY Rev Grw", "consec_rev_growth",  lambda x: str(int(x))),
     ("Consec YoY Rev Grw Span", "consec_rev_growth_span", str),
     ("Consec YoY Rev Grw V", "consec_rev_growth_vals", str),
+    ("Consec YoY Rev Grw Start", "consec_rev_growth_start_date", _fmt_date),
+    ("Consec YoY Rev Grw End", "consec_rev_growth_end_date", _fmt_date),
     ("Consec YoY Rev Grw Avg", "consec_rev_growth_period_avg", _fmt_period_pct),
     ("Consec YoY Rev Grw Max", "consec_rev_growth_period_max", _fmt_period_pct),
     ("Accel EPS Surp Q",  "accel_eps_surp_len",  lambda x: str(int(x))),
     ("Accel EPS Surp Span", "accel_eps_surp_span", str),
     ("Accel EPS Surp V",  "accel_eps_surp_vals", str),
+    ("Accel EPS Surp Start", "accel_eps_surp_start_date", _fmt_date),
+    ("Accel EPS Surp End", "accel_eps_surp_end_date", _fmt_date),
     ("Accel EPS Surp Avg", "accel_eps_surp_period_avg", _fmt_period_pct),
     ("Accel EPS Surp Max", "accel_eps_surp_period_max", _fmt_period_pct),
     ("Accel Rev Surp Q",  "accel_rev_surp_len",  lambda x: str(int(x))),
     ("Accel Rev Surp Span", "accel_rev_surp_span", str),
     ("Accel Rev Surp V",  "accel_rev_surp_vals", str),
+    ("Accel Rev Surp Start", "accel_rev_surp_start_date", _fmt_date),
+    ("Accel Rev Surp End", "accel_rev_surp_end_date", _fmt_date),
     ("Accel Rev Surp Avg", "accel_rev_surp_period_avg", _fmt_period_pct),
     ("Accel Rev Surp Max", "accel_rev_surp_period_max", _fmt_period_pct),
     ("Accel YoY EPS Q",   "accel_eps_yoy_len",   lambda x: str(int(x))),
     ("Accel YoY EPS Span", "accel_eps_yoy_span", str),
     ("Accel YoY EPS V",   "accel_eps_yoy_vals",  str),
+    ("Accel YoY EPS Start", "accel_eps_yoy_start_date", _fmt_date),
+    ("Accel YoY EPS End", "accel_eps_yoy_end_date", _fmt_date),
     ("Accel YoY EPS Avg", "accel_eps_yoy_period_avg", _fmt_period_pct),
     ("Accel YoY EPS Max", "accel_eps_yoy_period_max", _fmt_period_pct),
     ("Accel YoY Rev Q",   "accel_rev_yoy_len",   lambda x: str(int(x))),
     ("Accel YoY Rev Span", "accel_rev_yoy_span", str),
     ("Accel YoY Rev V",   "accel_rev_yoy_vals",  str),
+    ("Accel YoY Rev Start", "accel_rev_yoy_start_date", _fmt_date),
+    ("Accel YoY Rev End", "accel_rev_yoy_end_date", _fmt_date),
     ("Accel YoY Rev Avg", "accel_rev_yoy_period_avg", _fmt_period_pct),
     ("Accel YoY Rev Max", "accel_rev_yoy_period_max", _fmt_period_pct),
 ]
@@ -2294,6 +2314,9 @@ def _series_filter_keys(prefix: str) -> frozenset:
     keys = {count_key, f"{prefix}_period_avg", f"{prefix}_period_max"}
     if prefix in _ACCEL_PREFIXES or "_growth" in prefix:
         keys |= {f"{prefix}_span", f"{prefix}_vals"}
+        # v8.0.2: "all cols" means all — the run's Start / End dates too,
+        # though they also have a "Dates" tick of their own below.
+        keys |= {f"{prefix}_start_date", f"{prefix}_end_date"}
     return frozenset(keys)
 
 
@@ -2313,35 +2336,75 @@ _SERIES_TYPE_KEYS: dict[str, frozenset] = {
     for prefix in _SERIES_PREFIXES
 }
 
+# v8.0.2 — one "Dates" tick per non-beats earnings filter (the user's
+# choice). Every one of these is HIDDEN BY DEFAULT: the user's rule is that
+# all earnings filters produce a date column but only the beats rows show
+# theirs (the Q-X Dates) unless asked. A date column of a series filter also
+# belongs to that filter's "(all cols)" type, so it has two ticks; it is
+# hidden when either is.
+_DATE_TYPE_PREFIXES: tuple[str, ...] = (
+    "consec_eps_growth", "consec_rev_growth", *_ACCEL_PREFIXES,
+)
+_DATE_TYPE_LABELS: tuple[tuple[str, str], ...] = (
+    ("dates_last_report",        "Last Report Date"),
+    ("dates_consec_eps_growth",  "Consec YoY EPS Growth Dates"),
+    ("dates_consec_rev_growth",  "Consec YoY Rev Growth Dates"),
+    ("dates_accel_eps_surp",     "Accel EPS Surp Dates"),
+    ("dates_accel_rev_surp",     "Accel Rev Surp Dates"),
+    ("dates_accel_eps_yoy",      "Accel YoY EPS Dates"),
+    ("dates_accel_rev_yoy",      "Accel YoY Rev Dates"),
+)
+_DATE_TYPE_KEYS: dict[str, frozenset] = {
+    "dates_last_report": frozenset({"last_report_date"}),
+    **{f"dates_{p}": frozenset({f"{p}_start_date", f"{p}_end_date"})
+       for p in _DATE_TYPE_PREFIXES},
+}
+
+#: Types hidden unless the user unticks them (MainWindow keeps the set of
+#: those it was asked to show).
+DEFAULT_HIDDEN_EARNINGS_TYPES: frozenset = frozenset(_DATE_TYPE_KEYS)
+
+#: The series filters' Start / End report-date columns. Real report dates, so
+#: they anchor their own date-match colour like Last Report Date does.
+_RUN_DATE_KEYS: frozenset = frozenset(
+    k for p in _DATE_TYPE_PREFIXES
+    for k in (f"{p}_start_date", f"{p}_end_date"))
+
 EARNINGS_COLUMN_TYPES: tuple[tuple[str, str], ...] = (
-    _Q_TYPE_LABELS + _SERIES_TYPE_LABELS
+    _Q_TYPE_LABELS + _SERIES_TYPE_LABELS + _DATE_TYPE_LABELS
 )
 EARNINGS_COLUMN_TYPE_LABELS: dict[str, str] = dict(EARNINGS_COLUMN_TYPES)
 
-# Reverse index: exact key -> series type id. Built once at import.
-_SERIES_KEY_TO_TYPE: dict[str, str] = {
-    key: type_id
-    for type_id, keys in _SERIES_TYPE_KEYS.items()
-    for key in keys
-}
+# Reverse index: exact key -> every series / date type it belongs to, in
+# menu order. Built once at import.
+_KEY_TO_TYPES: dict[str, tuple] = {}
+for _type_id, _keys in list(_SERIES_TYPE_KEYS.items()) + list(
+        _DATE_TYPE_KEYS.items()):
+    for _key in _keys:
+        _KEY_TO_TYPES[_key] = _KEY_TO_TYPES.get(_key, ()) + (_type_id,)
+del _type_id, _keys, _key
+
+
+def earnings_column_types_of(key: str) -> tuple:
+    """Every hideable earnings type a results column belongs to — usually
+    one, two for a series filter's Start / End date (v8.0.2). Empty for a
+    column the taxonomy does not cover, which keeps it visible: the safe
+    direction to fail."""
+    hits = _KEY_TO_TYPES.get(key)
+    if hits:
+        return hits
+    m = _Q_COL_RE.match(key)
+    if m is None:
+        return ()
+    type_id = f"q_{m.group(2)}"
+    return (type_id,) if type_id in EARNINGS_COLUMN_TYPE_LABELS else ()
 
 
 def earnings_column_type_of(key: str):
-    """The hideable type a results column belongs to, or None.
-
-    None means "not an earnings column type" — every non-earnings column, and
-    any earnings column the taxonomy does not cover, is simply never hideable
-    through this control. Returning None rather than raising keeps an
-    unrecognised key visible, which is the safe direction to fail.
-    """
-    hit = _SERIES_KEY_TO_TYPE.get(key)
-    if hit is not None:
-        return hit
-    m = _Q_COL_RE.match(key)
-    if m is None:
-        return None
-    type_id = f"q_{m.group(2)}"
-    return type_id if type_id in EARNINGS_COLUMN_TYPE_LABELS else None
+    """The first hideable type a results column belongs to, or None. Use
+    `earnings_column_types_of` to decide whether a column is hidden."""
+    hits = earnings_column_types_of(key)
+    return hits[0] if hits else None
 
 
 def present_earnings_column_types(columns) -> list:
@@ -2354,8 +2417,7 @@ def present_earnings_column_types(columns) -> list:
     """
     counts: dict[str, int] = {}
     for _h, key, _f in columns:
-        type_id = earnings_column_type_of(key)
-        if type_id is not None:
+        for type_id in earnings_column_types_of(key):
             counts[type_id] = counts.get(type_id, 0) + 1
     return [
         (tid, EARNINGS_COLUMN_TYPE_LABELS[tid], counts[tid])
@@ -2417,8 +2479,20 @@ def present_fv_column_types(columns) -> list:
 
 
 def column_type_of(key: str):
-    """The hideable type of a column across BOTH families, or None."""
+    """The first hideable type of a column across BOTH families, or None."""
     return earnings_column_type_of(key) or fv_column_type_of(key)
+
+
+def column_types_of(key: str) -> tuple:
+    """Every hideable type of a column across BOTH families."""
+    fv = fv_column_type_of(key)
+    return earnings_column_types_of(key) + ((fv,) if fv else ())
+
+
+def is_type_hidden(key: str, hidden_types) -> bool:
+    """True when ANY of the column's types is in `hidden_types` (v8.0.2: a
+    series filter's Start / End date has two)."""
+    return any(t in hidden_types for t in column_types_of(key))
 
 
 def _format_optional(val, fmt) -> str:
@@ -2495,7 +2569,7 @@ _SELF_ANCHOR_DATE_COLS: frozenset[str] = frozenset({
     "max_gap_date", "min_gap_date", "up_gap_start_date",
     "down_gap_start_date", "surge_start_date", "surge_end_date",
     "last_report_date", "gain_start_date",
-})
+}) | _RUN_DATE_KEYS
 
 
 # Column keys whose anchor IS an earnings report_date by construction.
@@ -2511,7 +2585,7 @@ _EARNINGS_ANCHOR_TOP_LEVEL: frozenset[str] = frozenset({
     "yoy_eps_pct",
     "reported_rev", "surprise_rev_dollar", "surprise_rev_pct",
     "yoy_rev_pct",
-})
+}) | _RUN_DATE_KEYS
 
 
 def _is_earnings_anchor_key(key: str) -> bool:
@@ -2615,6 +2689,91 @@ def _anchor_date_value(key: str, row_data):
     if key in ("reported_rev", "surprise_rev_dollar", "surprise_rev_pct",
                "yoy_rev_pct"):
         return _first_present(row_data, "last_report_date", "q1_report_date_rev")
+    return None
+
+
+# ── Hover tooltip on earnings cells (v8.0.2) ───────────────────────────
+#
+# Hovering an earnings cell names the quarter it belongs to: the report date
+# and the fiscal quarter (the user's choice — the fiscal quarter tells a late
+# filing apart from report order). Built on demand by `ResultsTable` when a
+# tooltip is asked for, never during populate, so a 15k-row render pays
+# nothing for it. Reads table-internal keys the scanner writes alongside the
+# cells: `_q{k}_period_ending`, `_last_period_ending`,
+# `_{prefix}_start/end_date` and `_start/end_period`, `_last/_next_er_date`.
+
+_CURR_TIP_KEYS: frozenset = frozenset({
+    "reported_eps", "surprise_eps_dollar", "surprise_eps_pct", "yoy_eps_pct",
+    "reported_rev", "surprise_rev_dollar", "surprise_rev_pct", "yoy_rev_pct",
+    "last_report_date",
+})
+
+# Every column a series filter emits -> its prefix.
+_TIP_SERIES_PREFIX: dict[str, str] = {
+    key: prefix for prefix in _SERIES_PREFIXES
+    for key in _series_filter_keys(prefix)
+}
+
+
+def _tip_date(value, fmt: str = "%Y-%m-%d"):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+        return pd.Timestamp(value).strftime(fmt)
+    except (TypeError, ValueError):
+        return None
+
+
+def cell_tooltip(key: str, row_data):
+    """The hover text for one cell, or None for a cell that has none.
+
+    Q-X cells: ``Q-3 · reported 2026-02-10 · fiscal quarter 2025-12``.
+    Current (most-recent quarter) cells and Last Report Date: the same for
+    the quarter they show. A series filter's cells: the run's first → last
+    report dates and fiscal quarters. Days Since / Until ER: the date.
+    """
+    m = _Q_COL_RE.match(key)
+    if m is not None:
+        k, suffix = m.group(1), m.group(2)
+        side = "eps" if "_eps" in suffix else "rev" if "_rev" in suffix else None
+        date = _tip_date(row_data.get(f"q{k}_report_date_{side}")) if side else None
+        if date is None:
+            return None
+        fq = _tip_date(row_data.get(f"_q{k}_period_ending"), "%Y-%m")
+        return " · ".join([f"Q-{k}", f"reported {date}"]
+                          + ([f"fiscal quarter {fq}"] if fq else []))
+    if key in _CURR_TIP_KEYS:
+        side = "rev" if "_rev" in key else "eps"
+        date = _tip_date(_first_present(
+            row_data, "last_report_date", f"q1_report_date_{side}"))
+        if date is None:
+            return None
+        fq = _tip_date(_first_present(
+            row_data, "_last_period_ending", "_q1_period_ending"), "%Y-%m")
+        return " · ".join(["Most recent quarter", f"reported {date}"]
+                          + ([f"fiscal quarter {fq}"] if fq else []))
+    prefix = _TIP_SERIES_PREFIX.get(key)
+    if prefix is not None:
+        start = _tip_date(_first_present(
+            row_data, f"_{prefix}_start_date", f"{prefix}_start_date"))
+        end = _tip_date(_first_present(
+            row_data, f"_{prefix}_end_date", f"{prefix}_end_date"))
+        if start is None and end is None:
+            return None
+        parts = ["Run", f"reported {start or '?'} → {end or '?'}"]
+        sq = _tip_date(row_data.get(f"_{prefix}_start_period"), "%Y-%m")
+        eq = _tip_date(row_data.get(f"_{prefix}_end_period"), "%Y-%m")
+        if sq or eq:
+            parts.append(f"fiscal quarters {sq or '?'} → {eq or '?'}")
+        return " · ".join(parts)
+    if key == "days_since_er":
+        date = _tip_date(row_data.get("_last_er_date"))
+        return f"Last earnings report {date}" if date else None
+    if key == "days_until_er":
+        date = _tip_date(row_data.get("_next_er_date"))
+        return f"Next earnings report {date}" if date else None
     return None
 
 
@@ -2814,7 +2973,7 @@ def _build_dynamic_columns(
         cols = [
             (h, k, f) for h, k, f in cols
             if k in _ALWAYS_VISIBLE_KEYS
-            or column_type_of(k) not in hidden_types
+            or not is_type_hidden(k, hidden_types)
         ]
 
     # Individually hidden columns (header right-click / Columns dialog)
@@ -3553,6 +3712,9 @@ class ResultsTable(QTableView):
         # Individually hidden column KEYS (v8.0.0). Applied to the layout,
         # never to the frame — see the foot of `_build_dynamic_columns`.
         self._hidden_column_keys: frozenset = frozenset()
+        # The frame on screen, for hover tooltips (v8.0.2). Source-model row
+        # r is frame row r; `viewportEvent` builds the text on demand.
+        self._tip_df = None
         # Colour rules (v8.0.0). A table nobody configures paints the
         # pre-v8 schemes, because the defaults ARE those schemes.
         from . import coloring as _coloring
@@ -3798,6 +3960,37 @@ class ResultsTable(QTableView):
         in the most recent populate() call."""
         return self._active_n_eps_quarters, self._active_n_rev_quarters
 
+    def viewportEvent(self, event):
+        """Hover tooltip on earnings cells (v8.0.2): the quarter a cell
+        belongs to (`cell_tooltip`). Answered on demand from the frame on
+        screen, so populate pays nothing; any failure just shows no tip."""
+        if event.type() == QEvent.Type.ToolTip:
+            text = None
+            try:
+                text = self._tooltip_at(event.pos())
+            except Exception as exc:
+                log.debug("cell tooltip failed: %s", exc)
+            if text:
+                QToolTip.showText(event.globalPos(), text, self.viewport())
+            else:
+                QToolTip.hideText()
+            return True
+        return super().viewportEvent(event)
+
+    def _tooltip_at(self, pos):
+        """Tooltip text for the cell under viewport position `pos`."""
+        df = self._tip_df
+        if df is None or df.empty:
+            return None
+        index = self.indexAt(pos)
+        if not index.isValid():
+            return None
+        src = self.proxy.mapToSource(index)
+        r, c = src.row(), src.column()
+        if not (0 <= r < len(df) and 0 <= c < len(self._active_columns)):
+            return None
+        return cell_tooltip(self._active_columns[c][1], df.iloc[r])
+
     def current_column_order(self) -> list[str]:
         """Return the column keys in their CURRENT visual order
         (after any user reorder). Used by Excel export to write
@@ -4007,6 +4200,7 @@ class ResultsTable(QTableView):
             self._populate_in_flight = False
 
     def _populate_impl(self, df):
+        self._tip_df = df if df is not None and not df.empty else None
         was_sortable = self.isSortingEnabled()
         self.setSortingEnabled(False)
         # Critical perf wrappers — measured against a 379-row × 97-col

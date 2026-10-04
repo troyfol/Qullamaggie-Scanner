@@ -1240,8 +1240,10 @@ def _compute_ticker(
 
         if last_e is not None:
             row["days_since_er"] = (end_ts - last_e).days
+            row["_last_er_date"] = last_e       # hover tooltip (v8.0.2)
         if next_e is not None:
             row["days_until_er"] = (next_e - end_ts).days
+            row["_next_er_date"] = next_e       # hover tooltip (v8.0.2)
 
     # --- Per-quarter Zacks earnings (Phase 7 §7.1 + §7.3) ---
     # Audit H2: always populate the seven single-quarter columns when
@@ -1376,11 +1378,12 @@ def _compute_ticker(
                 if (params.yoy_rev_pct_enabled
                         or params.yoy_rev_pct_display_only):
                     row["yoy_rev_pct"] = mr.get("yoy_rev_pct")
-                # last_report_date: include ONLY when at least one
-                # individual earnings stat is active AND no beat is
-                # active. When beats is on, the Q-1 Date column shows
-                # the same date — last_report_date would be pure
-                # redundancy.
+                # last_report_date: whenever at least one individual
+                # earnings stat is active (v8.0.2). It used to be dropped
+                # beside Q-X blocks as redundant with Q-1 Date; the user's
+                # rule is that every earnings filter produces a date column,
+                # so it is always produced and instead HIDDEN by default
+                # (Hide Q Columns → "Last Report Date").
                 _individual_active = (
                     params.reported_eps_enabled
                     or params.reported_eps_display_only
@@ -1399,46 +1402,32 @@ def _compute_ticker(
                     or params.yoy_rev_pct_enabled
                     or params.yoy_rev_pct_display_only
                 )
-                _beats_active = (
-                    params.consec_eps_beats_enabled
-                    or params.consec_eps_beats_display_only
-                    or params.consec_rev_beats_enabled
-                    or params.consec_rev_beats_display_only
-                )
-                # v8.0.0: the growth filters draw Q-X blocks too, so their
-                # Q-1 Date makes last_report_date just as redundant.
-                _q_blocks_active = _beats_active or any(
-                    getattr(params, f"{prefix}_enabled")
-                    or getattr(params, f"{prefix}_display_only")
-                    for prefix, _metric in _GROWTH_FILTERS
-                )
-                if _individual_active and not _q_blocks_active:
+                if _individual_active:
                     row["last_report_date"] = mr.get("report_date")
+                    # Table-internal: the fiscal quarter for the hover
+                    # tooltip on the Curr cells (v8.0.2).
+                    row["_last_period_ending"] = mr.get("period_ending")
 
                 # Beats streaks computed only on the past slice — future
                 # quarters relative to end_ts must not contribute, so
                 # historical replays produce point-in-time-correct counts.
-                # Phase 8 §8.3: when beats are active, also stash up to
-                # MAX_BEATS_QUARTERS most-recent quarters per metric as
-                # `qK_*` flat columns. The table model uses these to
-                # render the multi-quarter wide-format display.
-                # `consec_*_beats_quarter_cap` (default 0 = no cap)
-                # narrows the per-side population to the requested
-                # quarter count — useful when the user only cares about
-                # the last 4 quarters and doesn't want 20 columns of
-                # noise. Cap is independent per side so EPS and Rev
-                # can use different limits.
+                # Phase 8 §8.3: when beats are active, also stash the
+                # most-recent quarters per metric as `qK_*` flat columns.
+                # The table model uses these to render the multi-quarter
+                # wide-format display. How MANY is `q_block_count` (v8.0.2):
+                # the highest Q Cap among every active quarter filter, the
+                # same count on both sides — before, each beats row drew
+                # its own cap.
                 _eps_cap = params.consec_eps_beats_quarter_cap
-                _eps_n = MAX_BEATS_QUARTERS if _eps_cap <= 0 else min(_eps_cap, MAX_BEATS_QUARTERS)
                 _rev_cap = params.consec_rev_beats_quarter_cap
-                _rev_n = MAX_BEATS_QUARTERS if _rev_cap <= 0 else min(_rev_cap, MAX_BEATS_QUARTERS)
-                # The Q Cap is pool-defining for the STREAK as well as
-                # the columns: `compute_consecutive_beats` sees only the
-                # capped quarters, so a cap of 4 can never report a
-                # streak of 5. Deliberately NOT `_eps_n` — that carries
-                # the MAX_BEATS_QUARTERS=20 display ceiling, which must
-                # not silently truncate an uncapped streak that runs
-                # past 20 quarters. cap<=0 stays genuinely uncapped.
+                _n_blocks = q_block_count(params)
+                # The Q Cap is pool-defining for the STREAK: the run sees
+                # only the capped quarters, so a cap of 4 can never report
+                # a streak of 5 — whatever another filter's cap widens the
+                # DISPLAY to. Deliberately not `_n_blocks`, which carries
+                # the MAX_BEATS_QUARTERS=20 display ceiling and must not
+                # silently truncate an uncapped streak that runs past 20
+                # quarters. cap<=0 stays genuinely uncapped.
                 _eps_pool = past_pref if _eps_cap <= 0 else past_pref.head(_eps_cap)
                 _rev_pool = past_pref if _rev_cap <= 0 else past_pref.head(_rev_cap)
                 if params.consec_eps_beats_enabled or params.consec_eps_beats_display_only:
@@ -1449,9 +1438,11 @@ def _compute_ticker(
                         0 if _eps_series is None else _eps_series.length
                     )
                     _write_period_stats(row, "consec_eps_beats", _eps_series)
+                    _write_run_dates(row, "consec_eps_beats", _eps_series,
+                                     columns=False)
                     _write_run_quarters(
                         row, "consec_eps_beats", past_pref, _eps_series)
-                    _write_q_blocks(row, past_pref, "eps", _eps_n)
+                    _write_q_blocks(row, past_pref, "eps", _n_blocks)
                 if params.consec_rev_beats_enabled or params.consec_rev_beats_display_only:
                     _rev_series = _beats_series(
                         _rev_pool, "surprise_rev_pct", params, "consec_rev_beats",
@@ -1460,9 +1451,11 @@ def _compute_ticker(
                         0 if _rev_series is None else _rev_series.length
                     )
                     _write_period_stats(row, "consec_rev_beats", _rev_series)
+                    _write_run_dates(row, "consec_rev_beats", _rev_series,
+                                     columns=False)
                     _write_run_quarters(
                         row, "consec_rev_beats", past_pref, _rev_series)
-                    _write_q_blocks(row, past_pref, "rev", _rev_n)
+                    _write_q_blocks(row, past_pref, "rev", _n_blocks)
 
                 # --- Quarter-series filters (earnings-filters-spec) ---
                 # Both families read the same `past_pref` slice the beats
@@ -1549,8 +1542,8 @@ def _write_q_blocks(row: dict, past_pref, side: str, n: int) -> None:
     order the table has always used. Each block carries its own date key
     (`q{k}_report_date_eps` / `_rev`) so the EPS and Rev blocks can be
     coloured independently even though one report covers both. Idempotent:
-    beats and growth both call this for the same side and simply agree on
-    the values, so the side shows as many blocks as its widest filter asks.
+    beats and growth both call this for the same side with the same `n`
+    (`q_block_count`) and simply agree on the values.
     """
     if n <= 0:
         return
@@ -1558,6 +1551,36 @@ def _write_q_blocks(row: dict, past_pref, side: str, n: int) -> None:
     for k, (_, q) in enumerate(past_pref.head(n).iterrows(), 1):
         for suffix, col in fields:
             row[f"q{k}_{suffix}"] = q.get(col)
+        # Table-internal (v8.0.2): the quarter's fiscal period for the hover
+        # tooltip. One key per quarter — EPS and Rev share the report.
+        row[f"_q{k}_period_ending"] = q.get("period_ending")
+
+
+def _write_run_dates(row: dict, prefix: str, series, *, columns: bool) -> None:
+    """A run's first / last quarter: report dates and fiscal quarters (v8.0.2).
+
+    `columns=True` (growth + accelerating rows) writes the visible
+    `{prefix}_start_date` / `{prefix}_end_date` columns — the user's rule that
+    every earnings filter produces a date column; they are hidden by default
+    through Hide Q Columns. The beats rows already show their quarters' dates
+    in the Q-X blocks, so for them (`columns=False`) the report dates go to
+    table-internal `_{prefix}_start_date` / `_end_date` keys for the hover
+    tooltip only. Both get `_{prefix}_start_period` / `_end_period`.
+
+    Always writes every key, None when there is no run, so the columns exist
+    whenever the filter ran.
+    """
+    ok = series is not None and getattr(series, "length", 0) > 0
+    start = series.start_report_date if ok else None
+    end = series.end_report_date if ok else None
+    if columns:
+        row[f"{prefix}_start_date"] = start
+        row[f"{prefix}_end_date"] = end
+    else:
+        row[f"_{prefix}_start_date"] = start
+        row[f"_{prefix}_end_date"] = end
+    row[f"_{prefix}_start_period"] = series.start_period if ok else None
+    row[f"_{prefix}_end_period"] = series.end_period if ok else None
 
 
 def _run_quarter_indices(past_pref, periods) -> list:
@@ -1668,6 +1691,38 @@ _GROWTH_FILTERS: tuple[tuple[str, str], ...] = (
     ("consec_rev_growth", "yoy_rev_pct"),
 )
 
+# Every filter row that carries a Q Cap, by param prefix.
+_Q_CAP_FILTERS: tuple[str, ...] = (
+    ("consec_eps_beats", "consec_rev_beats")
+    + tuple(prefix for prefix, _ in _GROWTH_FILTERS)
+    + tuple(prefix for prefix, _ in _ACCEL_FILTERS)
+)
+
+
+def q_block_count(params: "ScanParams") -> int:
+    """How many Q-X blocks each side draws (v8.0.2): the HIGHEST Q Cap among
+    the active quarter filters — enabled or display-only, all eight rows —
+    where 0 (no cap) is the highest of all; never more than
+    MAX_BEATS_QUARTERS. 0 when no quarter filter is active.
+
+    One count for EPS and Rev alike (the user's rule, 2026-10-02). Before
+    this each filter drew its own cap per side, and "no cap" meant 20 blocks
+    on a beats row but only back to the run's oldest counted quarter on a
+    growth row, so the table's quarter depth depended on which filter asked.
+
+    DISPLAY ONLY: every filter still evaluates over its own cap, so a preset
+    selects exactly the tickers it did before.
+    """
+    caps = [int(getattr(params, f"{prefix}_quarter_cap") or 0)
+            for prefix in _Q_CAP_FILTERS
+            if getattr(params, f"{prefix}_enabled")
+            or getattr(params, f"{prefix}_display_only")]
+    if not caps:
+        return 0
+    if min(caps) <= 0:
+        return MAX_BEATS_QUARTERS
+    return min(max(caps), MAX_BEATS_QUARTERS)
+
 
 def _fmt_series_span(start, end) -> str:
     """Render an accelerating series' start and end *fiscal quarters* as
@@ -1767,10 +1822,10 @@ def _populate_quarter_series(row: dict, params: "ScanParams", past_pref) -> None
         _write_period_stats(row, prefix, growth)
         # v8.0.0: the growth filters show their quarters the way the beats
         # filters always have. Span / V condense the run like the
-        # accelerating filters' cells; the Q-X blocks show every quarter the
-        # run could read — the whole capped pool, or, uncapped, back to the
-        # run's oldest counted quarter (at least Q-1) so a 25-year pool does
-        # not become 20 blocks of noise.
+        # accelerating filters' cells. The Q-X block COUNT is shared by every
+        # active quarter filter (`q_block_count`, v8.0.2); before, an
+        # uncapped growth row drew only back to its run's oldest counted
+        # quarter while an uncapped beats row drew 20.
         if length > 0:
             row[f"{prefix}_span"] = _fmt_series_span(
                 growth.start_period, growth.end_period)
@@ -1781,13 +1836,10 @@ def _populate_quarter_series(row: dict, params: "ScanParams", past_pref) -> None
         else:
             row[f"{prefix}_span"] = None
             row[f"{prefix}_vals"] = None
+        _write_run_dates(row, prefix, growth, columns=True)
         _write_run_quarters(row, prefix, past_pref, growth)
         side = "eps" if "_eps_" in prefix else "rev"
-        if cap and cap > 0:
-            n_blocks = min(int(cap), MAX_BEATS_QUARTERS)
-        else:
-            n_blocks = max([1] + list(row[f"_{prefix}_qs"]))
-        _write_q_blocks(row, past_pref, side, n_blocks)
+        _write_q_blocks(row, past_pref, side, q_block_count(params))
 
     for prefix, metric_key in _ACCEL_FILTERS:
         if not (getattr(params, f"{prefix}_enabled")
@@ -1809,6 +1861,7 @@ def _populate_quarter_series(row: dict, params: "ScanParams", past_pref) -> None
                 past_pref, points, quarter_cap=cap),
         )
         _write_run_quarters(row, prefix, past_pref, result)
+        _write_run_dates(row, prefix, result, columns=True)
         if result is None:
             # No quarter in the pool carries this metric at all. Leave
             # `_len` as NaN rather than 0: 0 would read as "a series of

@@ -183,6 +183,10 @@ class HideManager:
         win._deleted_column_keys = set(data.get("column_hidden") or [])
         win._hidden_earnings_col_types = set(
             data.get("hidden_earnings_col_types") or [])
+        # v8.0.2: the default-hidden date types the preset showed. Absent
+        # (every pre-8.0.2 preset) means none shown — hidden by default.
+        win._shown_default_earnings_col_types = set(
+            data.get("shown_default_earnings_col_types") or [])
         win._hidden_fv_col_types = set(data.get("hidden_fv_col_types") or [])
         win._hide_undo_stack = []
 
@@ -227,7 +231,7 @@ class HideManager:
         if not cols:
             return []
         from .widgets import (
-            RESULT_COLUMNS, earnings_column_type_of, fv_column_type_of,
+            RESULT_COLUMNS, earnings_column_types_of, fv_column_type_of,
         )
         win = self.win
         try:
@@ -237,9 +241,10 @@ class HideManager:
         header_of = {k: h for h, k, _f in RESULT_COLUMNS}
         header_of.update({k: h for h, k, _f in layout})
         in_scan = [k for _h, k, _f in layout if k in cols]
+        # v8.0.2: the EFFECTIVE set — default-hidden date types included.
         try:
-            q_hidden = set(win._hidden_earnings_col_types)
-        except (AttributeError, RuntimeError):
+            q_hidden = set(win._effective_hidden_earnings_types())
+        except (AttributeError, RuntimeError, TypeError):
             q_hidden = set()
         try:
             fv_hidden = set(win._hidden_fv_col_types)
@@ -248,7 +253,7 @@ class HideManager:
         items, locked = [], []
         for key in in_scan:
             head = header_of.get(key, key)
-            if earnings_column_type_of(key) in q_hidden:
+            if any(t in q_hidden for t in earnings_column_types_of(key)):
                 locked.append((f"{head}  (hidden by Hide Q Columns)", key, False))
             elif fv_column_type_of(key) in fv_hidden:
                 locked.append((f"{head}  (hidden by Hide FV Columns)", key, False))

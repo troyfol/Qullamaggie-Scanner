@@ -65,6 +65,9 @@ from .lookup import (
 )
 from .hotkey_dialog import HotkeySettingsDialog
 from .theme import build_stylesheet
+from .ticker_input import (
+    FORMAT_NOTE, INPUT_PROMPT, parse_ticker_list, strip_qualifiers,
+)
 from .widgets import (
     _fmt_date, IndicatorPanel, LogPanel, QtLogHandler, RESULT_COLUMNS,
     ResultsTable,
@@ -1570,10 +1573,17 @@ class MainWindow(QMainWindow):
         # scan stay in the set so a preset saved against a wider scan still
         # means what it said when a narrower one is run.
         self._hidden_earnings_col_types: set[str] = set()
+        # v8.0.2: the earnings DATE types (widgets.DEFAULT_HIDDEN_EARNINGS_
+        # TYPES) are hidden unless unticked; this is the set the user
+        # unticked. Saved with presets like the hidden set.
+        self._shown_default_earnings_col_types: set[str] = set()
         # FV column CATEGORIES hidden via the Hide FV Columns dropdown
         # (v8.0.0). Kept apart from the earnings set so each dropdown's Show
         # All clears only its own family; the table receives the union.
         self._hidden_fv_col_types: set[str] = set()
+        # The table must hold the default-hidden types before the first
+        # scan renders, or its date columns would show once (v8.0.2).
+        self._apply_hidden_column_types(rerender=False)
         self._hide_mgr.refresh_indicators()
         # Colour rules (v8.0.0) — the session's working set, saved with a
         # preset as `color_rules`. The table holds its own copy
@@ -2965,7 +2975,7 @@ class MainWindow(QMainWindow):
             )
 
     def _rebuild_tickers_dialog(self):
-        """Phase 4 R9: prompt for comma-separated tickers, delete each one's
+        """Phase 4 R9: prompt for tickers, delete each one's
         parquet cache, and trigger a fresh download via the parallel
         download_many pipeline. Used when cached prices look wrong (most
         commonly from a stock split that pre-dated the cache)."""
@@ -2974,10 +2984,12 @@ class MainWindow(QMainWindow):
         dlg.setMinimumWidth(520)
         layout = QVBoxLayout(dlg)
 
-        layout.addWidget(QLabel(
-            "Enter tickers to rebuild (comma-separated). "
+        prompt = QLabel(
+            f"Enter tickers to rebuild ({FORMAT_NOTE}). "
             "Their cached parquet will be deleted and re-downloaded."
-        ))
+        )
+        prompt.setWordWrap(True)
+        layout.addWidget(prompt)
         txt = QTextEdit()
         txt.setPlaceholderText("e.g. AAPL, TSLA, NVDA")
         txt.setMinimumHeight(100)
@@ -3001,9 +3013,7 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        raw = txt.toPlainText()
-        syms = [t.strip().upper() for t in raw.replace("\n", ",").split(",")
-                if t.strip()]
+        syms = parse_ticker_list(txt.toPlainText())
         if not syms:
             return
 
@@ -3487,7 +3497,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dlg)
 
         lbl = QLabel(
-            "Enter tickers to skip during OHLCV refresh (comma-separated).\n"
+            f"Enter tickers to skip during OHLCV refresh ({FORMAT_NOTE}).\n"
             "These tickers will never be downloaded or updated."
         )
         lbl.setWordWrap(True)
@@ -3513,11 +3523,10 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_row)
 
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            raw = txt.toPlainText().strip()
-            self._blacklist = {
-                self._normalize_ticker(t)
-                for t in raw.split(",") if t.strip()
-            }
+            # v8.0.2: commas ONLY used to split this box, so a one-per-line
+            # paste became a single newline-bearing entry — nothing got
+            # blacklisted and blacklist.txt lost its one-line shape.
+            self._blacklist = set(parse_ticker_list(txt.toPlainText()))
             self._save_blacklist()
             self.log_panel.write_line(
                 f"Blacklist updated: {len(self._blacklist)} tickers"
@@ -3544,7 +3553,7 @@ class MainWindow(QMainWindow):
             "(every fill)\n"
             "  • Bulk Fill Earnings (Zacks): pre-skip pass over "
             "universe.csv ETF/ADR flags\n\n"
-            "One ticker per line."
+            f"Tickers are {FORMAT_NOTE}."
         )
         lbl.setWordWrap(True)
         layout.addWidget(lbl)
@@ -3572,14 +3581,7 @@ class MainWindow(QMainWindow):
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        raw = txt.toPlainText()
-        new_set = {
-            self._normalize_ticker(t)
-            for line in raw.splitlines()
-            for t in line.split(",")
-            if t.strip()
-        }
-        new_set.discard("")
+        new_set = set(parse_ticker_list(txt.toPlainText()))
         if new_set != self._zacks_blacklist:
             self._zacks_blacklist = new_set
             try:
@@ -3611,7 +3613,7 @@ class MainWindow(QMainWindow):
             "Auto-populated by tickers whose <code>/stock/earnings</code> "
             "response is <code>[]</code> — Finnhub doesn't cover them "
             "(ETFs, funds, recently-IPO'd, delisted).\n\n"
-            "One ticker per line."
+            f"Tickers are {FORMAT_NOTE}."
         )
         lbl.setWordWrap(True)
         layout.addWidget(lbl)
@@ -3639,14 +3641,7 @@ class MainWindow(QMainWindow):
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        raw = txt.toPlainText()
-        new_set = {
-            self._normalize_ticker(t)
-            for line in raw.splitlines()
-            for t in line.split(",")
-            if t.strip()
-        }
-        new_set.discard("")
+        new_set = set(parse_ticker_list(txt.toPlainText()))
         if new_set != self._finnhub_blacklist:
             self._finnhub_blacklist = new_set
             try:
@@ -3751,9 +3746,10 @@ class MainWindow(QMainWindow):
             self, "Spot Fill Earnings (Finnhub)",
             "Ticker:",
         )
-        if not ok or not sym.strip():
+        # v8.0.2: a pasted finviz tag — AGL(HB) — is dropped.
+        norm = self._normalize_ticker(strip_qualifiers(sym)) if ok else ""
+        if not norm:
             return
-        norm = self._normalize_ticker(sym)
         # User-only skip (universe blacklist + Finnhub-specific skip
         # list). Excludes the ETF/ADR auto-skip — see method docstring.
         user_only_skip = self._blacklist | self._finnhub_blacklist
@@ -4374,7 +4370,7 @@ class MainWindow(QMainWindow):
             "Auto-populated only by a definitive finviz <i>ticker not "
             "found</i> page - never by a block or a throttle. Tickers on the "
             "OHLCV blacklist are skipped as well, but are not stored here."
-            "\n\nOne ticker per line. Tickers you add are tagged "
+            f"\n\nTickers are {FORMAT_NOTE}. Tickers you add are tagged "
             "<code>manual</code>."
         )
         lbl.setWordWrap(True)
@@ -4410,13 +4406,7 @@ class MainWindow(QMainWindow):
         """Persist an edited attributes skip list. Split out of the dialog so
         it is testable without a modal. Returns True if anything changed."""
         current = set(getattr(self, "_finviz_snapshot_blacklist", set()) or ())
-        new_set = {
-            self._normalize_ticker(t)
-            for line in raw.splitlines()
-            for t in line.split(",")
-            if t.strip()
-        }
-        new_set.discard("")
+        new_set = set(parse_ticker_list(raw))
         if new_set == current:
             return False
         reasons = self._skip_reasons.setdefault("finviz_snapshot", {})
@@ -4452,7 +4442,7 @@ class MainWindow(QMainWindow):
             "all still see these tickers normally.\n\n"
             "Auto-populated by tickers finviz doesn't cover (no "
             "<code>earningsData</code> — ETFs, funds, brand-new listings)."
-            "\n\nOne ticker per line."
+            f"\n\nTickers are {FORMAT_NOTE}."
         )
         lbl.setWordWrap(True)
         layout.addWidget(lbl)
@@ -4480,14 +4470,7 @@ class MainWindow(QMainWindow):
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        raw = txt.toPlainText()
-        new_set = {
-            self._normalize_ticker(t)
-            for line in raw.splitlines()
-            for t in line.split(",")
-            if t.strip()
-        }
-        new_set.discard("")
+        new_set = set(parse_ticker_list(txt.toPlainText()))
         if new_set != self._finviz_blacklist:
             self._finviz_blacklist = new_set
             try:
@@ -4834,9 +4817,10 @@ class MainWindow(QMainWindow):
         sym, ok = QInputDialog.getText(
             self, "Spot Fill Earnings (Finviz)", "Ticker:",
         )
-        if not ok or not sym.strip():
+        # v8.0.2: a pasted finviz tag — AGL(HB) — is dropped.
+        norm = self._normalize_ticker(strip_qualifiers(sym)) if ok else ""
+        if not norm:
             return
-        norm = self._normalize_ticker(sym)
         user_only_skip = self._blacklist | self._finviz_blacklist
         if norm in user_only_skip:
             self._info_plain(
@@ -4931,7 +4915,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dlg)
 
         lbl = QLabel(
-            "Tickers to OMIT FROM SCANS only (comma-separated).\n\n"
+            f"Tickers to OMIT FROM SCANS only ({FORMAT_NOTE}).\n\n"
             "Greylist does NOT affect OHLCV / sector / earnings updates — "
             "those still run normally so you can clear a ticker from the "
             "list and immediately scan it without re-downloading anything."
@@ -4959,11 +4943,9 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_row)
 
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            raw = txt.toPlainText().strip()
-            self._greylist = {
-                self._normalize_ticker(t)
-                for t in raw.split(",") if t.strip()
-            }
+            # v8.0.2: was comma-only, like the blacklist editor — a
+            # one-per-line paste became one newline-bearing entry.
+            self._greylist = set(parse_ticker_list(txt.toPlainText()))
             self._save_greylist()
             self.log_panel.write_line(
                 f"Greylist updated: {len(self._greylist)} tickers (scan-only filter)"
@@ -5069,9 +5051,10 @@ class MainWindow(QMainWindow):
             self, "Spot Fill Earnings Dates (Yahoo)",
             "Ticker:",
         )
-        if not ok or not sym.strip():
+        # v8.0.2: a pasted finviz tag — AGL(HB) — is dropped.
+        norm = self._normalize_ticker(strip_qualifiers(sym)) if ok else ""
+        if not norm:
             return
-        norm = self._normalize_ticker(sym)
         if norm in self._blacklist:
             self._info_plain(
                 "Skipped",
@@ -5258,9 +5241,10 @@ class MainWindow(QMainWindow):
         sym, ok = QInputDialog.getText(
             self, "Spot Fill Earnings (Zacks)", "Ticker:",
         )
-        if not ok or not sym.strip():
+        # v8.0.2: a pasted finviz tag — AGL(HB) — is dropped.
+        norm = self._normalize_ticker(strip_qualifiers(sym)) if ok else ""
+        if not norm:
             return
-        norm = self._normalize_ticker(sym)
         user_only_skip = self._blacklist | self._zacks_blacklist
         if norm in user_only_skip:
             self._info_plain(
@@ -6734,7 +6718,7 @@ class MainWindow(QMainWindow):
 
         # Reference / benchmark tickers
         lbl3 = QLabel(
-            "Reference / benchmark tickers (comma-separated). Always "
+            f"Reference / benchmark tickers ({FORMAT_NOTE}). Always "
             "kept in the OHLCV cache and used for the RS calculations; "
             "never appear in scan results."
         )
@@ -6818,11 +6802,7 @@ class MainWindow(QMainWindow):
         # Pre-validate the ticker list here so a typo warns BY NAME —
         # save_user_config() would drop the whole invalid list and
         # silently revert to the baked-in defaults.
-        tickers = [
-            t.strip().upper()
-            for t in txt.toPlainText().replace("\n", ",").split(",")
-            if t.strip()
-        ]
+        tickers = parse_ticker_list(txt.toPlainText())
         bad = [
             t for t in tickers if not config.PLAUSIBLE_TICKER_RE.match(t)
         ]
@@ -7803,31 +7783,35 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 log.error("watchlist diff after scan failed: %s", exc)
 
-        # Reconcile the saved column order against the new canonical
-        # set: NEW filter/display columns (variables added since last
-        # scan) get prepended to the user's saved layout in indicator-
-        # panel order; columns whose source variable was disabled drop
-        # out. Empty saved order means canonical wins. Columns dialog
-        # visibility (`_deleted_column_keys`) is preserved across scans
-        # so users don't have to re-hide the same noisy columns each
-        # run; right-click → Reset Column Order or the popup's Reset
-        # to Default button restores everything.
+        # Reconcile the column order against the new scan's columns: what
+        # was on screen keeps its place, columns whose filter was switched
+        # off drop out, and NEW columns go to the right (v8.0.2 — they used
+        # to be prepended). Columns dialog visibility
+        # (`_deleted_column_keys`) is preserved across scans so users don't
+        # have to re-hide the same noisy columns each run; right-click →
+        # Reset Column Order or the popup's Reset to Default button
+        # restores everything. Must run BEFORE `_last_results_df` is
+        # replaced below: with no saved order, the previous results'
+        # layout is what the new columns join.
         try:
             from .widgets import _build_dynamic_columns
             interleave = self.results_table.interleave_quarters
-            primary_label = (
-                self._period_order[0] if self._period_order else None
+            # The first period that returned rows. A frame with none carries
+            # only the always-visible columns, and reconciling against it
+            # used to drop the whole saved layout (v8.0.2 fix).
+            ref_df = next(
+                (d for d in (self._period_results.get(lbl)
+                             for lbl in self._period_order)
+                 if d is not None and not d.empty),
+                None,
             )
-            primary_df = (
-                self._period_results.get(primary_label)
-                if primary_label else None
-            )
-            cols_for_reconcile, _, _ = _build_dynamic_columns(
-                primary_df, interleave_quarters=interleave,
-            )
-            self._reconcile_column_order_for_scan(
-                [k for _h, k, _f in cols_for_reconcile]
-            )
+            if ref_df is not None:
+                cols_for_reconcile, _, _ = _build_dynamic_columns(
+                    ref_df, interleave_quarters=interleave,
+                )
+                self._reconcile_column_order_for_scan(
+                    [k for _h, k, _f in cols_for_reconcile]
+                )
         except Exception as exc:
             log.debug("column-order reconcile after scan failed: %s", exc)
 
@@ -7859,6 +7843,9 @@ class MainWindow(QMainWindow):
         self.results_table.set_saved_column_order(self._results_column_order)
         self._populate_results(df)
         self._last_results_df = df
+        # The Hide Q caption names default-hidden date types only when the
+        # scan has them, so it follows the new results (v8.0.2).
+        self._apply_hidden_column_types(rerender=False)
         # Sync the (possibly open) Columns dropdown so it reflects the
         # post-reconcile order + the surviving hidden set.
         self._sync_columns_dialog()
@@ -8227,27 +8214,53 @@ class MainWindow(QMainWindow):
             act = menu.addAction("No earnings columns in this scan")
             act.setEnabled(False)
             return
+        hidden = self._effective_hidden_earnings_types()
         for type_id, label, n_cols in present:
             act = menu.addAction(f"{label}  ({n_cols})")
             act.setCheckable(True)
-            act.setChecked(type_id in self._hidden_earnings_col_types)
+            act.setChecked(type_id in hidden)
             # `triggered` carries the NEW checked state; bind type_id per
             # iteration so every action does not close over the last one.
             act.triggered.connect(
                 lambda checked, t=type_id: self._on_hide_type_toggled(t, checked)
             )
 
+    #: Class default so a bypass-init test shell reads "nothing shown".
+    _shown_default_earnings_col_types = frozenset()
+
+    def _effective_hidden_earnings_types(self) -> set:
+        """What Hide Q Columns actually hides (v8.0.2): the types the user
+        ticked, plus every default-hidden date type the user has not
+        unticked."""
+        from .widgets import DEFAULT_HIDDEN_EARNINGS_TYPES
+        try:
+            hidden = set(self._hidden_earnings_col_types)
+        except (AttributeError, RuntimeError, TypeError):
+            hidden = set()
+        try:
+            shown = set(self._shown_default_earnings_col_types)
+        except (AttributeError, RuntimeError, TypeError):
+            shown = set()
+        return hidden | (set(DEFAULT_HIDDEN_EARNINGS_TYPES) - shown)
+
     def _on_hide_type_toggled(self, type_id: str, hidden: bool):
+        from .widgets import DEFAULT_HIDDEN_EARNINGS_TYPES
         if hidden:
             self._hidden_earnings_col_types.add(type_id)
+            self._shown_default_earnings_col_types.discard(type_id)
         else:
             self._hidden_earnings_col_types.discard(type_id)
+            if type_id in DEFAULT_HIDDEN_EARNINGS_TYPES:
+                self._shown_default_earnings_col_types.add(type_id)
         self._apply_hidden_column_types()
 
     def _on_show_all_column_types(self):
-        if not self._hidden_earnings_col_types:
+        from .widgets import DEFAULT_HIDDEN_EARNINGS_TYPES
+        if not self._effective_hidden_earnings_types():
             return
         self._hidden_earnings_col_types.clear()
+        self._shown_default_earnings_col_types |= set(
+            DEFAULT_HIDDEN_EARNINGS_TYPES)
         self._apply_hidden_column_types()
 
     # ── Hide FV Columns dropdown (v8.0.0) ────────────────────────────
@@ -8316,7 +8329,7 @@ class MainWindow(QMainWindow):
         Also refreshes both button captions and grey summary labels so the
         state is legible without opening a menu.
         """
-        earnings = set(self._hidden_earnings_col_types)
+        earnings = self._effective_hidden_earnings_types()
         fv = set(self._hidden_fv_col_types)
         try:
             self.results_table.set_hidden_column_types(earnings | fv)
@@ -8326,13 +8339,21 @@ class MainWindow(QMainWindow):
         try:
             from .widgets import (
                 EARNINGS_COLUMN_TYPE_LABELS, FV_COLUMN_TYPE_LABELS,
+                present_earnings_column_types,
             )
-            n = len(earnings)
+            # A default-hidden date type is only worth mentioning when this
+            # scan has it; one the user ticked counts as before, present or
+            # not (v8.0.2).
+            present = {t for t, _l, _n in present_earnings_column_types(
+                self._hide_types_source_columns())}
+            ticked = set(self._hidden_earnings_col_types)
+            caption = ticked | ((earnings - ticked) & present)
+            n = len(caption)
             self.btn_hide_col_types.setText(
                 "Hide Q Columns ▾" if not n else f"Hide Q Columns ({n}) ▾"
             )
             self.lbl_hidden_types.setText(self._hidden_types_caption(
-                earnings, EARNINGS_COLUMN_TYPE_LABELS, "column types"))
+                caption, EARNINGS_COLUMN_TYPE_LABELS, "column types"))
             m = len(fv)
             self.btn_hide_fv_types.setText(
                 "Hide FV Columns ▾" if not m else f"Hide FV Columns ({m}) ▾"
@@ -8947,14 +8968,16 @@ class MainWindow(QMainWindow):
         self._wl_dialog.exec()
 
     def _manual_input_stw(self):
-        """Open a dialog for manually entering comma-separated tickers."""
+        """Open a dialog for manually entering or pasting tickers."""
         dlg = QDialog(self)
         dlg.setWindowTitle("Manual Input — Send to Watchlist")
         dlg.setMinimumWidth(500)
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(30, 20, 30, 20)
 
-        layout.addWidget(QLabel("Enter tickers (comma-separated):"))
+        prompt = QLabel(INPUT_PROMPT)
+        prompt.setWordWrap(True)
+        layout.addWidget(prompt)
         txt = QTextEdit()
         txt.setMinimumHeight(120)
         txt.setPlaceholderText("AAPL, MSFT, NVDA, TSLA, ...")
@@ -8977,9 +9000,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_row)
 
         def _on_go():
-            raw = txt.toPlainText()
-            tickers = [t.strip().upper() for t in raw.replace("\n", ",").split(",")
-                       if t.strip()]
+            tickers = parse_ticker_list(txt.toPlainText())
             if not tickers:
                 QMessageBox.warning(dlg, "No Tickers", "Enter at least one ticker.")
                 return
@@ -9273,6 +9294,12 @@ class MainWindow(QMainWindow):
             # preset still means what it said against a wider one.
             "hidden_earnings_col_types": sorted(
                 self._hidden_earnings_col_types
+            ),
+            # v8.0.2: earnings DATE types are hidden by default; these are
+            # the ones the user unticked. A preset without the key shows
+            # none of them.
+            "shown_default_earnings_col_types": sorted(
+                self._shown_default_earnings_col_types
             ),
             # v7 (v8.0.0): FV column categories hidden via Hide FV Columns.
             # Same semantics as the earnings types above.

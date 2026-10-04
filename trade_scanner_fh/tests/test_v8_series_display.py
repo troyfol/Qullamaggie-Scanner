@@ -161,16 +161,21 @@ def test_atro_growth_row_shows_every_quarter_the_count_used():
     assert np.isclose(row["consec_eps_growth_period_avg"], 454.231523)
 
 
-def test_uncapped_growth_shows_quarters_back_to_the_oldest_counted_one():
+def test_uncapped_growth_counts_the_whole_pool_and_shows_every_quarter():
     """Uncapped, ATRO's run also steps over its N/A Q-5 (one bridged quarter
     is the allowance) to Q-6 (+388.89%): four quarters counted, Q-5 not among
-    them, and the blocks run back to Q-6 and no further."""
+    them. v8.0.2: an uncapped row shows every quarter on file up to the
+    20-block ceiling (it used to stop at the run's oldest counted quarter,
+    Q-6, while an uncapped beats row drew 20 — the user's rule made them
+    agree)."""
     row: dict = {}
     S._populate_quarter_series(
         row, _growth_params(consec_eps_growth_quarter_cap=0), ATRO)
     assert row["consec_eps_growth"] == 4
     assert row["_consec_eps_growth_qs"] == [2, 3, 4, 6]
-    assert "q6_yoy_eps_pct" in row and "q7_yoy_eps_pct" not in row
+    n = min(len(ATRO), S.MAX_BEATS_QUARTERS)
+    assert n > 6, "fixture must reach past the run's oldest quarter"
+    assert f"q{n}_yoy_eps_pct" in row and f"q{n + 1}_yoy_eps_pct" not in row
 
 
 def test_a_failed_backward_only_growth_run_shows_no_span_and_no_quarters():
@@ -215,10 +220,12 @@ def test_beats_membership_follows_fiscal_order_not_report_order():
     assert row["_consec_eps_beats_qs"] == [2, 3, 4]
 
 
-def test_growth_blocks_suppress_last_report_date_like_beats_blocks(
-        tmp_path, monkeypatch):
-    """Last Report Date is redundant beside a Q-1 Date, so it has always been
-    dropped when beats drew the blocks; growth draws them now too."""
+def test_last_report_date_is_kept_beside_growth_blocks(tmp_path, monkeypatch):
+    """v8.0.2 (the user's rule): every earnings filter produces a date
+    column, so Last Report Date is no longer dropped beside a Q-1 Date — it
+    is hidden by default through Hide Q Columns instead (pinned in
+    test_v802_dates_and_tooltips.py). It used to be suppressed whenever beats
+    or growth drew the blocks."""
     from trade_scanner_fh import data_engine
     days = pd.bdate_range("2026-01-02", "2026-09-18")
     ohlcv = pd.DataFrame({"Open": 10.0, "High": 10.5, "Low": 9.5,
@@ -245,7 +252,7 @@ def test_growth_blocks_suppress_last_report_date_like_beats_blocks(
     with_growth = run(consec_eps_growth_enabled=True,
                       consec_eps_growth_quarter_cap=4,
                       consec_eps_growth_backward_only=True)
-    assert "last_report_date" not in with_growth
+    assert with_growth["last_report_date"] == T("2026-08-11")
     assert with_growth["q1_report_date_eps"] == T("2026-08-11")
     assert with_growth["_consec_eps_growth_qs"] == [2, 3, 4]
 

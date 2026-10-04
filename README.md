@@ -305,6 +305,25 @@ into presets); right-click rows or headers to delete, cut, or paste;
 colouring; **Save Preset** stores the full filter + window + column layout to
 `scanner_data/presets/{name}.json`.
 
+### Pasting ticker lists (v8.0.2)
+
+Every box that takes a list of tickers reads it the same way: Scans →
+Lookup…, Manual Input → Send to Watchlist, Data → Rebuild Tickers…, the OHLCV
+Blacklist and Greylist editors, the reference tickers in Settings →
+Advanced…, and the Zacks / Finnhub / finviz / finviz attributes skip-list
+editors.
+
+- Separators: commas, semicolons, newlines, tabs and spaces — so a
+  TradeStation column (one symbol per line) pastes as-is.
+- Anything in parentheses is dropped: finviz tags such as `AGL(HB)` (hard to
+  borrow) read as `AGL`, with or without a space before the tag.
+- Upper-cased, a leading `$` dropped, duplicates removed in order. `$` and
+  `^` *inside* a symbol are kept (`ABR$D`, `AIIA^` are real universe
+  symbols).
+
+The single-ticker Spot Fill prompts (Finnhub, finviz, Zacks, Yahoo) also drop
+a pasted tag, so `AGL(HB)` fills AGL.
+
 ### Lookup mode (v8.0.1)
 
 **Scans → Lookup…** runs the current filter panel over tickers you type
@@ -315,9 +334,11 @@ exactly like a scan's (period dropdown, colour rules, exports, Send to
 Watchlist) and replace what was on screen.
 
 The dialog has the Manual Input STW form factor. Tickers are comma-separated
-(newlines, spaces and semicolons work too; `$` prefixes and case are
-ignored; `BRK.B` / `BRK/B` match the store's `BRK-B`). The last list and
-mode are remembered for the session. Two modes:
+or one per line — a TradeStation column pastes as-is — and semicolons,
+tabs and spaces work too; finviz tags in parentheses such as `(HB)` are
+dropped, `$` prefixes and case are ignored, and `BRK.B` / `BRK/B` match the
+store's `BRK-B` (see [Pasting ticker lists](#pasting-ticker-lists-v802)).
+The last list and mode are remembered for the session. Two modes:
 
 - **Apply filters as set** — a ticker failing any filter is not shown. On
   the same preset a lookup shows exactly the scan's passers from the list,
@@ -886,11 +907,13 @@ class ScanParams:
 
 **The 6 individual earnings filters** (reported_eps, surprise_eps_dollar, surprise_eps_pct, reported_rev, surprise_rev_dollar, surprise_rev_pct) each follow this triplet pattern. As of 2026-05 they're per-column gated — column appears only when its specific `_enabled OR _display_only` is on.
 
-**Two beats filters** (consec_eps_beats, consec_rev_beats) gate their corresponding Q-i triplet block AND the streak count column. When either is active, `last_report_date` is suppressed (redundant with Q-1 Date).
+**Two beats filters** (consec_eps_beats, consec_rev_beats) gate their corresponding Q-i triplet block AND the streak count column. Until v8.0.2 `last_report_date` was suppressed while either was active (redundant with Q-1 Date); it is now always produced with the individual columns and hidden by default instead — see [Earnings date columns and hover tooltips](#earnings-date-columns-and-hover-tooltips-v802).
 
 The `consec_*_beats_min` spinbox accepts **0 as a valid threshold**. Setting min=0 makes the streak filter trivially pass every ticker (streak ≥ 0 is always true) AND the display-only red-on-fail can never fire (streak < 0 is impossible). Intended use: surface the streak count + Q-i blocks for context when the user wants to see the data without any pass/fail signal.
 
-The `consec_*_beats_quarter_cap` spinbox (label "Q Cap" in the panel) is an **optional ceiling on the pool of quarters the filter may look back over** for that side. Default 0 means "no cap". Setting cap=4 restricts that side to the 4 most recently reported quarters, which limits the rendered Q-i columns to Q-1..Q-4 **and** bounds the streak itself — with cap=4 the reported streak can never exceed 4. EPS and Rev caps are independent. Implementation: applied at the scanner level via `past_pref.head(cap)`, and that same capped frame is what `compute_consecutive_beats` walks.
+The `consec_*_beats_quarter_cap` spinbox (label "Q Cap" in the panel) is an **optional ceiling on the pool of quarters the filter may look back over** for that side. Default 0 means "no cap". Setting cap=4 restricts that side to the 4 most recently reported quarters, which bounds the streak itself — with cap=4 the reported streak can never exceed 4. EPS and Rev caps are independent for the calculation. Implementation: applied at the scanner level via `past_pref.head(cap)`, and that same capped frame is what `compute_consecutive_beats` walks.
+
+**How many Q-i blocks are shown is shared (v8.0.2).** With several quarter filters on (display-only included, all eight rows that have a Q Cap), the table shows the **highest** Q Cap's worth of quarters, and a cap of 0 (no cap) beats any number — at most 20 blocks. The same count applies to the EPS and the Rev blocks. This is display only: each filter still counts over its own cap, so a preset selects the same tickers. Implementation: `scanner.q_block_count(params)`.
 
 > **Changed 2026-09-07.** The cap was previously display-only: it limited
 > which Q-i columns were populated while `compute_consecutive_beats` still
@@ -966,8 +989,9 @@ slightly differently than before.
 | `max_gap_pct` + `max_gap_date` | Iff max_gap active | `indicators.max_positive_gap` (returns tuple) |
 | `surge_pct` + `surge_start_date` + `surge_end_date` + `surge_window` | Iff surge active | `indicators.surge_*` |
 | `reported_eps`, `surprise_eps_*`, `reported_rev`, `surprise_rev_*` | Per-column gating (Option B 2026-05) | `mr.get(...)` from earnings_history_lookup |
-| `last_report_date` | Iff individual earnings active AND no beats active | (suppressed when beats covers it) |
-| `consec_eps_beats`, `q1..qN_*_eps` | Iff `consec_eps_beats_enabled OR _display_only`; N = `min(populated_quarters, consec_eps_beats_quarter_cap if >0 else MAX_BEATS_QUARTERS=20)`. NOT capped by streak length. The streak itself is computed over the same capped pool. | `compute_consecutive_beats` + per-quarter projection |
+| `last_report_date` | Iff individual earnings active (v8.0.2: no longer suppressed beside Q-i blocks; hidden by default) | `mr.get("report_date")` |
+| `consec_eps_beats`, `q1..qN_*_eps` | Iff `consec_eps_beats_enabled OR _display_only`; N = `min(populated_quarters, scanner.q_block_count(params))` — the highest active Q Cap, no cap = MAX_BEATS_QUARTERS=20 (v8.0.2). NOT capped by streak length. The streak itself is computed over this filter's own capped pool. | `compute_consecutive_beats` + per-quarter projection |
+| `{growth/accel prefix}_start_date` / `_end_date` | Iff that series filter active (v8.0.2); report dates of the run's first / last quarter, None when no run; hidden by default | `scanner._write_run_dates` |
 | `consec_rev_beats`, `q1..qN_*_rev` | Iff `consec_rev_beats_enabled OR _display_only`; same N-rule with `consec_rev_beats_quarter_cap` (independent from EPS) | Same for revenue side |
 | `consec_eps_growth`, `consec_rev_growth` | Iff that row is enabled-or-display | `earnings_series.consecutive_growth_run` |
 | `accel_*_len`, `accel_*_span`, `accel_*_vals` | Iff that accelerating row is enabled-or-display | `earnings_series.accelerating_series` |
@@ -1517,7 +1541,9 @@ type's original behaviour exactly** — an existing preset selects identically.
 
 Each row has its own **Q Cap**, and it is pool-defining: cap=8 means the
 filter may look back over the 8 most recently reported quarters and no
-further. 0 = no cap. Same slicing basis as the beats Q Cap.
+further. 0 = no cap. Same slicing basis as the beats Q Cap. The number of
+Q-X blocks the table SHOWS is shared across rows — the highest active cap,
+no cap = 20 (v8.0.2, see the beats Q Cap above).
 
 Within the pool, quarters are ordered by `period_ending` (fiscal order),
 and a quarter is *missing* when it has no row **or** its row has a NaN
@@ -1624,21 +1650,21 @@ default the filter reports the **longest qualifying run anywhere in the
 pool** — tick Backward Only to require a live run instead.
 
 **Every quarter behind the count is on screen (v8.0.0).** A growth row draws
-its own Q-X blocks: the whole Q Cap pool, or, uncapped, back to the oldest
-quarter the run counted (at least Q-1, at most 20 — 74 live-store runs are
-longer than that). Before, only the beats filters drew blocks, so a growth
-count over four quarters beside beats blocks capped at three hid a quarter it
-used. Blocks are data, not per filter: a side shows as many as its widest
-active filter asks, and Last Report Date is dropped beside a Q-1 Date exactly
-as it is for beats. The row also gains a **Span** and **V** cell like the
-accelerating filters. The **"Quarter counted in the YoY … growth run"**
+Q-X blocks as the beats rows do. Before, only the beats filters drew blocks,
+so a growth count over four quarters beside beats blocks capped at three hid a
+quarter it used. Blocks are data, not per filter: since v8.0.2 both sides show
+the highest active Q Cap's worth (no cap = 20; until then an uncapped growth
+row drew only back to the oldest quarter its run counted, while an uncapped
+beats row drew 20). The row also gains a **Span** and **V** cell like the
+accelerating filters, and since v8.0.2 a **Start** / **End** report-date pair
+(hidden by default). The **"Quarter counted in the YoY … growth run"**
 default colour rule shades the YoY cell of each quarter the run counted — not
 Q-1..Q-count: a run that stepped over an N/A Q-1 is Q-2..Q-4.
 
 Note the display is capped, not the calculation's reach beyond it: the count
-never reads past the Q Cap, so the blocks always cover every quarter it could
-have used. Uncapped with a long-running grower in the results, a side can
-reach 20 blocks — set a Q Cap to keep the table narrow.
+never reads past the Q Cap, and the blocks are at least that wide, so they
+always cover every quarter it could have used. Any uncapped quarter row means
+20 blocks per side — set Q Caps on every quarter row to keep the table narrow.
 
 ### Accelerating Quarters
 
@@ -2846,6 +2872,40 @@ quarter index, a deleted `Q-2 Date` came straight back as an empty column.
 Because the data survives, a colour rule can still read a hidden column —
 "compute it (Display Only), hide it, colour by it" is a supported workflow.
 
+### Earnings date columns and hover tooltips (v8.0.2)
+
+Every earnings filter now produces a date column. Only the **Consecutive EPS
+/ Rev Beats** rows show theirs by default (the Q-X Date columns); every other
+one is **hidden by default** and has its own tick in **Hide Q Columns ▾**:
+
+| Filter | Date column(s) | Hide Q Columns tick |
+|---|---|---|
+| Consecutive EPS / Rev Beats | Q-X Date (EPS / Rev), visible | Q-X Date (EPS / Rev) |
+| Consecutive YoY EPS / Rev Growth | Start + End — report dates of the run's first and last quarter | Consec YoY EPS / Rev Growth Dates |
+| Accelerating Quarters ×4 | Start + End, as above | Accel … Dates |
+| Current EPS / Rev / Surprise / YoY rows | Last Report Date (produced even beside Q-X blocks now) | Last Report Date |
+
+Unticking a Dates entry shows those columns until it is ticked again; the
+choice is saved with presets (`shown_default_earnings_col_types`), and a
+preset without that key — any saved before v8.0.2 — hides them all. A
+filter's **(all cols)** tick also covers its Start / End, so hiding the filter
+hides its dates even when its Dates tick is clear. **Show All** shows the dates
+too. Hidden date columns are offered unticked in the Excel export dialog, and
+Start / End take part in the earnings date-match colouring like Last Report
+Date.
+
+**Hovering an earnings cell** names the quarter it belongs to:
+
+- a Q-X cell — `Q-3 · reported 2026-02-10 · fiscal quarter 2025-12`;
+- a Current cell or Last Report Date — the most recent quarter, same form;
+- any cell of a series filter (count, Span, V, Avg, Max, Start, End) — the run:
+  `Run · reported 2025-05-06 → 2026-05-05 · fiscal quarters 2025-03 → 2026-03`;
+- Days Since / Until ER — the report date.
+
+The text is built only when you hover (from the frame on screen), so a large
+render pays nothing for it. The fiscal quarter is there because report order
+and fiscal order disagree for late filers.
+
 ### Cut + Paste columns (manual reorder)
 
 Symmetric with row cut/paste — reorder columns via the header right-click menu:
@@ -2881,7 +2941,7 @@ Default:     | EPS Beats | Q-1 EPS | Q-2 EPS | … | Rev Beats | Q-1 Rev | Q-2 R
 Interleaved: | EPS Beats | Rev Beats | Q-1 EPS | Q-1 Rev | Q-2 EPS | Q-2 Rev | …
 ```
 
-No-op when only one side has beats data — guarantees zero behavior change for users who run EPS-only or Rev-only scans. Asymmetric `n_eps != n_rev` (e.g., user set different per-side quarter caps) is handled by emitting whichever side still has data at each quarter index.
+No-op when only one side has beats data — guarantees zero behavior change for users who run EPS-only or Rev-only scans. Asymmetric `n_eps != n_rev` (per-side quarter caps before v8.0.2, which made the block count shared) is handled by emitting whichever side still has data at each quarter index.
 
 Persisted in QSettings + presets under `view_interleave_quarters`. Implementation: `_build_dynamic_columns(df, interleave_quarters=True)` builds the alternating layout; `ResultsTable.set_interleave_quarters(bool)` flips the flag and invalidates the column-width cache; `MainWindow._on_interleave_quarters_toggled` clears any saved column order (a prior manual reorder would otherwise be re-applied AFTER populate and undo the new q-i layout) and re-renders the active period. Regression covered by `test_interleave_toggle_overrides_saved_column_order`.
 
@@ -2897,11 +2957,13 @@ Toolbar button **`Columns ▾`** (right of IPO Mode Max Days) opens a non-modal 
 
 #### Reconcile rules across scans
 
-When a scan completes (`_reconcile_column_order_for_scan`), the saved order is updated as follows:
+When a scan completes (`_reconcile_column_order_for_scan`), the column order is updated as follows (v8.0.2):
 
-- **Saved order empty** → leave it empty so canonical wins.
-- **New filter/display variable adds an output column** → the new key(s) get **prepended to the front** of the saved order in canonical order (which mirrors the indicator panel's top-to-bottom arrangement, i.e. "first added = leftmost in table"). Existing saved entries keep their relative positions behind the additions.
-- **Filter/display variable removed** → its key is dropped from the saved order; the rest of the user's layout survives intact.
+- **The layout new columns join** is the saved order, or — when nothing is saved (never reordered, after Reset, after an interleave flip) — the layout the table was showing for the previous results. With neither (the first scan, or the first after loading a preset) the canonical order stands. The result is always stored, so the next scan has a layout to add to.
+- **New filter/display variable adds an output column** → the new key(s) go to the **right** of everything already shown, in canonical order among themselves — even when the filter's panel row sits further up. (Before v8.0.2 they were prepended to the front of a saved order, and with no saved order they landed at their canonical slot.)
+- **More Q-X blocks on a side already shown** (a cap raised from 4 to 8) → they extend that side's run, Q-5 straight after Q-4, rather than going to the right edge. A side shown for the first time counts as new.
+- **Filter/display variable removed** → its key is dropped from the order; the rest of the layout survives intact.
+- **A scan with no results** leaves the order alone (it used to reduce a saved order to the always-visible columns).
 - **Hidden set (`_deleted_column_keys`)** carries across scans without modification — users don't have to re-hide noisy columns each run. Reset clears it.
 
 Toolbar input changes that only affect ticker-input shape (timeframe, sequence range, earnings-dates / earnings-data filter, include ETFs / ADRs, IPO mode, etc.) do **not** trigger column changes — they don't add or remove columns from the output, so the saved order passes through unchanged.
@@ -3322,7 +3384,7 @@ data directory.
 
 ## Testing
 
-Test suite at `trade_scanner_fh/tests/` — **2,443 tests, all passing** as of 2026-10-01 (v8.0.1 added 104 across the null re-send guard, the flagged-session re-check, the colour-rule favorites, Lookup mode with its earnings refresh, and the layout / monitor-move fixes; v8.0.0 added 236 across the eight fixes, hide / unhide, the colour-rule engine and its editor, and the round-2 fixes from user testing; v6.3.3 added 18, v6.3.2 added 40, v6.3.1 added 16, v6.3.0 added 93 across the disagreement merge, the failure taxonomy, the trim scoping, both new features and the unified series engine; v6.2.0 brought it to 1,759; v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
+Test suite at `trade_scanner_fh/tests/` — **2,527 tests, all passing** as of 2026-10-04 (v8.0.2 added 84 for the shared ticker parser and every dialog that uses it, the shared quarter-block count, new columns going to the right, and the earnings date columns with their hover tooltips; v8.0.1 added 104 across the null re-send guard, the flagged-session re-check, the colour-rule favorites, Lookup mode with its earnings refresh, and the layout / monitor-move fixes; v8.0.0 added 236 across the eight fixes, hide / unhide, the colour-rule engine and its editor, and the round-2 fixes from user testing; v6.3.3 added 18, v6.3.2 added 40, v6.3.1 added 16, v6.3.0 added 93 across the disagreement merge, the failure taxonomy, the trim scoping, both new features and the unified series engine; v6.2.0 brought it to 1,759; v6.0.0 added 99 covering the data-integrity audit, v5.5.0 added 30, v5.4.0 added 107). (The once-flaky calendar-drift fixture in `test_yahoo_fill.py` was made relative-to-today on 2026-06-07; there are no known failures.) Run all:
 
 ```bash
 cd c:/python/EDA_Project/Trade_Scanner_FH
@@ -3442,6 +3504,9 @@ client's rate limiter).
 | `test_v801_ohlcv_health.py` | **v8.0.1.** A null re-send never replaces real cached prices (normal and overwrite mode) while a null cached bar is still repaired and a null bar on a new date is still written; the flagged-session list — flag, per-ticker re-check, the alphabet-clustered partial-run trap, the burst-only share rule, resolution boundaries, file tolerance; the watch reaching `download_one` on the batch and the rate-limit probe; the launch reminder, status-label suffix and Dismiss |
 | `test_v801_layout.py` | **v8.0.1.** Monitor moves: FlowLayout wrapping / minimum / gaps / hidden items, filter rows fitting a narrow panel with every label kept beside its input, the panel's content-derived minimum (no sideways scrollbar), the window fitting a 1,080 px monitor measured with the dark theme, every full-width row being a wrapping layout, the top bar holding every control, fit-to-monitor (shrink + pull on-screen, maximized left alone), fitting only after the move settles on a new monitor and never with the mouse button held, and a guard against any `nativeEvent` override (it crashes PyQt 6.7.1 on show) |
 | `test_v801_lookup.py` | **v8.0.1.** Lookup mode: parsing and share-class matching, `lookup_params` (Top X% off; display-only builds zero funnel stages with every filter on; caller's params untouched), `run_scan(lookup=True)` outcomes (passed / failed at a stage / no data / quarantine / error, benchmarks kept, Top X% guard), the worker's per-period outcomes, the report, the dialog's STW form factor, the window using the scan's own periods and params, and completion leaving scan history and the session counter alone |
+| `test_v802_ticker_input.py` | **v8.0.2.** The shared ticker parser on the user's own 45-ticker TradeStation / finviz paste (CRLF and tab variants, every tag placement, inner `$` / `^` kept, re-parsing a saved list changes nothing), and every list dialog and Spot Fill prompt driven end to end through a scripted dialog — including the one-line `blacklist.txt` / `greylist.txt` files a column paste used to break. Mutation-checked: reverting any of the 14 call sites or 3 parser rules fails it |
+| `test_v802_dates_and_tooltips.py` | **v8.0.2.** The growth / accelerating Start / End columns (real run dates, empty when there is no run), Last Report Date beside Q-X blocks, the tooltip-only keys (beats run dates, fiscal quarters, ER dates); the seven Dates types (all default-hidden, a run date under both its Dates and its (all cols) tick); the real window — hidden on a fresh scan, untick to show, presets save / a pre-8.0.2 preset re-hides, (all cols) beats a shown Dates tick, Show All, the export dialog, the unhide menu, the button count; and every tooltip kind, including the real table under a sort. Mutation-checked: 20 of 20 rule breaks caught |
+| `test_v802_quarters_and_columns.py` | **v8.0.2.** `q_block_count` (highest cap wins, 0 beats every number, the 20 ceiling, display-only and accelerating rows counted, switched-off rows ignored, both sides drawn alike); the column merge (new columns right, removals drop, extra quarter blocks extend their run in both layouts, a new side goes right even without a counter); and the real window scan after scan — additions, an empty scan, a removal plus a fourth quarter, after Reset, after a drag. With the two end-to-end cap tests in `test_display_only.py`, mutation-checked: 14 of 14 rule breaks caught |
 | `test_v801_color_favorites.py` | **v8.0.1.** The favorites store (copy semantics, case-insensitive names, rename / delete, unreadable files), `unmet_requirements` for every condition kind and target, and the dialog: right-click save, overwrite confirmation, greyed entries with reasons, picking adds without painting, duplicates select, Manage dialog, end to end across presets |
 | `test_v8_series_display.py` | **v8.0.0 round 2.** Built from ATRO / ELOX / a late filing: the Backward Only tail limit (growth + accelerating), counted-quarter membership in fiscal order, growth Q-X blocks / Span / V, the phantom beats column, `in_run` + skip-N/A colouring, the rules v1 → v2 upgrade, the dialog round trip, preset settings falling back to defaults, and Beta at weekly / monthly (exact slopes, the fast period picker against pandas resample, the scan path) |
 | `test_finviz_snapshot.py` | **v7.0.0 - 7.0.2.** Snapshot parsing (duplicate `EPS next Y`, the seven two-value cells, short ETF grids, the `Change %` label), the not-found gate that decides permanent skip-listing, the store's merge-never-replace rule, the sweep's block/abort behaviour, the launch cadence prompt, per-field spinbox ranges, sweep log visibility, the attributes skip list's reason codes end to end, its editor, and the gap fill's target selection and clock handling |
@@ -3650,7 +3715,8 @@ directories, and the previous `_internal/`.
 | `gui/color_rules_dialog.py` | The Color Rules editor (non-modal; Apply repaints live), the ★ Favorites menu and `ManageFavoritesDialog` |
 | `gui/color_favorites.py` | **v8.0.1.** Colour-rule favorites store — named single-rule copies shared by every preset, in `scanner_data/color_rule_favorites.json` |
 | `gui/flow_layout.py` | **v8.0.1.** `FlowLayout` (a row that wraps instead of forcing its parent's width; minimum = widest single item, height-for-width) and `WrappingBar` (the top control bar, search row and ribbon: wrapping, with groups so a label stays with its control) |
-| `gui/lookup.py` | **v8.0.1.** Lookup mode — ticker-list parsing, matching to cached symbols, the Lookup dialog, the per-ticker report (parameter changes live in `scanner.lookup_params`) |
+| `gui/lookup.py` | **v8.0.1.** Lookup mode — matching the typed list to cached symbols, the Lookup dialog, the per-ticker report (parameter changes live in `scanner.lookup_params`) |
+| `gui/ticker_input.py` | **v8.0.2.** `parse_ticker_list` / `strip_qualifiers` — the one parser behind every ticker-list box and the Spot Fill prompts (TradeStation columns, finviz `(HB)` tags), plus the shared dialog wording |
 | `gui/hiding.py` | `HideManager` — hide / unhide rows and columns, undo stack, preset replace, indicators |
 
 ## v7 module map
@@ -3672,6 +3738,70 @@ therefore refreshes that ticker's attributes at no extra cost, independently
 of whether the sweep ever runs.
 
 ## Changelog
+
+### v8.0.2 — paste TradeStation columns and finviz lists, one quarter depth, new columns on the right, earnings date columns and hover tooltips (2026-10-04)
+
+**Every ticker-list box now reads a TradeStation column and drops finviz
+tags.** The ten ticker-list boxes split their text in different ways — some
+on commas only, some on commas and newlines, Lookup on commas, newlines,
+spaces and semicolons — and every one kept a finviz qualifier as part of the symbol, so
+`AGL(HB)` (hard to borrow) went to TradeStation, to Rebuild, or into Lookup's
+"not in the OHLCV cache" list as a ticker called `AGL(HB)`. They now share one
+parser (`gui/ticker_input.py`): commas, semicolons, newlines, tabs and spaces
+all separate, anything in parentheses is dropped, case and a leading `$` are
+normalised and duplicates removed. The four single-ticker Spot Fill prompts
+drop a pasted tag too. See [Pasting ticker lists](#pasting-ticker-lists-v802).
+
+**A column pasted into the Blacklist or Greylist editor blacklisted nothing.**
+Those two boxes split on commas only, so a one-per-line paste became a single
+entry with newlines inside it: none of the tickers was skipped, and the
+newline broke the one-line shape of `blacklist.txt` / `greylist.txt`. Fixed by
+the shared parser; the test pins the file staying on one line.
+
+Checked against the live store before shipping: no universe, cache, blacklist
+or skip-list symbol contains a parenthesis or whitespace or starts with `$`,
+so pressing OK on an unedited editor cannot change a stored list; `$` and `^`
+inside symbols (`ABR$D`, `AIIA^`) are kept.
+
+**One quarter depth for the whole table.** Each quarter filter drew its own
+Q Cap's worth of Q-X blocks on its own side, and "no cap" meant 20 blocks on a
+beats row but only back to the run's oldest counted quarter on a growth row —
+so how deep the table went depended on which filter asked. Now, the user's
+rule: with several quarter filters on (display-only included, all eight rows
+with a Q Cap), the **highest** cap sets how many quarters are shown, 0 (no
+cap) beats any number, at most 20, and the EPS and Rev blocks share the count.
+Display only: each filter still counts over its own cap (pinned by a test in
+which a 2-quarter beats streak stays 2 beside 6 blocks where the uncapped
+streak is 6). Of the user's six presets only `EPS YoY` changes — its uncapped
+display-only Rev Growth row now widens both sides to 20.
+
+**New filters' columns go to the right.** After a scan, columns whose filter
+was just switched on were put at the far LEFT of a dragged layout, or — with
+no dragged layout — at their panel row's slot, often mid-table. Now they go to
+the right of everything already shown; switched-off filters' columns drop out;
+extra quarter blocks on a side already shown extend that run (Q-5 after Q-4).
+Also fixed on the way: a scan with no results reduced a dragged layout to the
+four always-visible columns.
+
+**A date column for every earnings filter, hidden unless it is a beats
+row's.** The accelerating rows had no date at all (their Span is the fiscal
+quarter, not the report date), and Last Report Date vanished whenever Q-X
+blocks were drawn. Now each YoY Growth and Accelerating row produces a Start
+/ End report-date pair for its run, and the Current rows always produce Last
+Report Date. Following the user's rule, all of them are hidden by default,
+each with its own Hide Q Columns tick, while the beats rows' Q-X Dates stay
+visible; unticking is remembered and saved with presets. See
+[Earnings date columns and hover tooltips](#earnings-date-columns-and-hover-tooltips-v802).
+
+**Hover an earnings cell to see its quarter.** Report date plus fiscal
+quarter, or a run's first → last for a series filter's cells — built only on
+hover, so it costs a 15k-row render nothing. Smoke-tested on 600 real tickers
+from a scratch copy of the store with every earnings filter on: every
+growth / accelerating run's dates were real report dates of that ticker in
+order (2,524 runs), dated exactly when the count was above 0; Last Report Date
+equalled Q-1 Date on every row; every Q-X tooltip named its quarter's report
+date; about 10 µs per tooltip. One reading it immediately made plain: with no
+cap, ticker A's longest accelerating EPS series ran 2003 → 2004.
 
 ### v8.0.1 — Lookup mode, follow a flagged session, refuse null re-sends, colour-rule favorites (2026-10-01)
 
@@ -4656,7 +4786,7 @@ These are properties the codebase depends on. Breaking any one is a regression w
 ### Earnings columns (Option B)
 
 19. **Each of the 6 individual earnings columns gates on its own `_enabled OR _display_only`.** Off → column absent. No "always-on context" surfacing.
-20. **`last_report_date` shows ONLY when** at least one individual earnings column is active AND no beats column is active. When beats is active, Q-1 Date covers the same value.
+20. **`last_report_date` is produced whenever** at least one individual earnings column is active (v8.0.2 — it used to be dropped beside a beats or growth Q-1 Date). It is hidden by default through Hide Q Columns → "Last Report Date", like every non-beats earnings date column.
 21. **Q-i column display gating is decoupled from streak length.** `_build_dynamic_columns` uses `_max_present(suffix)` to render every populated quarter (up to MAX_BEATS_QUARTERS=20), NOT `min(streak, present)`. The streak count drives only the green-text coloring inside `_populate_row`. This is what keeps post-streak earnings cells eligible for match-coloring against non-earnings indicator dates.
 22. **`consec_*_beats_min = 0` is a valid threshold.** Spinbox minimum is 0, not 1. With min=0 the filter trivially passes everyone AND the display-only red-on-fail can never fire.
 23. **`consec_*_beats_quarter_cap` is per-side, independent, and pool-defining.** EPS cap controls only the EPS side; Rev cap only the Rev side. Default 0 means no cap — and no cap means the FULL history, not MAX_BEATS_QUARTERS=20 (that constant is a display ceiling only; 95 live tickers have a longer streak than 20). Values 1-20 restrict the pool at the scanner level via `past_pref.head(cap)`, so the cap bounds both the populated `q*_*` columns and the streak `compute_consecutive_beats` can report.
