@@ -945,9 +945,19 @@ silently invisible to a momentum scan.
 `% Gain P/S`, `P/S Start` and `RS S&P P/S` therefore sit **beside** the originals
 rather than replacing them. This is a different measurement, not a correction:
 `pct_gain_over_period` and `relative_strength_ratio` are untouched, so every
-saved preset keeps its exact current meaning. For the ~87% of tickers with no
-qualifying split in the window the two columns are identical by construction —
-`_compute_ticker` reuses the already-computed value rather than recomputing it.
+saved preset keeps its exact current meaning.
+
+**They are N/A unless a split falls inside the window they measure** (the
+user's rule, 2026-10-18). `% Gain P/S` / `P/S Start` measure over the scan
+window. `RS S&P P/S` measures over the RS row's own window: its last `Days`
+bars, or the scan window when the row's **Scan Window** box is ticked. Until
+then the P/S columns fell back to the un-anchored figure — so every ticker
+showed a number and the ones with a split could not be told apart — and
+`RS S&P P/S`, handed the whole price history, anchored on a split of ANY age:
+with a 20-day lookback, a split 250 bars back made it a ~249-bar ratio sitting
+next to a 20-bar RS S&P. An ex-date on the window's first bar counts as inside
+it (the anchor skips exactly that bar); fewer than `MIN_POST_SPLIT_BARS` (3)
+bars after the split is N/A.
 
 The anchor **excludes** the ex-date bar. That bar *should* already be on the
 post-split basis but empirically is not always: GTIC's 1-for-100 leaves it at
@@ -958,8 +968,7 @@ window of a hundred-plus and is robust to the boundary landing on either side.
 
 The benchmark is sliced by **date**, not position — a thin ticker can be missing
 bars the benchmark has, and positional slicing would compare two different
-periods. Fewer than `MIN_POST_SPLIT_BARS` (3) after the anchor falls back to the
-un-anchored figure.
+periods.
 
 **As of 2026-09-07 the base `relative_strength_ratio` slices by date too.** It
 was still taking `bench_df.iloc[-lookback:]`, so the rationale above applied to
@@ -977,8 +986,9 @@ slightly differently than before.
 | Column | Always present? | Source |
 |--------|-----------------|--------|
 | `symbol`, `close`, `price`, `pct_gain`, `gain_start_date` | Yes (per-ticker baseline) | `_compute_ticker` |
-| `pct_gain_post_split`, `post_split_start_date` | Yes (v6.1.0 — joined the always-on bundle, paired with `pct_gain`) | `indicators.pct_gain_post_split` |
-| `rs_market_post_split` | Iff RS-vs-S&P enabled-or-display | `indicators.relative_strength_post_split` |
+| `pct_gain_post_split`, `post_split_start_date` | Yes (v6.1.0 — joined the always-on bundle, paired with `pct_gain`); NaN / None unless a split falls inside the scan window | `indicators.pct_gain_post_split` |
+| `rs_market`, `rs_nasdaq`, `rs_sector` | Iff the matching RS row is enabled-or-display | `indicators.relative_strength_ratio` over the last `*_lookback` bars, or over the scan window when `*_scan_window` is set |
+| `rs_market_post_split` | Iff RS-vs-S&P enabled-or-display; NaN unless a split falls inside the RS window (lookback or scan window) | `indicators.relative_strength_post_split` |
 | `sma{period}` | Iff sma1/sma2 enabled-or-display | `indicators.price_above_sma` |
 | `sti`, `dist_high_pct`, `consec_gaps`, ... | Iff matching filter active | `indicators.*` |
 | `rvol` | Iff rvol enabled-or-display | `indicators.relative_volume` (last bar's volume ÷ mean of the prior `rvol_lookback` bars) |
@@ -1238,9 +1248,8 @@ producer then.
 appear (~1,900 of 14.6k). Feeds the post-split momentum columns.
 
 Both readers degrade cleanly when a file is absent — an empty skip list scans
-everything, and absent anchors make the post-split columns mirror their
-un-anchored counterparts — so the first launch after an install is never wrong,
-only unfiltered. Both writes are atomic, so a scan running mid-rebuild cannot
+everything, and absent anchors leave the post-split columns N/A — so the first
+launch after an install is never wrong, only unfiltered. Both writes are atomic, so a scan running mid-rebuild cannot
 see a torn file.
 
 **`data_engine.is_share_split(ratio)`** is the structural gate in front of both.
@@ -2894,6 +2903,15 @@ too. Hidden date columns are offered unticked in the Excel export dialog, and
 Start / End take part in the earnings date-match colouring like Last Report
 Date.
 
+**Q-1 Dates Only** (v8.2.0), the button beside Show All, hides every Q-X Date
+column except Q-1's, EPS and Rev, in one click; a second click brings them
+back. It is a hide type of its own, **Q-X Dates except Q-1**, listed first in
+Hide Q Columns ▾ — a rule rather than a list of columns, so it covers however
+many quarters a later scan draws. The button and the tick are the same state,
+it is saved with presets (`hidden_earnings_col_types`), and Show All clears
+it. The type id is `older_q_dates`, deliberately not `q_…`: the colour-rule
+editor turns every `q_` type into a `q{k}_…` column template.
+
 **Hovering an earnings cell** names the quarter it belongs to:
 
 - a Q-X cell — `Q-3 · reported 2026-02-10 · fiscal quarter 2025-12`;
@@ -2901,6 +2919,17 @@ Date.
 - any cell of a series filter (count, Span, V, Avg, Max, Start, End) — the run:
   `Run · reported 2025-05-06 → 2026-05-05 · fiscal quarters 2025-03 → 2026-03`;
 - Days Since / Until ER — the report date.
+
+A **V** cell (v8.2.0) first says what its two numbers are — e.g. `Revenue
+surprise % in the run's first (oldest) → last (newest) quarter` — then the run
+line. The six V column **headers** carry a longer explanation: the metric, the
+rule the run follows (accelerating: each step at least Step pp, first quarter
+at least Start %; growth: every quarter at least Growth %, no acceleration
+needed), and that the run is the one the Series setting picked, so it may not
+end on the latest quarter. `header_tooltip` / `HEADER_TOOLTIPS` in
+`gui/widgets.py`; `ResultsTable._apply_header_tooltips` sets or clears every
+header's tip on each layout, because `setHorizontalHeaderLabels` reuses the
+header items and a tip left on index i would follow the next column there.
 
 The text is built only when you hover (from the frame on screen), so a large
 render pays nothing for it. The fiscal quarter is there because report order
@@ -3774,6 +3803,62 @@ therefore refreshes that ticker's attributes at no extra cost, independently
 of whether the sweep ever runs.
 
 ## Changelog
+
+### v8.2.0 — RS Scan Window, P/S columns N/A without a split, Q-1 Dates Only, V tooltips, plain-English reconcile (2026-10-18)
+
+**Q-1 Dates Only.** A button beside Hide Q Columns' Show All hides every Q-X
+Date column except Q-1's (EPS and Rev) in one click, and a second click brings
+them back. Built as a hide type ("Q-X Dates except Q-1") so it covers any
+number of quarters, saves with the preset and is cleared by Show All. See
+[Earnings date columns and hover tooltips](#earnings-date-columns-and-hover-tooltips-v802).
+
+**The V columns explain themselves.** Hovering a V header (Accel … V, Consec
+YoY … Grw V) explains that it is the metric in the run's first (oldest) and
+last (newest) quarter and what rule the run follows; hovering a V cell says the
+same in one line above the run's dates.
+
+**The reconcile counts read as plain English.** After every earnings-dates
+reconcile the log said `z=…, y=…, aug=…`; it now says how many tickers got
+their dates from past earnings reports (Finviz / Zacks / Finnhub), how many
+from the earnings calendars (Nasdaq / Yahoo), and how many used both. The
+Data-menu Reconcile action reports the same wording (in the status bar — the
+log line already reaches the log panel, so it is no longer printed twice). The
+counters themselves are unchanged.
+
+Smoke-tested with a real window on a scratch copy of the store (600 tickers,
+Beats + Growth + Accelerating rows on): Q-1 Dates Only removed exactly the 38
+Q-2+ date columns and a second click restored the identical layout; the
+Quarter view kept all 20 quarter dates; every V header and cell carried its
+explanation; a full reconcile reported 7,306 tickers in the new wording, once.
+Eleven deliberate mutations of these changes were all caught. The button sits
+outside the Hide Q Columns group: inside it, the group (which never wraps)
+widened the window's minimum by ~170 px and broke the 1,080 px fit.
+
+**Each RS row gains a Scan Window box.** RS vs S&P 500, RS vs NASDAQ and RS
+vs Sector ETF each have a `Scan Window` checkbox next to Days. Ticked, the row
+measures relative strength over the scan's own Start → End range — the same
+base bar as `% Gain` — and Days is greyed out and unused. Saved in presets; a
+preset written before the box existed loads with it unticked. A filtering RS
+row says so in the funnel (`RS S&P >= 1.0 (scan window)`).
+
+**`% Gain P/S`, `P/S Start` and `RS S&P P/S` are N/A unless a split falls
+inside their window.** They used to fall back to the un-anchored figure, so
+every ticker showed a number. `RS S&P P/S` was also handed the whole price
+history, so a split of ANY age anchored it: on the 2026-10-16 store, 1,890
+tickers showed an RS S&P P/S measured from a split outside the 20-day lookback
+(e.g. ABEO from a 2022 split, next to a 20-day RS S&P). It now uses its row's
+window — the last Days bars, or the scan window when the box is ticked — and
+`% Gain P/S` uses the scan window as before. An ex-date on the window's first
+bar now counts as inside it (the anchor skips that bar, which is the one that
+can still be quoted on the old basis — WCUFF's zero-volume 0.148 print).
+
+`RS S&P`, `RS Nas`, `RS Sec` and `% Gain` are unchanged with the box unticked.
+Smoke-tested on a scratch copy of the store (14,880 tickers, 3M / 1Y windows):
+every non-P/S cell identical to v8.1.0 (206,822 cells); every RS and P/S cell
+equal to an independent recomputation from the prices across five scans
+(lookback and Scan Window, 1W / 3M / 1Y); the real panel → scan → table path
+renders `N/A` for tickers without a split. Twelve deliberate mutations of the
+change were all caught by the tests.
 
 ### v8.1.0 — Quarter view (2026-10-04)
 

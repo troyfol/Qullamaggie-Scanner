@@ -20,7 +20,6 @@ from trade_scanner_fh.indicators import (
     pct_gain_over_period,
     pct_gain_post_split,
     relative_strength_post_split,
-    relative_strength_ratio,
 )
 
 
@@ -85,6 +84,21 @@ def test_anchor_before_window_is_ignored():
     assert anchored is False
 
 
+def test_anchor_on_the_windows_first_bar_is_inside_it():
+    """The split happened ON the window's first bar, so it is inside the
+    window — and that bar is exactly the base the anchor must skip."""
+    df = _px([99, 1, 2, 3])
+    sub, anchored = anchor_after_split(df, df.index[0])
+    assert anchored is True
+    assert list(sub["Close"]) == [1, 2, 3]
+
+
+def test_anchor_after_the_window_is_not_inside_it():
+    """A backdated scan can end before the split; nothing follows it."""
+    df = _px([1, 2, 3, 4])
+    assert anchor_after_split(df, df.index[-1] + pd.Timedelta(days=5))[1] is False
+
+
 def test_too_few_post_anchor_bars_falls_back():
     df = _px([10, 10, 10, 1, 1])
     sub, anchored = anchor_after_split(df, df.index[4])
@@ -113,9 +127,24 @@ def test_post_split_gain_ignores_pre_split_collapse():
     assert start == df.index[4].date()
 
 
-def test_identical_when_no_split():
+def test_post_split_gain_is_na_without_a_split():
+    """N/A, not the un-anchored figure: a number in every row hid which
+    tickers actually had a split (the user's rule, 2026-10-18)."""
     df = _px([10, 11, 12, 13])
-    assert pct_gain_post_split(df, None) == pct_gain_over_period(df)
+    pct, start = pct_gain_post_split(df, None)
+    assert np.isnan(pct) and start is None
+
+
+def test_post_split_gain_is_na_when_the_split_predates_the_window():
+    df = _px([10, 11, 12, 13])
+    pct, start = pct_gain_post_split(df, pd.Timestamp("2020-01-01"))
+    assert np.isnan(pct) and start is None
+
+
+def test_post_split_gain_is_na_with_too_few_bars_after_the_split():
+    df = _px([10, 10, 10, 99, 1, 1])
+    pct, start = pct_gain_post_split(df, df.index[4])
+    assert np.isnan(pct) and start is None
 
 
 def test_rs_post_split_uses_date_aligned_benchmark():
@@ -128,7 +157,7 @@ def test_rs_post_split_uses_date_aligned_benchmark():
     stock = stock.drop(stock.index[4])
     anchor = stock.index[2]                     # the ex-date bar (99)
 
-    got = relative_strength_post_split(stock, bench, anchor, lookback=4)
+    got = relative_strength_post_split(stock, bench, anchor, lookback=5)
 
     # Correct: stock 1 -> 4 over d3..d6, benchmark 53 -> 56 over the SAME dates.
     assert got == pytest.approx(4.0 / (56 / 53))
@@ -137,18 +166,48 @@ def test_rs_post_split_uses_date_aligned_benchmark():
     assert got != pytest.approx(4.0 / (56 / 54))
 
 
-def test_rs_post_split_falls_back_without_anchor():
+def test_rs_post_split_is_na_without_anchor():
     stock = _px([10, 11, 12, 13])
     bench = _px([50, 51, 52, 53])
-    assert relative_strength_post_split(stock, bench, None, lookback=4) == \
-        relative_strength_ratio(stock, bench, lookback=4)
+    assert np.isnan(relative_strength_post_split(stock, bench, None, lookback=4))
+
+
+def test_rs_post_split_is_na_when_the_split_predates_the_lookback():
+    """The bug the user caught: handed the whole history, the P/S RS anchored
+    on a split 250 bars back and measured ~249 bars against a 20-bar RS S&P.
+    A split outside the RS lookback is not inside the window — N/A."""
+    stock = _px(list(np.linspace(10, 40, 300)))
+    bench = _px([100.0] * 300)
+    assert np.isnan(relative_strength_post_split(
+        stock, bench, stock.index[50], lookback=20))
+
+
+def test_rs_post_split_inside_the_lookback_measures_from_the_split():
+    stock = _px([100.0] * 290 + [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+    bench = _px([100.0] * 300)
+    anchor = stock.index[289]                   # ex-date bar, 11 bars from the end
+    # 1 -> 10 off the post-split base (the 100s before it are ignored)
+    assert relative_strength_post_split(
+        stock, bench, anchor, lookback=20) == pytest.approx(10.0)
+    # ...and a ratio under the cap is exact
+    stock2 = _px([100.0] * 290 + [4, 4, 4, 4, 4, 5, 5, 5, 5, 6])
+    assert relative_strength_post_split(
+        stock2, bench, anchor, lookback=20) == pytest.approx(6 / 4)
+
+
+def test_rs_post_split_is_na_on_short_history():
+    """Mirrors `relative_strength_ratio`: fewer bars than the lookback is N/A."""
+    stock = _px([100, 99, 1, 2, 3])
+    bench = _px([50] * 5)
+    assert np.isnan(relative_strength_post_split(
+        stock, bench, stock.index[1], lookback=20))
 
 
 def test_rs_post_split_keeps_the_upside_cap():
     stock = _px([100, 100, 99, 1, 50, 900])
     bench = _px([50, 50, 50, 50, 50, 50])
     assert relative_strength_post_split(
-        stock, bench, stock.index[2], lookback=4) == 10.0
+        stock, bench, stock.index[2], lookback=5) == 10.0
 
 
 def test_rs_post_split_nan_on_empty_benchmark():
@@ -225,7 +284,8 @@ def test_existing_columns_unchanged_by_the_feature(monkeypatch, tmp_path):
 
     assert plain["pct_gain"] == anchored["pct_gain"]
     assert plain["gain_start_date"] == anchored["gain_start_date"]
-    # ...while the new column diverges exactly where a split exists
+    # ...while the new column carries a value exactly where a split exists
     assert anchored["pct_gain_post_split"] != anchored["pct_gain"]
     assert anchored["pct_gain_post_split"] == pytest.approx(400.0)  # 1 -> 5
-    assert plain["pct_gain_post_split"] == plain["pct_gain"]
+    assert np.isnan(plain["pct_gain_post_split"])
+    assert plain["post_split_start_date"] is None

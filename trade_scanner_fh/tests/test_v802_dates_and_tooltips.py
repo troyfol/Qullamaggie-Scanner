@@ -348,7 +348,12 @@ def test_tooltip_text_for_each_kind_of_earnings_cell():
     assert tip("reported_eps", row) == \
         "Most recent quarter · reported 2026-05-05 · fiscal quarter 2026-03"
     assert tip("last_report_date", row) == tip("reported_eps", row)
+    # v8.2.0: a V cell first says what its two numbers are.
     assert tip("accel_eps_yoy_vals", row) == (
+        "YoY EPS growth % in the run's first (oldest) → last (newest) quarter\n"
+        "Run · reported 2025-05-06 → 2026-05-05 · "
+        "fiscal quarters 2025-03 → 2026-03")
+    assert tip("accel_eps_yoy_span", row) == (
         "Run · reported 2025-05-06 → 2026-05-05 · "
         "fiscal quarters 2025-03 → 2026-03")
     # The visible Start / End columns stand in for the internal keys.

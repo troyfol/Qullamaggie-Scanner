@@ -424,22 +424,27 @@ class ScanParams:
     rvol_min: float = 1.5
 
     # --- Relative Strength ---
+    # `*_scan_window`: measure over the scan's own Start → End window instead
+    # of the last `*_lookback` bars (the lookback is then unused).
     # #15  RS vs S&P 500 (SPY)
     rs_market_enabled: bool = False
     rs_market_display_only: bool = False
     rs_market_lookback: int = 20
+    rs_market_scan_window: bool = False
     rs_market_min: float = 1.0
 
     # #15b RS vs NASDAQ (ONEQ)
     rs_nasdaq_enabled: bool = False
     rs_nasdaq_display_only: bool = False
     rs_nasdaq_lookback: int = 20
+    rs_nasdaq_scan_window: bool = False
     rs_nasdaq_min: float = 1.0
 
     # #16  RS vs Sector ETF
     rs_sector_enabled: bool = False
     rs_sector_display_only: bool = False
     rs_sector_lookback: int = 20
+    rs_sector_scan_window: bool = False
     rs_sector_min: float = 1.0
 
     # --- Global Earnings Mode (replaces per-filter include_no_data) ---
@@ -975,19 +980,11 @@ def _compute_ticker(
     # present in the frame, so gating these behind a toggle would make them
     # vanish from a filterless scan — and the whole point of carrying both
     # measurements is being able to see them side by side without configuring
-    # anything. The cost is a dict lookup and, only for the ~18% of tickers that
-    # actually have an anchor, one extra slice.
+    # anything. N/A unless a split falls inside the scan window.
     split_anchor = (split_anchors or {}).get(symbol.upper())
-    if split_anchor is None:
-        # No anchor: reuse the values already computed rather than recomputing
-        # an identical result. Makes "identical when there is no split"
-        # structural instead of merely arithmetic.
-        row["pct_gain_post_split"] = pct
-        row["post_split_start_date"] = gain_start
-    else:
-        ps_pct, ps_start = indicators.pct_gain_post_split(window, split_anchor)
-        row["pct_gain_post_split"] = ps_pct
-        row["post_split_start_date"] = ps_start
+    ps_pct, ps_start = indicators.pct_gain_post_split(window, split_anchor)
+    row["pct_gain_post_split"] = ps_pct
+    row["post_split_start_date"] = ps_start
 
     # Phase 3 I2 + Phase 8 §8.5: every indicator below is gated on
     # `_enabled OR _display_only`. Display-only computes the value
@@ -1193,31 +1190,40 @@ def _compute_ticker(
             full_to_end, lookback=params.rvol_lookback
         )
 
+    def _rs_span(prefix: str):
+        """(frame, lookback) an RS row measures: the scan window itself when
+        its Scan Window box is ticked, else the last `lookback` bars up to
+        the End date. The window is already sliced to Start → End, so a
+        lookback of its own length makes `relative_strength_ratio` measure
+        exactly that span."""
+        if getattr(params, f"{prefix}_scan_window", False):
+            return window, len(window)
+        return full_to_end, getattr(params, f"{prefix}_lookback")
+
     if (params.rs_market_enabled or params.rs_market_display_only) \
             and benchmark_data and "SPY" in benchmark_data:
+        rs_df, rs_lb = _rs_span("rs_market")
         row["rs_market"] = indicators.relative_strength_ratio(
-            full_to_end, benchmark_data["SPY"],
-            lookback=params.rs_market_lookback,
+            rs_df, benchmark_data["SPY"], lookback=rs_lb,
         )
         row["rs_market_post_split"] = indicators.relative_strength_post_split(
-            full_to_end, benchmark_data["SPY"], split_anchor,
-            lookback=params.rs_market_lookback,
+            rs_df, benchmark_data["SPY"], split_anchor, lookback=rs_lb,
         )
 
     if (params.rs_nasdaq_enabled or params.rs_nasdaq_display_only) \
             and benchmark_data and "ONEQ" in benchmark_data:
+        rs_df, rs_lb = _rs_span("rs_nasdaq")
         row["rs_nasdaq"] = indicators.relative_strength_ratio(
-            full_to_end, benchmark_data["ONEQ"],
-            lookback=params.rs_nasdaq_lookback,
+            rs_df, benchmark_data["ONEQ"], lookback=rs_lb,
         )
 
     if (params.rs_sector_enabled or params.rs_sector_display_only) \
             and sector_lookup and benchmark_data:
         etf = sector_lookup.get(symbol)
         if etf and etf in benchmark_data:
+            rs_df, rs_lb = _rs_span("rs_sector")
             row["rs_sector"] = indicators.relative_strength_ratio(
-                full_to_end, benchmark_data[etf],
-                lookback=params.rs_sector_lookback,
+                rs_df, benchmark_data[etf], lookback=rs_lb,
             )
 
     if (params.days_since_earnings_enabled
@@ -2439,6 +2445,10 @@ def _build_filter_stages(params: ScanParams) -> list[tuple[str, Callable]]:
             lambda df, p=params: df["rvol"] >= p.rvol_min,
         ))
 
+    # An RS row measured over the scan window says so in its funnel label.
+    def _rs_span_note(prefix: str) -> str:
+        return " (scan window)" if getattr(params, f"{prefix}_scan_window", False) else ""
+
     # #15 RS vs S&P 500. Fail CLOSED when the rs_market column is absent — that
     # happens only when the SPY benchmark failed to load so NO ticker got an
     # rs_market value. An explicitly-enabled gate with no data must drop rows
@@ -2448,7 +2458,7 @@ def _build_filter_stages(params: ScanParams) -> list[tuple[str, Callable]]:
     # copy that here — these gates fail NaN via the comparison.)
     if params.rs_market_enabled and not params.rs_market_display_only:
         stages.append((
-            f"RS S&P >= {params.rs_market_min}",
+            f"RS S&P >= {params.rs_market_min}{_rs_span_note('rs_market')}",
             lambda df, p=params: (
                 df["rs_market"] >= p.rs_market_min
                 if "rs_market" in df.columns
@@ -2459,7 +2469,7 @@ def _build_filter_stages(params: ScanParams) -> list[tuple[str, Callable]]:
     # #15b RS vs NASDAQ — same fail-closed guard as #15 (ONEQ benchmark).
     if params.rs_nasdaq_enabled and not params.rs_nasdaq_display_only:
         stages.append((
-            f"RS NASDAQ >= {params.rs_nasdaq_min}",
+            f"RS NASDAQ >= {params.rs_nasdaq_min}{_rs_span_note('rs_nasdaq')}",
             lambda df, p=params: (
                 df["rs_nasdaq"] >= p.rs_nasdaq_min
                 if "rs_nasdaq" in df.columns
@@ -2470,7 +2480,7 @@ def _build_filter_stages(params: ScanParams) -> list[tuple[str, Callable]]:
     # #16 RS vs Sector (missing data passes)
     if params.rs_sector_enabled and not params.rs_sector_display_only:
         stages.append((
-            f"RS Sector >= {params.rs_sector_min}",
+            f"RS Sector >= {params.rs_sector_min}{_rs_span_note('rs_sector')}",
             lambda df, p=params: (df["rs_sector"] >= p.rs_sector_min) | df["rs_sector"].isna(),
         ))
 

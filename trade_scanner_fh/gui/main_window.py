@@ -1430,6 +1430,27 @@ class MainWindow(QMainWindow):
         )
         type_row.addWidget(self.btn_show_all_col_types)
 
+        # Quick-select (2026-10-18): one click hides every Q-X Date but
+        # Q-1's — the same hide type as "Q-X Dates except Q-1" in the
+        # dropdown, so the two always agree and it saves with the preset.
+        # Checkable so it shows the state and a second click undoes it.
+        #
+        # Its own flow item, NOT part of the group above: a group never
+        # wraps internally, so adding the button (and the caption after it)
+        # to it widened the bar's minimum by ~190 px and pushed the window
+        # past the 1,080 px monitor (`test_window_fits_a_1080_wide_monitor`).
+        type_row.end_group()
+        self.btn_q1_dates_only = QPushButton("Q-1 Dates Only")
+        self.btn_q1_dates_only.setCheckable(True)
+        self.btn_q1_dates_only.setToolTip(
+            "Hide every Q-X Date column except Q-1's (EPS and Rev), however "
+            "many quarters the scan shows. Click again to bring them back. "
+            "Same as ticking 'Q-X Dates except Q-1' under Hide Q Columns; "
+            "saved with the preset."
+        )
+        self.btn_q1_dates_only.toggled.connect(self._on_q1_dates_only_toggled)
+        type_row.addWidget(self.btn_q1_dates_only)
+
         self.lbl_hidden_types = QLabel("")
         self.lbl_hidden_types.setStyleSheet("color: #888;")
         type_row.addWidget(self.lbl_hidden_types)
@@ -6028,7 +6049,9 @@ class MainWindow(QMainWindow):
 
     def _reconcile_earnings_dates_action(self):
         """Menu: force a full universe-wide reconcile of earnings_dates."""
-        from ..earnings_reconcile import reconcile_earnings_dates
+        from ..earnings_reconcile import (
+            describe_reconcile_counts, reconcile_earnings_dates,
+        )
         try:
             z, y, aug = reconcile_earnings_dates()
         except Exception as exc:
@@ -6036,12 +6059,9 @@ class MainWindow(QMainWindow):
                 self, "Reconcile Failed", f"Reconcile error: {exc}",
             )
             return
-        msg = (
-            f"Reconcile complete — history-sourced: {z}, "
-            f"dates-passthrough: {y}, augmented: {aug}."
-        )
-        self.log_panel.write_line(msg)
-        self.status.showMessage(msg)
+        # The reconcile logs this same sentence, and the `scanner` logger
+        # already feeds the log panel, so only the status bar gets it here.
+        self.status.showMessage(describe_reconcile_counts(z, y, aug))
 
     # ── Phase 6.5 Diagnostics ────────────────────────────────────────
 
@@ -8260,6 +8280,29 @@ class MainWindow(QMainWindow):
                 self._shown_default_earnings_col_types.add(type_id)
         self._apply_hidden_column_types()
 
+    def _on_q1_dates_only_toggled(self, checked: bool):
+        """The "Q-1 Dates Only" button: toggles the older-Q-dates type."""
+        from .widgets import OLDER_Q_DATES_TYPE
+        if checked == (OLDER_Q_DATES_TYPE in self._hidden_earnings_col_types):
+            return                    # already in that state (a resync)
+        self._on_hide_type_toggled(OLDER_Q_DATES_TYPE, checked)
+
+    def _sync_q1_dates_only_button(self) -> None:
+        """Make the button show the type's state, whichever control (or a
+        preset load) changed it, without re-firing its slot."""
+        from .widgets import OLDER_Q_DATES_TYPE
+        try:
+            btn = self.btn_q1_dates_only
+            on = OLDER_Q_DATES_TYPE in self._hidden_earnings_col_types
+        except (AttributeError, RuntimeError, TypeError):
+            return
+        if btn.isChecked() != on:
+            btn.blockSignals(True)
+            try:
+                btn.setChecked(on)
+            finally:
+                btn.blockSignals(False)
+
     def _on_show_all_column_types(self):
         from .widgets import DEFAULT_HIDDEN_EARNINGS_TYPES
         if not self._effective_hidden_earnings_types():
@@ -8337,6 +8380,7 @@ class MainWindow(QMainWindow):
         """
         earnings = self._effective_hidden_earnings_types()
         fv = set(self._hidden_fv_col_types)
+        self._sync_q1_dates_only_button()
         try:
             self.results_table.set_hidden_column_types(earnings | fv)
         except (AttributeError, RuntimeError) as exc:

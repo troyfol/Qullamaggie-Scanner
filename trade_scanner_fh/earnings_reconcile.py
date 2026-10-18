@@ -292,6 +292,19 @@ def _classify(last_src: Optional[str], next_src: Optional[str]) -> str:
     return "y"
 
 
+def describe_reconcile_counts(z: int, y: int, aug: int) -> str:
+    """The (z, y, aug) counters in plain English, for the log and the
+    Reconcile menu action (2026-10-18). The bare letters meant nothing to a
+    new user; the counters themselves are unchanged (`_classify`)."""
+    total = z + y + aug
+    return (
+        f"Earnings dates reconciled for {total:,} ticker(s): "
+        f"{z:,} from past earnings reports (Finviz / Zacks / Finnhub), "
+        f"{y:,} from the earnings calendars (Nasdaq / Yahoo), "
+        f"{aug:,} using both (one date from each)."
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # reconcile_earnings_dates
 # ──────────────────────────────────────────────────────────────────────
@@ -476,10 +489,7 @@ def reconcile_earnings_dates(
         else:
             combined = new_df
         ec.save_earnings_cache(combined)
-    log.info(
-        "Reconciled earnings_dates.parquet: z=%d, y=%d, aug=%d",
-        z_count, y_count, aug_count,
-    )
+    log.info("%s", describe_reconcile_counts(z_count, y_count, aug_count))
     return z_count, y_count, aug_count
 
 

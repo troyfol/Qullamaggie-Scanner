@@ -144,15 +144,17 @@ def test_compute_ticker_all_disabled_produces_always_on_keys_only(tmp_path, monk
     }
 
 
-def test_always_on_post_split_keys_mirror_the_originals_without_an_anchor(
+def test_always_on_post_split_keys_are_na_without_an_anchor(
         tmp_path, monkeypatch):
-    """The two added always-on keys must be exactly the un-anchored values when
-    the ticker has no split, so adding them changed nothing for ~89% of the
-    universe."""
+    """The two always-on P/S keys are N/A when the ticker has no split — they
+    used to mirror the un-anchored values, which hid which tickers actually
+    had one (the user's rule, 2026-10-18). The keys stay present, so the
+    columns still render."""
     _make_fake_parquet(tmp_path, monkeypatch, "TEST", days=80)
     row = scanner._compute_ticker("TEST", _all_disabled_params())
-    assert row["pct_gain_post_split"] == row["pct_gain"]
-    assert row["post_split_start_date"] == row["gain_start_date"]
+    assert pd.isna(row["pct_gain_post_split"])
+    assert row["post_split_start_date"] is None
+    assert not pd.isna(row["pct_gain"])
 
 
 def test_compute_ticker_enabled_indicators_included(tmp_path, monkeypatch):

@@ -169,6 +169,12 @@ def pct_gain_over_period(df: pd.DataFrame) -> tuple[float, "_date | None"]:
 # These are therefore a DIFFERENT MEASUREMENT, not a correction, and they live
 # in their own columns so every saved preset keeps its exact current meaning.
 #
+# They are N/A unless a split falls INSIDE the window they measure (the
+# user's rule, 2026-10-18). Until then they fell back to the un-anchored
+# figure, so a P/S column showed a number for every ticker and the ~1,900 with
+# a split could not be told apart from the rest; and RS S&P P/S, handed the
+# whole history, anchored on a split years before its own lookback.
+#
 # Minimum post-anchor bars before a figure is reported at all. Below this the
 # base is a single price with no context, which is noise rather than a signal.
 MIN_POST_SPLIT_BARS = 3
@@ -179,8 +185,9 @@ def anchor_after_split(df: pd.DataFrame, anchor):
 
     Returns ``(frame, anchored)``. ``anchored`` is False — and the frame is
     returned unchanged — when there is no anchor, the anchor predates the
-    window, or too few bars follow it. Callers then report the un-anchored
-    value, so a ticker with no split reads identically in both columns.
+    window, or too few bars follow it. The P/S measurements are then N/A.
+    An ex-date ON the window's first bar is inside the window: the split
+    happened there, and that bar is the one the base must not be taken from.
 
     The ex-date bar is EXCLUDED. It "should" already be quoted on the
     post-split basis, but empirically it is not always: GTIC's 1-for-100 on
@@ -201,7 +208,7 @@ def anchor_after_split(df: pd.DataFrame, anchor):
     idx = df.index
     if getattr(idx, "tz", None) is not None:
         ts = ts.tz_localize(idx.tz) if ts.tzinfo is None else ts
-    if ts <= idx[0]:
+    if ts < idx[0]:
         return df, False          # split predates the window: nothing to anchor
     sub = df.loc[idx > ts]
     if len(sub) < MIN_POST_SPLIT_BARS:
@@ -212,12 +219,12 @@ def anchor_after_split(df: pd.DataFrame, anchor):
 def pct_gain_post_split(df: pd.DataFrame, anchor) -> tuple[float, "_date | None"]:
     """#4b  % gain measured from the most recent split ex-date.
 
-    Identical to `pct_gain_over_period` when the ticker has no qualifying split
-    inside the window, so the two columns only diverge where a split exists.
+    ``df`` is the scan window. ``(nan, None)`` — N/A — unless a qualifying
+    split falls inside it.
     """
     sub, anchored = anchor_after_split(df, anchor)
     if not anchored:
-        return pct_gain_over_period(df)
+        return np.nan, None
     return pct_gain_over_period(sub)
 
 
@@ -230,13 +237,21 @@ def relative_strength_post_split(
 ) -> float:
     """#RS-b  Relative strength measured from the most recent split ex-date.
 
+    The RS window is the stock's last ``lookback`` bars — the span
+    `relative_strength_ratio` measures (the scanner passes the scan window
+    with ``lookback=len(window)`` for a Scan Window row). N/A unless the
+    split falls inside that window; a split anywhere earlier in the history
+    is not this measurement's business.
+
     The benchmark is sliced by DATE to the stock's anchored range rather than
     by position: a thin ticker can be missing bars the benchmark has, and
     positional slicing would then silently compare two different periods.
     """
-    sub, anchored = anchor_after_split(stock_df, anchor)
+    if stock_df is None or len(stock_df) < lookback:
+        return np.nan
+    sub, anchored = anchor_after_split(stock_df.iloc[-lookback:], anchor)
     if not anchored:
-        return relative_strength_ratio(stock_df, bench_df, lookback=lookback)
+        return np.nan
     if bench_df is None or bench_df.empty or len(sub) < 2:
         return np.nan
     bench = bench_df.loc[sub.index[0]:sub.index[-1]]

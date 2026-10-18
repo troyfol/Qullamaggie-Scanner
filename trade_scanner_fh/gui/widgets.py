@@ -480,6 +480,11 @@ _ACCEL_ROW_KEYS: tuple[str, ...] = (
 )
 
 
+# The relative-strength rows. Each carries a `Scan Window` box that swaps its
+# Days lookback for the scan's own Start → End range.
+_RS_ROW_KEYS: tuple[str, ...] = ("rs_market", "rs_nasdaq", "rs_sector")
+
+
 # Every row carrying the Series / Backward Only pair. The accelerating rows
 # had them first; v6.3.0 added them to beats and growth so all three series
 # filter types answer the same questions the same way.
@@ -738,23 +743,30 @@ class IndicatorPanel(QScrollArea):
             {"name": "max_pct", "label": "Max %", "type": "float", "default": 5.0, "min": 0.0, "max": 100.0, "step": 0.5},
         ])
 
+        # `Scan Window` measures RS over the scan's Start → End range instead
+        # of the last N days, and greys out Days; see `_wire_rs_scan_window`.
         self._add("rs_market", "RS vs S&P 500 (SPY)", [
             {"name": "lookback", "label": "Days", "type": "int", "default": 20, "min": 5, "max": 252},
+            {"name": "scan_window", "label": "Scan Window", "type": "checkbox", "default": False},
             {"name": "min_ratio", "label": "Min", "type": "float", "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05},
         ])
         self.rows["rs_market"].set_enabled(False)
 
         self._add("rs_nasdaq", "RS vs NASDAQ (ONEQ)", [
             {"name": "lookback", "label": "Days", "type": "int", "default": 20, "min": 5, "max": 252},
+            {"name": "scan_window", "label": "Scan Window", "type": "checkbox", "default": False},
             {"name": "min_ratio", "label": "Min", "type": "float", "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05},
         ])
         self.rows["rs_nasdaq"].set_enabled(False)
 
         self._add("rs_sector", "RS vs Sector ETF", [
             {"name": "lookback", "label": "Days", "type": "int", "default": 20, "min": 5, "max": 252},
+            {"name": "scan_window", "label": "Scan Window", "type": "checkbox", "default": False},
             {"name": "min_ratio", "label": "Min", "type": "float", "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05},
         ])
         self.rows["rs_sector"].set_enabled(False)
+        for _key in _RS_ROW_KEYS:
+            self._wire_rs_scan_window(_key)
 
         # --- Momentum / Prior Move ---
         self._section("Momentum / Prior Move")
@@ -1459,6 +1471,50 @@ class IndicatorPanel(QScrollArea):
                     "" if on else IndicatorRow._GREYED_INPUT_STYLE
                 )
 
+    # ── RS Scan Window greyout ───────────────────────────────────────
+
+    @staticmethod
+    def _apply_rs_scan_window(row: "IndicatorRow"):
+        scan_window = row.spinboxes.get("scan_window")
+        days = row.spinboxes.get("lookback")
+        if scan_window is None or days is None:
+            return
+        on = scan_window.isChecked()
+        days.setEnabled(not on)
+        days.setStyleSheet(IndicatorRow._GREYED_INPUT_STYLE if on else "")
+
+    def _wire_rs_scan_window(self, key: str):
+        """Grey out an RS row's Days while its Scan Window box is ticked —
+        the scan's Start → End range is the span then, so the lookback is
+        unused. Same visual treatment as the Backward-Only greyout:
+        `setEnabled(False)` plus the explicit muted stylesheet."""
+        row = self.rows[key]
+        scan_window = row.spinboxes.get("scan_window")
+        if scan_window is None:
+            return
+        scan_window.setToolTip(
+            "Measure relative strength over the scan's own date range "
+            "(Start → End) instead of the last N days. Days is unused "
+            "while this is ticked.")
+        # Filter / Display Only toggles strip every input's stylesheet
+        # (`_apply_display_only_styling`, `_on_filter_toggled`); these are
+        # connected after the row's own slots, so they re-grey Days after it.
+        signals = [scan_window.toggled, row.toggle.toggled]
+        if row.display_only is not None:
+            signals.append(row.display_only.toggled)
+        for signal in signals:
+            signal.connect(lambda _on, r=row: self._apply_rs_scan_window(r))
+        self._apply_rs_scan_window(row)  # Apply once with the default (off)
+
+    def _sync_rs_scan_window(self):
+        """Re-apply every RS row's Days greyout after a preset load:
+        `set_value` emits no `toggled` when a preset re-asserts the value the
+        box already holds. Mirrors `_sync_backward_only`."""
+        for key in _RS_ROW_KEYS:
+            row = self.rows.get(key)
+            if row is not None:
+                self._apply_rs_scan_window(row)
+
     def _section(self, title: str):
         lbl = QLabel(f"  {title}")
         lbl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
@@ -1724,16 +1780,19 @@ class IndicatorPanel(QScrollArea):
             rs_market_enabled=r["rs_market"].is_enabled(),
             rs_market_display_only=r["rs_market"].is_display_only(),
             rs_market_lookback=r["rs_market"].value("lookback"),
+            rs_market_scan_window=bool(r["rs_market"].value("scan_window")),
             rs_market_min=r["rs_market"].value("min_ratio"),
             # RS vs NASDAQ
             rs_nasdaq_enabled=r["rs_nasdaq"].is_enabled(),
             rs_nasdaq_display_only=r["rs_nasdaq"].is_display_only(),
             rs_nasdaq_lookback=r["rs_nasdaq"].value("lookback"),
+            rs_nasdaq_scan_window=bool(r["rs_nasdaq"].value("scan_window")),
             rs_nasdaq_min=r["rs_nasdaq"].value("min_ratio"),
             # RS vs Sector
             rs_sector_enabled=r["rs_sector"].is_enabled(),
             rs_sector_display_only=r["rs_sector"].is_display_only(),
             rs_sector_lookback=r["rs_sector"].value("lookback"),
+            rs_sector_scan_window=bool(r["rs_sector"].value("scan_window")),
             rs_sector_min=r["rs_sector"].value("min_ratio"),
             # Days since earnings
             days_since_earnings_enabled=r["days_since_er"].is_enabled(),
@@ -1950,6 +2009,8 @@ class IndicatorPanel(QScrollArea):
         # spinbox greyout is driven by a checkbox that emits nothing when a
         # preset re-asserts its current value.
         self._sync_period_stat_fields()
+        # And for the RS rows' Days, greyed while Scan Window is ticked.
+        self._sync_rs_scan_window()
         # Resync surge field-greyout after loading. Mirror
         # `_wire_surge_mode_dependent_fields` — apply the same explicit
         # muted style so a preset that lands on trend mode greys days
@@ -2040,8 +2101,8 @@ RESULT_COLUMNS = [
     # Post-split-anchored momentum. A DIFFERENT MEASUREMENT, not a correction:
     # `% Gain` is the true buy-and-hold return over the window, while these
     # measure from the most recent split ex-date — the base the stock actually
-    # trades on now. Identical to their neighbours for any ticker without a
-    # split in the window, which is ~89% of the universe.
+    # trades on now. N/A for any ticker without a split inside the window
+    # (the scan window here; the RS window for RS S&P P/S).
     ("% Gain P/S",        "pct_gain_post_split", lambda x: f"{x:.1f}%"),
     ("P/S Start",         "post_split_start_date", _fmt_date),
     ("STI",               "sti",                 lambda x: f"{x:.3f}"),
@@ -2370,8 +2431,19 @@ _RUN_DATE_KEYS: frozenset = frozenset(
     k for p in _DATE_TYPE_PREFIXES
     for k in (f"{p}_start_date", f"{p}_end_date"))
 
+#: Every Q-X Date column but Q-1's, EPS and Rev alike — the "Q-1 Dates Only"
+#: quick-select (2026-10-18). A rule rather than a list of keys, so it covers
+#: however many quarters a later scan draws. A Q-k Date (k >= 2) belongs to
+#: this AND its own "Q-X Date" type, and is hidden when either is ticked.
+#: Deliberately NOT a `q_` id: the colour-rule editor turns every `q_` type
+#: into a `q{k}_<suffix>` column template.
+OLDER_Q_DATES_TYPE = "older_q_dates"
+_OLDER_Q_DATE_SUFFIXES: frozenset = frozenset(
+    {"report_date_eps", "report_date_rev"})
+
 EARNINGS_COLUMN_TYPES: tuple[tuple[str, str], ...] = (
-    _Q_TYPE_LABELS + _SERIES_TYPE_LABELS + _DATE_TYPE_LABELS
+    ((OLDER_Q_DATES_TYPE, "Q-X Dates except Q-1"),)
+    + _Q_TYPE_LABELS + _SERIES_TYPE_LABELS + _DATE_TYPE_LABELS
 )
 EARNINGS_COLUMN_TYPE_LABELS: dict[str, str] = dict(EARNINGS_COLUMN_TYPES)
 
@@ -2397,7 +2469,11 @@ def earnings_column_types_of(key: str) -> tuple:
     if m is None:
         return ()
     type_id = f"q_{m.group(2)}"
-    return (type_id,) if type_id in EARNINGS_COLUMN_TYPE_LABELS else ()
+    if type_id not in EARNINGS_COLUMN_TYPE_LABELS:
+        return ()
+    if m.group(2) in _OLDER_Q_DATE_SUFFIXES and int(m.group(1)) >= 2:
+        return (type_id, OLDER_Q_DATES_TYPE)
+    return (type_id,)
 
 
 def earnings_column_type_of(key: str):
@@ -2715,6 +2791,49 @@ _TIP_SERIES_PREFIX: dict[str, str] = {
 }
 
 
+# What each series filter's V column measures (2026-10-18: the V cells and
+# headers explain themselves — "+3.00% -> +15.50%" meant nothing to a user
+# who had not read the spec).
+_V_METRIC: dict[str, str] = {
+    "consec_eps_growth": "YoY EPS growth %",
+    "consec_rev_growth": "YoY revenue growth %",
+    "accel_eps_surp": "EPS surprise %",
+    "accel_rev_surp": "Revenue surprise %",
+    "accel_eps_yoy": "YoY EPS growth %",
+    "accel_rev_yoy": "YoY revenue growth %",
+}
+
+
+def _v_header_tooltip(prefix: str) -> str:
+    metric = _V_METRIC[prefix]
+    if prefix.startswith("accel_"):
+        rule = ("Each quarter in the run is at least the row's Step pp\n"
+                "(percentage points) above the one before, and the first\n"
+                "quarter is at or above Start %.")
+    else:
+        rule = ("Every quarter in the run is at or above the row's Growth %.\n"
+                "It does not have to accelerate, so the end can be lower\n"
+                "than the start.")
+    return (f"V = {metric} in the first (oldest) and last (newest)\n"
+            f"quarter of the run this filter found, shown as start -> end.\n"
+            f"{rule}\n"
+            f"The run is the one the row's Series setting picked (Longest\n"
+            f"by default), so it may not end on the latest quarter;\n"
+            f"Span / Start / End show when it ran. The count beside it is\n"
+            f"the number of quarters in the run; Avg / Max cover them all.")
+
+
+#: Header hover text, by column key. Only the V columns so far.
+HEADER_TOOLTIPS: dict[str, str] = {
+    f"{p}_vals": _v_header_tooltip(p) for p in _V_METRIC
+}
+
+
+def header_tooltip(key: str):
+    """The hover text for a results-table column header, or None."""
+    return HEADER_TOOLTIPS.get(key)
+
+
 def _tip_date(value, fmt: str = "%Y-%m-%d"):
     if value is None:
         return None
@@ -2756,18 +2875,24 @@ def cell_tooltip(key: str, row_data):
                           + ([f"fiscal quarter {fq}"] if fq else []))
     prefix = _TIP_SERIES_PREFIX.get(key)
     if prefix is not None:
+        # A V cell says what its two numbers are before the run's dates.
+        explain = (f"{_V_METRIC[prefix]} in the run's first (oldest) → "
+                   f"last (newest) quarter"
+                   if key == f"{prefix}_vals" and prefix in _V_METRIC
+                   else None)
         start = _tip_date(_first_present(
             row_data, f"_{prefix}_start_date", f"{prefix}_start_date"))
         end = _tip_date(_first_present(
             row_data, f"_{prefix}_end_date", f"{prefix}_end_date"))
         if start is None and end is None:
-            return None
+            return explain
         parts = ["Run", f"reported {start or '?'} → {end or '?'}"]
         sq = _tip_date(row_data.get(f"_{prefix}_start_period"), "%Y-%m")
         eq = _tip_date(row_data.get(f"_{prefix}_end_period"), "%Y-%m")
         if sq or eq:
             parts.append(f"fiscal quarters {sq or '?'} → {eq or '?'}")
-        return " · ".join(parts)
+        run = " · ".join(parts)
+        return f"{explain}\n{run}" if explain else run
     if key == "days_since_er":
         date = _tip_date(row_data.get("_last_er_date"))
         return f"Last earnings report {date}" if date else None
@@ -3626,6 +3751,7 @@ class ResultsTable(QTableView):
         super().__init__(parent)
         self.model_src = QStandardItemModel()
         self.model_src.setHorizontalHeaderLabels([c[0] for c in RESULT_COLUMNS])
+        self._apply_header_tooltips(RESULT_COLUMNS)
 
         self.proxy = NumericSortProxy()
         self.proxy.setSourceModel(self.model_src)
@@ -4014,6 +4140,16 @@ class ResultsTable(QTableView):
                   if src_row < len(self._row_styles) else None)
         return df.iloc[src_row].to_dict(), styles
 
+    def _apply_header_tooltips(self, cols) -> None:
+        """Set (or clear) every header's hover text from `header_tooltip`.
+        Clearing matters: `setHorizontalHeaderLabels` reuses the header
+        items, so a tip left on index i would follow whatever column lands
+        there in the next layout. QHeaderView shows ToolTipRole itself."""
+        for i, (_h, key, _f) in enumerate(cols):
+            self.model_src.setHeaderData(
+                i, Qt.Orientation.Horizontal, header_tooltip(key),
+                Qt.ItemDataRole.ToolTipRole)
+
     def _tooltip_at(self, pos):
         """Tooltip text for the cell under viewport position `pos`."""
         df = self._tip_df
@@ -4279,6 +4415,7 @@ class ResultsTable(QTableView):
             self._active_n_rev_quarters = n_rev
             self.model_src.setColumnCount(len(cols))
             self.model_src.setHorizontalHeaderLabels([c[0] for c in cols])
+            self._apply_header_tooltips(cols)
             # Column set just changed — clear any stale multi-select
             # marker on the header. Setting fresh headers wiped them
             # from the model anyway; keeping the in-memory set in
